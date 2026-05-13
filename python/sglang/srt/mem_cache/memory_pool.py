@@ -180,6 +180,18 @@ class ReqToTokenPool:
 
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        # Zero out the row's `req_to_token` cells before releasing the
+        # row index back to free_slots. Without this, the row retains
+        # the previous occupant's kv-slot ids beyond the new occupant's
+        # seq_len, and those stale ids can leak into tree node value
+        # tensors via cache_finished_req / cache_unfinished_req's read
+        # of `req_to_token[row, :cache_len]` (eval_results_42 root
+        # cause: a short-seq req inheriting a long-seq req's row got
+        # stale slot ids 226853..226882, which propagated into a fresh
+        # tree node's value tensor and triggered a multi-col cascade).
+        # Zeroing here is a small constant cost per req-free and
+        # eliminates the stale-data propagation channel.
+        self.req_to_token[req.req_pool_idx].zero_()
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
@@ -340,6 +352,14 @@ class MambaPool:
     def available_size(self):
         return len(self.free_slots)
 
+    def schedulable_available_size(self):
+        """Default mirrors `available_size()`. The shared-pool override
+        (`SharedMambaPool`) returns a byte-coordinated value that may be
+        smaller; on the plain pool there is no peer-side byte coupling so
+        the slot-conservation view IS the schedulable view.
+        """
+        return self.available_size()
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
@@ -460,7 +480,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: BaseLinearStateParams,
         mamba_layer_ids: List[int],
         enable_mamba_extra_buffer: bool,
-        speculative_num_draft_tokens: int = None,
+        speculative_num_draft_tokens: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
     ):
@@ -494,7 +514,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         mamba_layer_ids: List[int],
         device: str,
         enable_mamba_extra_buffer: bool,
-        speculative_num_draft_tokens: int = None,
+        speculative_num_draft_tokens: Optional[int] = None,
     ):
         self.mamba_pool = MambaPool(
             size=size,
@@ -632,6 +652,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
+
+    def transfer_mamba_to_radix(self, req: "Req") -> None:
+        """Hand off a req's mamba slot to the radix tree without freeing it.
+
+        On the non-shared pool there is no per-slot bookkeeping that cares
+        about a dangling `req.mamba_pool_idx`, so this is a no-op. The
+        shared subclass overrides it to drop binder entries that would
+        otherwise be misclassified as live references when the tree later
+        evicts the node that took ownership of the slot.
+        """
+        return
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -1241,9 +1272,10 @@ class HybridLinearKVPool(KVCache):
         enable_memory_saver: bool = False,
         # TODO: refactor mla related args
         use_mla: bool = False,
-        kv_lora_rank: int = None,
-        qk_rope_head_dim: int = None,
+        kv_lora_rank: Optional[int] = None,
+        qk_rope_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
+        full_kv_pool: Optional["KVCache"] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1258,7 +1290,11 @@ class HybridLinearKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
-        if not use_mla:
+        if full_kv_pool is not None:
+            # Caller supplied a pre-built inner pool (e.g. SharedMHATokenToKVPool
+            # aliased over a shared byte buffer). Use it as-is.
+            self.full_kv_pool = full_kv_pool
+        elif not use_mla:
 
             TokenToKVPoolClass = MHATokenToKVPool
 

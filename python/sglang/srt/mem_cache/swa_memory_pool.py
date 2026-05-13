@@ -320,6 +320,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.swa_attn_allocator.available_size()
 
+    # Byte-coordinated capacity views, used by the scheduler's alloc planner
+    # ([common.alloc_for_extend], [schedule_policy] availability checks).
+    # On the non-shared SWATokenToKVPoolAllocator there is no peer-side byte
+    # coupling, so the scheduler view is identical to the leak-check view —
+    # these methods are exposed only so callers can use a single name across
+    # shared and non-shared paths. The shared variant
+    # (`SharedSWATokenToKVPoolAllocator`) overrides them with the actual
+    # byte-coordinated values.
+    def schedulable_full_available_size(self):
+        return self.full_available_size()
+
+    def schedulable_swa_available_size(self):
+        return self.swa_available_size()
+
     @property
     def size(self):
         return min(self._size_full, self._size_swa)

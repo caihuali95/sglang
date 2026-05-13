@@ -384,7 +384,9 @@ class HiMambaRadixCache(MambaRadixCache):
         offset = 0
         for n in nodes_to_load:
             n_len = len(n.host_value)
-            n.value = full_device_indices[offset : offset + n_len].clone()
+            self._set_node_value(
+                n, full_device_indices[offset : offset + n_len].clone()
+            )
             offset += n_len
 
             self.full_lru_list.insert_mru(n)
@@ -592,6 +594,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         mamba_num = self._free_device_mamba(node)
 
+        self._unbind_all_node_value(node)
         node.value = None
         self._update_leaf_status(node)
         self._update_full_device_leaf_status(node.parent)
@@ -618,6 +621,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_pool_host.free(node.mamba_host_value)
             node.mamba_host_value = None
 
+        self._unbind_all_node_value(node)
         node.value = None
         self._discard_from_leaf_sets(node)
 
@@ -871,7 +875,7 @@ class HiMambaRadixCache(MambaRadixCache):
         assert node.mamba_value is None, f"evicted node has device mamba, {node.id=}"
         n = len(fresh_value)
 
-        node.value = fresh_value.clone()
+        self._set_node_value(node, fresh_value.clone())
         self.full_lru_list.insert_mru(node)
         self.full_evictable_size_ += n
 
@@ -962,7 +966,7 @@ class HiMambaRadixCache(MambaRadixCache):
         new_node = TreeNode()
         new_node.parent = parent
         new_node.key = key
-        new_node.value = value.clone()
+        self._set_node_value(new_node, value.clone())
         new_node.mamba_value = mamba_value
         self.full_lru_list.insert_mru(new_node)
         self.mamba_lru_list.insert_mru(new_node)
@@ -1101,7 +1105,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 )
                 src_index = mamba_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                req.mamba_pool_idx = dst_index[0]
+                self._set_req_mamba_pool_idx(req, dst_index[0])
             else:
                 src_index = mamba_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)

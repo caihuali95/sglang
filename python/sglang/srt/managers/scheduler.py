@@ -2462,13 +2462,21 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
-                # revert matched mamba idx to avoid memory leak, if req is not added
+                # revert matched mamba idx to avoid memory leak, if req is not added.
+                # Use `free_mamba_cache` (not direct `mamba_pool.free`) so that
+                # the SharedHybridReqToTokenPool override unbinds BOTH the
+                # py_attr binding (req.mamba_pool_idx) AND the aux binding on
+                # `req_index_to_mamba_index_mapping[req.req_pool_idx]` set up
+                # in `SharedHybridReqToTokenPool.alloc`. The direct
+                # `mamba_pool.free` + `_set_req_mamba_pool_idx(None)` path was
+                # leaking the aux mapping entry — surfaced as
+                # `bind_aux DUPLICATE` warnings in eval_results_14 once the
+                # same slot was re-allocated to the same req_pool_idx, with
+                # downstream relocation flushes then writing to a stale
+                # mapping cell.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added and req.mamba_pool_idx is not None:
-                    self.tree_cache.req_to_token_pool.mamba_pool.free(
-                        req.mamba_pool_idx.unsqueeze(-1)
-                    )
-                    req.mamba_pool_idx = None
+                    self.tree_cache.req_to_token_pool.free_mamba_cache(req)
                 break
 
         # Update waiting queue
@@ -2650,6 +2658,12 @@ class Scheduler(
         # Capture prefill start time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
             set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
+
+        # Note: shared-memory-pool reverse-mapping rewrites used to be
+        # applied here via a `flush_relocations` hook. Under the
+        # immediate-apply refactor, the rewrites happen inline inside
+        # `MultiEndedAllocator._apply_relocations` (during `free()`),
+        # so no per-tick hook is required.
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():

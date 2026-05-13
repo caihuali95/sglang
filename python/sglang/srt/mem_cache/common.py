@@ -105,6 +105,48 @@ def write_cache_indices(
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
         )
+        # Shared-memory-pool: the Triton kernel writes straight into
+        # req_to_token without going through `pool.write()`, so the
+        # `wrap_req_to_token_pool_write` hook never fires. We need to
+        # fire `bind_req_position` manually for every slot the kernel
+        # just wrote, otherwise the relocation log's flush has no
+        # `req_position[slot]` entry to look up — meaning these cells
+        # silently go stale on the first relocation, and a later
+        # `cache_*_req` clones the stale slot id into `value` and
+        # passes it to `free` (root cause of the SWA stale-slot
+        # assertion observed in eval_results_7).
+        binder = getattr(req_to_token_pool, "_slot_binder", None)
+        if binder is not None and not binder.is_null():
+            # CPU iteration matches what `_extract_and_bind` does for
+            # the non-Triton path. Cost is bounded by extend tokens.
+            pt = 0
+            for i in range(req_pool_indices_cpu.shape[0]):
+                row = int(req_pool_indices_cpu[i].item())
+                prefix_len = int(prefix_lens_cpu[i].item())
+                seq_len = int(seq_lens_cpu[i].item())
+                extend_len = int(extend_lens_cpu[i].item())
+                # Bind the prefix portion: positions [0, prefix_len).
+                # These slots are typically tree-bound already (from a
+                # cache hit), so this just adds a req_position entry.
+                if prefix_len > 0:
+                    prefix_slots = (
+                        prefix_tensors[i][:prefix_len].detach().cpu().tolist()
+                    )
+                    for pos, slot in enumerate(prefix_slots):
+                        binder.bind_req_position(slot, row=row, col=pos)
+                # Bind the new-tokens portion: positions [prefix_len, seq_len).
+                if extend_len > 0:
+                    new_slots = (
+                        out_cache_loc[pt : pt + extend_len]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    )
+                    for j, slot in enumerate(new_slots):
+                        binder.bind_req_position(
+                            slot, row=row, col=prefix_len + j
+                        )
+                pt += extend_len
     else:
         pt = 0
         for i in range(req_pool_indices_cpu.shape[0]):
@@ -236,9 +278,12 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     allocator = tree_cache.token_to_kv_pool_allocator
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+        # Hybrid SWA allocator (static partition or shared pool — the
+        # shared variant inherits from SWATokenToKVPoolAllocator). Use the
+        # schedulable (byte-coordinated) view so the eviction trigger
+        # reflects actual current capacity under shared-pool peer usage.
+        full_available_size = allocator.schedulable_full_available_size()
+        swa_available_size = allocator.schedulable_swa_available_size()
 
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
@@ -302,7 +347,13 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
+        # Use schedulable_available_size: under shared-memory-pool, mamba's
+        # byte budget is coupled to the peer (full-attn) sub-pool's usage, so
+        # the alloc planner needs the byte-coordinated view to decide whether
+        # to evict. On the plain MambaPool this defaults to available_size().
+        mamba_available_size = (
+            req_to_token_pool.mamba_pool.schedulable_available_size()
+        )
         factor = (
             MAMBA_STATE_PER_REQ_PREFIX_CACHE
             if tree_cache.supports_mamba()
@@ -470,10 +521,15 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         ), "Only MambaRadixCache allow freeing before alloc"
         # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
-            tree_cache.req_to_token_pool.mamba_pool.free(
-                req.mamba_pool_idx.unsqueeze(-1)
-            )
-            req.mamba_pool_idx = None
+            # Free the early-allocated mamba slot (assigned by
+            # `MambaRadixCache.match_prefix` before `req_to_token_pool.alloc`
+            # ever ran). Use `_set_req_mamba_pool_idx(req, None)` to unbind
+            # the py_attr binding that match_prefix registered, then free
+            # the slot. Direct `mamba_pool.free` would leave a stale
+            # py_attr binding pointing at a now-defunct slot id.
+            mamba_idx = req.mamba_pool_idx
+            tree_cache._set_req_mamba_pool_idx(req, None)
+            tree_cache.req_to_token_pool.mamba_pool.free(mamba_idx.unsqueeze(-1))
         return
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)

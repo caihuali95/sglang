@@ -217,7 +217,9 @@ class SessionAwareCache(BasePrefixCache):
                 kv_indices = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, : len(req.fill_ids)
                 ]
-                req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+                self._set_req_prefix_indices(
+                    req, kv_indices.to(dtype=torch.int64, copy=True)
+                )
                 return
             if req.session.session_id in self.slots:
                 # Subsequent turns: slot exists, skip inner entirely.

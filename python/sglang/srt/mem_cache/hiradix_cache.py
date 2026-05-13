@@ -827,6 +827,7 @@ class HiRadixCache(RadixCache):
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
+        self._unbind_all_node_value(node)
         node.value = None
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
@@ -929,7 +930,9 @@ class HiRadixCache(RadixCache):
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)].clone()
+            self._set_node_value(
+                node, device_indices[offset : offset + len(node.host_value)].clone()
+            )
             offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
@@ -1302,8 +1305,11 @@ class HiRadixCache(RadixCache):
         if child.evicted:
             new_node.value = None
         else:
+            self._unbind_all_node_value(child)
             new_node.value = child.value[:split_len].clone()
             child.value = child.value[split_len:].clone()
+            self._bind_node_value(new_node)
+            self._bind_node_value(child)
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
@@ -1348,7 +1354,7 @@ class HiRadixCache(RadixCache):
                 if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
-                    node.value = value[:prefix_len].clone()
+                    self._set_node_value(node, value[:prefix_len].clone())
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
@@ -1363,7 +1369,7 @@ class HiRadixCache(RadixCache):
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
-                    new_node.value = value[:prefix_len].clone()
+                    self._set_node_value(new_node, value[:prefix_len].clone())
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
@@ -1384,7 +1390,7 @@ class HiRadixCache(RadixCache):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
-            new_node.value = value.clone()
+            self._set_node_value(new_node, value.clone())
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)

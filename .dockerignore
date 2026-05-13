@@ -1,1 +1,66 @@
-.gitignore
+# Exclude files/dirs from `docker build` context. This affects:
+#   1. context-transfer time to BuildKit (large dirs slow uploads), and
+#   2. anything reachable via COPY / ADD or `--mount=type=bind` from the build.
+#
+# Notes on syntax:
+#   * Patterns without a leading slash match relative to the build-context root.
+#   * `dir/` matches only at root level (NOT recursively at any depth).
+#   * To match at any depth, use `**/dir/`.
+#
+# IMPORTANT: do NOT exclude `python/` — sglang's package source lives under
+# `python/sglang/` and is required by `pip install ./python[all]`. Any pattern
+# here that incidentally matches that path will break the build.
+
+# ---- Version control / IDE / editor metadata ----
+.git/
+.github/
+.gitattributes
+.idea/
+.vscode/
+.cursor/
+.claude/
+
+# ---- Python build / runtime artifacts ----
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/build/
+**/dist/
+
+# ---- Top-level dev-only directories not needed at runtime ----
+# These are sub-projects / docs / dev tooling. The container image only needs
+# the `python/` package source plus `docker/shared-pool-test/{entrypoint.sh,scripts/}`.
+docs/
+test/
+examples/
+benchmark/
+playground/
+3rdparty/
+sgl-router/
+sgl-kernel/
+sgl-jax/
+sgl-pdmux/
+sgl-model-gateway/
+
+# ---- Local artifacts the harness produces in CWD ----
+results/
+profiles/
+sglang.tar
+sglang.tar.gz
+mamba_run_*.log
+*.log
+
+# ---- Large model assets that should never be in the build context ----
+*.safetensors
+*.bin
+*.pth
+*.pt
+*.gguf
+
+# ---- This file itself isn't needed in the image ----
+.dockerignore

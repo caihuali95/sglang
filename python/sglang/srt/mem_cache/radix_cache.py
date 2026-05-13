@@ -564,11 +564,11 @@ class RadixCache(BasePrefixCache):
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices
         # - eagle case: bigram keys will only cache len - 1 kv indices
         if len(new_indices) < len(kv_indices):
-            req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
+            self._set_req_prefix_indices(
+                req, torch.cat([new_indices, kv_indices[len(new_indices) :]])
             )
         else:
-            req.prefix_indices = new_indices
+            self._set_req_prefix_indices(req, new_indices)
 
         req.last_node = new_last_node
 
@@ -595,8 +595,9 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            self.token_to_kv_pool_allocator.free(x.value)
-            num_evicted += len(x.value)
+            # Match-aware unbind + free (eval_results_42): only frees
+            # slots actually owned by x per the binder.
+            num_evicted += self._unbind_and_free_node_value(x)
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
@@ -699,10 +700,16 @@ class RadixCache(BasePrefixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
+        # Split redistributes slots between new_node (prefix half) and child
+        # (suffix half). Unbind child's current bindings, reassign, rebind each
+        # half to the right (node, position).
+        self._unbind_all_node_value(child)
         new_node.value = child.value[:split_len].clone()
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
+        self._bind_node_value(new_node)
+        self._bind_node_value(child)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # Split hash_value if it was already computed, otherwise leave as None
@@ -764,7 +771,7 @@ class RadixCache(BasePrefixCache):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
             new_node.key = key
-            new_node.value = value.clone()
+            self._set_node_value(new_node, value.clone())
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)

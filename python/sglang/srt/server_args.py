@@ -359,6 +359,7 @@ class ServerArgs:
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
+    enable_shared_memory_pool: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
@@ -3418,6 +3419,48 @@ class ServerArgs:
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+        if self.enable_shared_memory_pool:
+            if self.enable_double_sparsity:
+                raise ValueError(
+                    "--enable-shared-memory-pool is incompatible with "
+                    "--enable-double-sparsity."
+                )
+            if self.attention_backend == "ascend":
+                raise ValueError(
+                    "--enable-shared-memory-pool is not supported on the Ascend/NPU "
+                    "backend."
+                )
+            if self.page_size is not None and self.page_size != 1:
+                raise ValueError(
+                    "--enable-shared-memory-pool requires --page-size=1; got "
+                    f"page_size={self.page_size}."
+                )
+            if self.disaggregation_mode not in (None, "null"):
+                raise ValueError(
+                    "--enable-shared-memory-pool is incompatible with "
+                    "--disaggregation-mode (custom nvlink mem pool and RDMA "
+                    "registration would need a different buffer layout)."
+                )
+            # MLA backend is not supported — the MLA sub-pool has a different
+            # per-slot shape and dtype than standard MHA, which the shared
+            # buffer layout does not support. NOTE: use_mla_backend is a
+            # METHOD on ServerArgs (not an attr), so it must be CALLED.
+            if self.use_mla_backend():
+                raise ValueError(
+                    "--enable-shared-memory-pool is not supported with the "
+                    "MLA attention backend."
+                )
+            # The experimental C++ radix tree does not expose Python-level
+            # hooks for the `_set_node_value` bookkeeping required by the
+            # targeted relocation flush.
+            import os
+
+            if os.environ.get("SGLANG_EXPERIMENTAL_CPP_RADIX_TREE"):
+                raise ValueError(
+                    "--enable-shared-memory-pool is not supported together with "
+                    "SGLANG_EXPERIMENTAL_CPP_RADIX_TREE=1."
+                )
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -4042,6 +4085,15 @@ class ServerArgs:
             "--disable-hybrid-swa-memory",
             action="store_true",
             help="Disable the hybrid SWA memory pool.",
+        )
+        parser.add_argument(
+            "--enable-shared-memory-pool",
+            action="store_true",
+            help="Enable the shared multi-ended memory pool for SWA and Mamba hybrid models. "
+            "When enabled, the full-attention and SWA (or Mamba) sub-pools share a single "
+            "GPU memory budget with a dynamic boundary, eliminating the need to tune "
+            "--swa-full-tokens-ratio or --mamba-full-memory-ratio.",
+            default=ServerArgs.enable_shared_memory_pool,
         )
         parser.add_argument(
             "--radix-eviction-policy",

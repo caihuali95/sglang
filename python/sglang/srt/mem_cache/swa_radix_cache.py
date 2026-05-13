@@ -436,9 +436,17 @@ class SWARadixCache(BasePrefixCache):
 
         key, value = maybe_bigram_convert(self.is_eagle, key, value)
 
-        prefix_len = self._insert_helper(
-            self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
-        )
+        # Bind the local `value` tensor as aux so any eager-compaction
+        # relocation triggered inside `_insert_helper` (via
+        # `_free_dedup_slots`) updates `value`'s cells in place. See
+        # :py:meth:`BasePrefixCache._bind_value_as_aux` for rationale.
+        self._bind_value_as_aux(value)
+        try:
+            prefix_len = self._insert_helper(
+                self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
+            )
+        finally:
+            self._unbind_value_as_aux(value)
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
@@ -450,7 +458,25 @@ class SWARadixCache(BasePrefixCache):
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
+        # Defer eager compaction triggered inside this call (the `insert`'s
+        # dedup-frees, and the `free(kv_indices[...])` paths) until every
+        # bound holder is in place. Only the OUTERMOST opener manages the
+        # group — the decode result path already wraps `release_kv_cache` in
+        # one, and nesting `free_group_begin()` would reset `free_group = []`.
+        # Mirrors `MambaRadixCache.cache_finished_req`.
+        alloc = self.token_to_kv_pool_allocator
+        own_free_group = bool(getattr(alloc, "is_not_in_free_group", True))
+        if own_free_group:
+            alloc.free_group_begin()
+        try:
+            self._cache_finished_req_inner(req, is_insert, kv_committed_len)
+        finally:
+            if own_free_group:
+                alloc.free_group_end()
 
+    def _cache_finished_req_inner(
+        self, req: Req, is_insert: bool, kv_committed_len: int
+    ) -> None:
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
@@ -500,9 +526,26 @@ class SWARadixCache(BasePrefixCache):
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
+            self._set_req_prefix_indices(req, kv_indices)
             return
+        # Defer eager compaction triggered inside `insert` (dedup-frees) until
+        # the new tree node is bound and `req_to_token` / `req.prefix_indices`
+        # are rewritten — relocations then land on bound holders, not on the
+        # in-flight `value` clone. Only the outermost opener manages the group.
+        # (SWA's int64 snapshot is already taken right before `insert`, with
+        # no eviction in between, so it never goes stale before being bound;
+        # this wrapper is parity with `MambaRadixCache` + belt-and-suspenders.)
+        alloc = self.token_to_kv_pool_allocator
+        own_free_group = bool(getattr(alloc, "is_not_in_free_group", True))
+        if own_free_group:
+            alloc.free_group_begin()
+        try:
+            self._cache_unfinished_req_inner(req, chunked)
+        finally:
+            if own_free_group:
+                alloc.free_group_end()
 
+    def _cache_unfinished_req_inner(self, req: Req, chunked: bool) -> None:
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
@@ -549,11 +592,11 @@ class SWARadixCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         if len(new_indices) < len(kv_indices):
-            req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
+            self._set_req_prefix_indices(
+                req, torch.cat([new_indices, kv_indices[len(new_indices) :]])
             )
         else:
-            req.prefix_indices = new_indices
+            self._set_req_prefix_indices(req, new_indices)
         req.last_node = new_last_node
         req.swa_uuid_for_lock = swa_uuid_for_lock
 
@@ -584,6 +627,7 @@ class SWARadixCache(BasePrefixCache):
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
 
                 # 1. free node kv indices, evict full and swa tokens
+                self._unbind_all_node_value(x)
                 self.token_to_kv_pool_allocator.free(x.value)
                 full_num_evicted += len(x.value)
                 swa_num_evicted += len(x.value)
@@ -633,6 +677,7 @@ class SWARadixCache(BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
+                    self._unbind_all_node_value(x)
                     self.token_to_kv_pool_allocator.free(x.value)
                     full_num_evicted += len(x.value)
                     swa_num_evicted += len(x.value)
@@ -902,6 +947,8 @@ class SWARadixCache(BasePrefixCache):
         new_node.swa_lock_ref = child.swa_lock_ref
         new_node.key = child.key[:split_len]
         assert len(new_node.key) > 0, f"new_node.key should not be empty"
+        # Redistribute slots between new_node and child; unbind then rebind.
+        self._unbind_all_node_value(child)
         new_node.value = child.value[:split_len].clone()
         # parent inherits the swa_uuid from child for swa lock ref
         new_node.swa_uuid = child.swa_uuid
@@ -917,6 +964,8 @@ class SWARadixCache(BasePrefixCache):
         child.key = child.key[split_len:]
         assert len(child.key) > 0, f"child.key should not be empty"
         child.value = child.value[split_len:].clone()
+        self._bind_node_value(new_node)
+        self._bind_node_value(child)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # insert the new node and child into the lru lists, insert
@@ -978,22 +1027,24 @@ class SWARadixCache(BasePrefixCache):
                     if swa_evicted_seqlen <= total_prefix_length:
                         # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
                         # Free full tokens in the original tree node.
+                        self._unbind_all_node_value(node)
                         self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
                         # Overwrite the new value in request to the tree node.
-                        node.value = value[:prefix_len].clone()
+                        self._set_node_value(node, value[:prefix_len].clone())
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
+                        self._unbind_all_node_value(node)
                         self.token_to_kv_pool_allocator.free(
                             node.value[start_update_idx:prefix_len]
                         )
                         self._split_node(node.key, node, start_update_idx)
                         # Here node is the new node after split, so we can overwrite the value to the new node.
                         # The old node is still swa tombstone and the full token is not freed.
-                        node.value = value[start_update_idx:prefix_len].clone()
+                        self._set_node_value(node, value[start_update_idx:prefix_len].clone())
                         self.token_to_kv_pool_allocator.free(value[:start_update_idx])
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
@@ -1003,7 +1054,17 @@ class SWARadixCache(BasePrefixCache):
                         self.token_to_kv_pool_allocator.free(value[:prefix_len])
                 else:
                     # The node is not tombstone, so we don't need to update the node.
-                    self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                    # Use `_free_dedup_slots`: skip slots that match `node.value`
+                    # (cache-hit reuse of the walker's current tree node) AND
+                    # skip slots bound to ANOTHER live tree node (freeing those
+                    # would corrupt the other tree's value tensor — the
+                    # bind_tree_node OVERWRITE / silent-drift bug surfaced in
+                    # eval_results_17). Stale binder entries (bound node was
+                    # detached but binder kept it alive) are cleaned up and
+                    # the slot is freed normally.
+                    self._free_dedup_slots(
+                        value[:prefix_len], node.value[:prefix_len]
+                    )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1041,7 +1102,7 @@ class SWARadixCache(BasePrefixCache):
         new_node = TreeNode()
         new_node.parent = parent
         new_node.key = key
-        new_node.value = value.clone()
+        self._set_node_value(new_node, value.clone())
         new_node.swa_tombstone = swa_tombstone
         parent.children[self.get_child_key_fn(key)] = new_node
         self.full_lru_list.insert_mru(new_node)
@@ -1066,6 +1127,15 @@ class SWARadixCache(BasePrefixCache):
                 node.parent.swa_lock_ref == 0
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
+            # Unbind tree-node bindings before freeing — same fix as
+            # `MambaRadixCache._iteratively_delete_tombstone_leaf`. Without
+            # this, the binder retains stale (slot -> tombstone_parent)
+            # entries; later re-allocation of the same slot for a different
+            # tree node OVERWRITES the binding, the tombstone parent's
+            # `value` tensor is missed by the relocation flush, and the
+            # stale id surfaces in a future eviction free → out-of-range
+            # assertion.
+            self._unbind_all_node_value(node.parent)
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)

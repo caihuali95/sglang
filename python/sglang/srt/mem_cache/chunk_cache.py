@@ -77,8 +77,12 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later.
+        # Route through the binder helper so eager-compaction relocations
+        # of these slot ids stay in sync (see base_prefix_cache).
+        self._set_req_prefix_indices(
+            req, kv_indices.to(dtype=torch.int64, copy=True)
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

@@ -422,9 +422,23 @@ class LRUList:
 
 class MambaRadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
+        # Accept the shared-memory-pool variant too (lazy import to avoid a
+        # circular dependency with multi_ended_allocator -> shared_memory_pool
+        # -> memory_pool -> mamba_radix_cache).
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            SharedMambaTokenToKVPoolAllocator,
+        )
         assert isinstance(
-            params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
-        ) or isinstance(params.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator)
+            params.token_to_kv_pool_allocator,
+            (
+                TokenToKVPoolAllocator,
+                PagedTokenToKVPoolAllocator,
+                SharedMambaTokenToKVPoolAllocator,
+            ),
+        ), (
+            f"MambaRadixCache: unsupported allocator type "
+            f"{type(params.token_to_kv_pool_allocator).__name__}"
+        )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
@@ -509,10 +523,271 @@ class MambaRadixCache(BasePrefixCache):
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
-        )
+
+        # Bind the local `value` tensor as aux so any eager-compaction
+        # relocation triggered inside `_insert_helper` (via
+        # `_free_dedup_slots`) updates `value`'s cells in place. See
+        # :py:meth:`BasePrefixCache._bind_value_as_aux` for rationale.
+        self._bind_value_as_aux(value)
+        try:
+            prefix_len, mamba_exist = self._insert_helper(
+                self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
+            )
+        finally:
+            self._unbind_value_as_aux(value)
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
+
+    # -- defensive validation backstop ------------------------------------
+    #
+    # eval_results_36 demonstrated that even after the
+    # `transfer_mamba_to_radix` fix sealed the dominant
+    # `cache_finished_req(mamba_exist=False)` ownership leak, a residual
+    # cascade still surfaces as `mamba_pool.free([stale_id])` from
+    # `_evict_leaf_node`. We have not yet localized the upstream write
+    # that produces the stale `req.mamba_pool_idx`; the strengthened
+    # weakref orphan tripwire (relocation_log.py) is part 1 of finding
+    # it. This validation backstop is part 2: refuse to launder a stale
+    # mamba slot id into the radix tree, breaking the chain at the
+    # point where it would otherwise become silent corruption.
+    #
+    # On detection: log a capped diagnostic warning with allocator state
+    # and caller chain (so the next eval round has the upstream context),
+    # then abort the cache for this Req — free its kv slots locally and
+    # skip the insert.
+
+    def _is_mamba_pool_idx_valid(self, req) -> bool:
+        """Returns True iff `req.mamba_pool_idx` names a slot that is
+        currently in the mamba allocator's allocated range. Returns False
+        for None, sentinel `-1`, structurally out-of-range ids, and ids
+        that fell into the reserved-zone after a watermark advance. The
+        caller decides what to do with a False (typically: log + abort)."""
+        mid = getattr(req, "mamba_pool_idx", None)
+        if mid is None:
+            return False
+        try:
+            slot = int(mid.item()) if hasattr(mid, "item") else int(mid)
+        except Exception:
+            return False
+        pool = self.req_to_token_pool.mamba_pool
+        if hasattr(pool, "is_slot_allocated"):
+            return pool.is_slot_allocated(slot)
+        # Non-shared pool: best we can do is a positivity check.
+        return slot > 0
+
+    @staticmethod
+    def _stale_mamba_warn_cap() -> int:
+        # Cap on the `STALE req.mamba_pool_idx` / `STALE kv-indices` backstop
+        # warnings (the aborts themselves are uncapped — only the logging is).
+        return 64
+
+    def _warn_stale_mamba_pool_idx(self, req, op: str) -> None:
+        """One-shot capped warning for a detected stale `req.mamba_pool_idx`.
+        Includes the offending slot id, allocator state, identifying req
+        fields, and the call stack — everything we need to localize the
+        upstream write that produced the stale value."""
+        if not hasattr(self, "_stale_mamba_warn_count"):
+            self._stale_mamba_warn_count = 0
+        self._stale_mamba_warn_count += 1
+        cap = self._stale_mamba_warn_cap()
+        if cap == 0 or self._stale_mamba_warn_count > cap:
+            return
+
+        mid = getattr(req, "mamba_pool_idx", None)
+        try:
+            slot_repr = (
+                "None"
+                if mid is None
+                else f"{int(mid.item())}"
+                if hasattr(mid, "item")
+                else f"{int(mid)}"
+            )
+        except Exception:
+            slot_repr = repr(mid)
+
+        pool = self.req_to_token_pool.mamba_pool
+        state_str = (
+            pool.allocator_state_str()
+            if hasattr(pool, "allocator_state_str")
+            else "<unknown>"
+        )
+
+        import inspect
+        frames = inspect.stack()[2:10]
+        callers = " <- ".join(
+            f"{f.filename.split('/')[-1]}:{f.lineno}" for f in frames
+        )
+
+        logger.warning(
+            "MambaRadixCache.%s: STALE req.mamba_pool_idx detected — "
+            "slot=%s is not in the mamba allocator's allocated range. "
+            "Aborting cache for this req to avoid laundering a stale id "
+            "into the radix tree (would crash later via mamba_pool.free). "
+            "Allocator: %s. req fields: req_pool_idx=%s, rid=%s, "
+            "obj_id=0x%x, retraction_count=%s. cum_stale=%d/%d. Caller: %s",
+            op,
+            slot_repr,
+            state_str,
+            getattr(req, "req_pool_idx", "?"),
+            getattr(req, "rid", "?"),
+            id(req),
+            getattr(req, "retraction_count", "?"),
+            self._stale_mamba_warn_count,
+            cap,
+            callers,
+        )
+
+    def _abort_cache_finished_for_stale_mamba(
+        self, req, kv_indices: torch.Tensor
+    ) -> None:
+        """Defensive abort path for `cache_finished_req` when
+        `req.mamba_pool_idx` is stale. Frees the FULL-pool kv slots
+        locally (otherwise leaked) and clears any binder bookkeeping
+        that may still tie the Req to the stale mamba slot. Does NOT
+        call `mamba_pool.free` — the slot is stale and the call would
+        crash on the watermark assertion."""
+        # Free full-pool kv slots that would have been inserted.
+        if kv_indices.numel() > 0:
+            self.token_to_kv_pool_allocator.free(kv_indices)
+        # Best-effort: drop binder entries that might still tie the Req
+        # to a (possibly stale) mamba slot. `transfer_mamba_to_radix`
+        # tolerates stale ids — its unbind_py_attr / unbind_aux are
+        # identity-keyed by `(slot, obj, attr)` / `(slot, tensor, idx)`
+        # and silently no-op when no entry matches. After the call,
+        # `req.mamba_pool_idx` is None.
+        if getattr(req, "mamba_pool_idx", None) is not None and hasattr(
+            self.req_to_token_pool, "transfer_mamba_to_radix"
+        ):
+            self.req_to_token_pool.transfer_mamba_to_radix(req)
+        else:
+            req.mamba_pool_idx = None
+
+    # -- full-pool kv-indices validation backstop --------------------------
+    #
+    # If a request's `req_to_token` row ever holds a FULL-pool slot id the
+    # allocator has already freed, `cache_*_req` would launder it into the
+    # radix tree via `_insert_helper` → `_set_node_value`, where it becomes
+    # silent corruption that surfaces later as a stale-slot / multi-col
+    # assertion. This backstop refuses the launder: if any slot in the
+    # kv-indices about to be cached is outside the allocator's allocated
+    # range, log a capped diagnostic and skip/abort the cache for this Req.
+
+    def _are_kv_indices_valid(self, kv_indices: torch.Tensor) -> bool:
+        """True iff every positive slot id in `kv_indices` is currently in
+        the full-pool allocator's allocated range. Non-positive ids
+        (0 = padding, negative = sentinel) count as INVALID. Returns True
+        when the allocator can't answer (non-shared pool)."""
+        if not isinstance(kv_indices, torch.Tensor) or kv_indices.numel() == 0:
+            return True
+        is_alloc = getattr(
+            self.token_to_kv_pool_allocator, "is_slot_allocated", None
+        )
+        if is_alloc is None:
+            return True
+        for s in kv_indices.detach().cpu().tolist():
+            si = int(s)
+            if si <= 0:
+                return False
+            if not is_alloc(si):
+                return False
+        return True
+
+    def _first_invalid_kv_indices(self, kv_indices: torch.Tensor):
+        """Return up to 8 (pos, slot) pairs that fail `_are_kv_indices_valid`,
+        plus the total count, for diagnostics."""
+        is_alloc = getattr(
+            self.token_to_kv_pool_allocator, "is_slot_allocated", None
+        )
+        bad = []
+        total = 0
+        for pos, s in enumerate(kv_indices.detach().cpu().tolist()):
+            si = int(s)
+            if si <= 0 or (is_alloc is not None and not is_alloc(si)):
+                total += 1
+                if len(bad) < 8:
+                    bad.append((pos, si))
+        return bad, total
+
+    def _warn_stale_kv_indices(
+        self, req, op: str, kv_indices: torch.Tensor
+    ) -> None:
+        """Capped warning for kv-indices carrying freed full-pool slot ids.
+        Shares `_stale_mamba_warn_cap()` with the other backstop warnings."""
+        if not hasattr(self, "_stale_kv_warn_count"):
+            self._stale_kv_warn_count = 0
+        self._stale_kv_warn_count += 1
+        cap = self._stale_mamba_warn_cap()
+        if cap == 0 or self._stale_kv_warn_count > cap:
+            return
+        bad, total = self._first_invalid_kv_indices(kv_indices)
+        bad_str = "; ".join(f"pos={p} slot={s}" for (p, s) in bad)
+        more = total - len(bad)
+        if more > 0:
+            bad_str += f", ...(+{more} more)"
+        alloc = self.token_to_kv_pool_allocator
+        state_str = (
+            alloc.allocator_state_str()
+            if hasattr(alloc, "allocator_state_str")
+            else "<unknown>"
+        )
+        import inspect
+        frames = inspect.stack()[2:10]
+        callers = " <- ".join(
+            f"{f.filename.split('/')[-1]}:{f.lineno}" for f in frames
+        )
+        logger.warning(
+            "MambaRadixCache.%s: STALE kv-indices detected — %d of %d "
+            "slot id(s) in the req_to_token row are NOT in the full-pool "
+            "allocator's allocated range (already freed). Aborting the "
+            "cache for this req to avoid laundering freed slots into the "
+            "radix tree. Bad slots: %s. Allocator: %s. req fields: "
+            "req_pool_idx=%s, rid=%s, obj_id=0x%x, cache_protected_len=%s, "
+            "retraction_count=%s. cum_stale_kv=%d/%d. Caller: %s",
+            op,
+            total,
+            kv_indices.numel(),
+            bad_str,
+            state_str,
+            getattr(req, "req_pool_idx", "?"),
+            getattr(req, "rid", "?"),
+            id(req),
+            getattr(req, "cache_protected_len", "?"),
+            getattr(req, "retraction_count", "?"),
+            self._stale_kv_warn_count,
+            cap,
+            callers,
+        )
+
+    def _abort_cache_finished_for_stale_kv(
+        self, req, kv_indices: torch.Tensor
+    ) -> None:
+        """Abort `cache_finished_req` when kv-indices carry freed ids.
+        Frees only the suffix beyond `cache_protected_len` (the req's own
+        fresh decode slots), and only the ones still in the allocated
+        range — the protected-prefix part belongs to the tree and the
+        out-of-range ids are already accounted for as free. Then releases
+        the mamba state. Does NOT insert anything into the tree."""
+        protected = int(getattr(req, "cache_protected_len", 0) or 0)
+        if isinstance(kv_indices, torch.Tensor) and kv_indices.numel() > protected:
+            suffix = kv_indices[protected:]
+            is_alloc = getattr(
+                self.token_to_kv_pool_allocator, "is_slot_allocated", None
+            )
+            if is_alloc is None:
+                self.token_to_kv_pool_allocator.free(suffix)
+            else:
+                safe = [
+                    int(s) for s in suffix.detach().cpu().tolist()
+                    if int(s) > 0 and is_alloc(int(s))
+                ]
+                if safe:
+                    self.token_to_kv_pool_allocator.free(
+                        torch.tensor(
+                            safe, dtype=kv_indices.dtype, device=kv_indices.device
+                        )
+                    )
+        # Release the mamba state (the req is finishing; it isn't going
+        # into the tree on this aborted path).
+        self.req_to_token_pool.free_mamba_cache(req)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
@@ -524,7 +799,26 @@ class MambaRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_mamba_cache(req)
             return
+        # Defer eager compaction triggered inside this call (the `insert`'s
+        # `_free_dedup_slots`, and the `free(kv_indices[...])` paths) until
+        # every bound holder is in place — so relocations land on bound
+        # holders, not on the in-flight `value` clone. Only the OUTERMOST
+        # opener manages the group (the decode result path already wraps
+        # `release_kv_cache` in one; nesting `free_group_begin()` would
+        # reset `free_group = []` and lose the outer batch).
+        alloc = self.token_to_kv_pool_allocator
+        own_free_group = bool(getattr(alloc, "is_not_in_free_group", True))
+        if own_free_group:
+            alloc.free_group_begin()
+        try:
+            self._cache_finished_req_inner(req, is_insert, kv_committed_len)
+        finally:
+            if own_free_group:
+                alloc.free_group_end()
 
+    def _cache_finished_req_inner(
+        self, req: Req, is_insert: bool, kv_committed_len: int
+    ) -> None:
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
@@ -573,8 +867,30 @@ class MambaRadixCache(BasePrefixCache):
                     .clone()
                 )
             else:
+                # Defensive validation backstop (eval_results_36): refuse
+                # to launder a stale `req.mamba_pool_idx` into the tree.
+                # See `_warn_stale_mamba_pool_idx` for diagnostic output.
+                if not self._is_mamba_pool_idx_valid(req):
+                    self._warn_stale_mamba_pool_idx(req, "cache_finished_req")
+                    self._abort_cache_finished_for_stale_mamba(
+                        req, page_aligned_kv_indices
+                    )
+                    self.dec_lock_ref(req.last_node)
+                    return
                 mamba_value = req.mamba_pool_idx.unsqueeze(-1).clone()
                 mamba_ping_pong_track_buffer_to_keep = None
+
+            # Defensive validation backstop (eval_results_44): refuse to
+            # launder already-freed full-pool slot ids into the tree.
+            if not self._are_kv_indices_valid(page_aligned_kv_indices):
+                self._warn_stale_kv_indices(
+                    req, "cache_finished_req", page_aligned_kv_indices
+                )
+                self._abort_cache_finished_for_stale_kv(
+                    req, page_aligned_kv_indices
+                )
+                self.dec_lock_ref(req.last_node)
+                return
 
             result = self.insert(
                 InsertParams(
@@ -599,6 +915,21 @@ class MambaRadixCache(BasePrefixCache):
                 req,
                 mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
             )
+        elif is_insert and req.mamba_pool_idx is not None:
+            # mamba_exist=False on the insert path: `_set_node_mamba_value`
+            # just bound `req.mamba_pool_idx`'s slot to a new (or revived
+            # tombstone) tree node. Slot ownership has transferred to the
+            # tree, but the alloc-time binder entries (py_attr on
+            # `req.mamba_pool_idx`, aux on `mapping[req_pool_idx]`) still
+            # point at the slot. If left, a future tree-evict frees the
+            # slot and the catch-all classifies those bookkeeping entries
+            # as a forgotten live reference, poisoning the holders with -1
+            # — which then laundries back into a fresh `node.mamba_value`
+            # via line 599 and crashes on a later `mamba_pool.free([-1])`
+            # (eval_results_1 cascade). Hand off ownership cleanly: drop
+            # the req's binder entries and clear its dangling handle, but
+            # keep the slot allocated for the tree.
+            self.req_to_token_pool.transfer_mamba_to_radix(req)
 
         self.dec_lock_ref(req.last_node)
 
@@ -609,9 +940,14 @@ class MambaRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.fill_ids)
             ]
-
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+            # `kv_indices` is a live view of `req_to_token` (always current).
+            # The int64 snapshot is taken on the same line that hands it to
+            # `_set_req_prefix_indices`, which immediately binds every cell via
+            # `bind_aux` — no unbound window for a relocation to slip through.
+            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later.
+            self._set_req_prefix_indices(
+                req, kv_indices.to(dtype=torch.int64, copy=True)
+            )
             return
 
         token_ids = req.fill_ids
@@ -623,19 +959,24 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or cache_len is None:
             return _skip_cache_unfinished_req(req)
 
+        # `kv_indices` is a live VIEW of `req_to_token` — it tracks
+        # eager-compaction relocations automatically because `req_to_token`
+        # is a bound container. We deliberately do NOT materialize the int64
+        # copy here: `mamba_pool.fork_from` / `self.evict(...)` below can free
+        # full-pool slots and relocate this request's near-boundary slots,
+        # and an int64 copy made now would NOT be updated by `Relocator.apply`
+        # until `insert()` binds it as aux — exactly the laundering bug
+        # eval_results_44/45 surfaced (`VALUE-FREED-SLOT`). Take the copy LATE,
+        # after `fork_from`/`evict`, when `req_to_token` has absorbed any
+        # relocations.
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
-        # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
-            page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
-                dtype=torch.int64, copy=True
-            )
         else:
             page_aligned_len = len(kv_indices)
-            page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         assert page_aligned_len == len(
             kv_indices
@@ -656,6 +997,19 @@ class MambaRadixCache(BasePrefixCache):
                 .clone()
             )
         else:
+            # Defensive validation backstop (eval_results_36): if
+            # `req.mamba_pool_idx` is stale, the parallel mapping cell
+            # `mapping[req.req_pool_idx]` is most likely stale too. Reading
+            # it into `mamba_value` and `fork_from`-ing produces a fresh
+            # forked slot via a corrupted CUDA copy_from(stale_row) — the
+            # forked slot is structurally valid but carries garbage state.
+            # That isn't a crash on its own, but it pollutes the radix tree
+            # with semantically-wrong cached states. Skip the cache in
+            # this case (and log diagnostic so the upstream write site can
+            # be traced — same warning helper / cap as cache_finished_req).
+            if not self._is_mamba_pool_idx_valid(req):
+                self._warn_stale_mamba_pool_idx(req, "cache_unfinished_req")
+                return _skip_cache_unfinished_req(req)
             mamba_value = self.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
@@ -669,54 +1023,90 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_value
             )
             assert mamba_value_forked is not None, "Can not alloc mamba cache"
-        result = self.insert(
-            InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
-                value=page_aligned_kv_indices,
-                mamba_value=mamba_value_forked,
-                prev_prefix_len=req.cache_protected_len,
+
+        # NOW take the int64 snapshot — after `fork_from`/`evict`, `kv_indices`
+        # (a view of `req_to_token`) reflects any relocations they triggered,
+        # so the snapshot is fresh. `insert()` will bind it as aux for the
+        # `_insert_helper` walk; the `free_group` wrapper below defers the
+        # walk's own `_free_dedup_slots` compaction until every bound holder
+        # (new node value, rewritten `req_to_token`, `req.prefix_indices`) is
+        # in place — so the snapshot can never go stale while it's live.
+        page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
+            dtype=torch.int64, copy=True
+        )
+        # Defensive validation backstop (eval_results_44/45): even with the
+        # late snapshot, refuse to launder an already-freed full-pool slot id
+        # into the tree. Should essentially never fire now.
+        if not self._are_kv_indices_valid(page_aligned_kv_indices):
+            self._warn_stale_kv_indices(
+                req, "cache_unfinished_req", page_aligned_kv_indices
             )
-        )
-        new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
-        # there is a mamba cache in radix cache, release it
-        if mamba_exist:
+            # Don't leak the mamba slot we just forked.
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+            return _skip_cache_unfinished_req(req)
 
-        # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
-        )
-        new_indices, new_last_node = (
-            match_result.device_indices,
-            match_result.last_device_node,
-        )
+        # Defer eager compaction triggered inside `insert` (via
+        # `_free_dedup_slots`) until after the new tree node is bound and
+        # `req_to_token` / `req.prefix_indices` are rewritten. Only the
+        # OUTERMOST opener manages the group — the decode result path already
+        # wraps `release_kv_cache` in one, and nesting `free_group_begin()`
+        # would reset `free_group = []` and lose the outer batch.
+        alloc = self.token_to_kv_pool_allocator
+        own_free_group = bool(getattr(alloc, "is_not_in_free_group", True))
+        if own_free_group:
+            alloc.free_group_begin()
+        try:
+            result = self.insert(
+                InsertParams(
+                    key=RadixKey(page_aligned_token_ids, req.extra_key),
+                    value=page_aligned_kv_indices,
+                    mamba_value=mamba_value_forked,
+                    prev_prefix_len=req.cache_protected_len,
+                )
+            )
+            new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
+            # there is a mamba cache in radix cache, release it
+            if mamba_exist:
+                self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
-        if not mamba_exist:
-            assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
+            # The prefix indices could be updated, reuse it
+            match_result = self.match_prefix(
+                MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            )
+            new_indices, new_last_node = (
+                match_result.device_indices,
+                match_result.last_device_node,
+            )
 
-        assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+            if not mamba_exist:
+                assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
 
-        self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
-        )
+            assert (
+                req.cache_protected_len <= len(new_indices) + self.page_size - 1
+            ), f"{req.cache_protected_len=}, {len(new_indices)=}, {len(page_aligned_token_ids)=}, {mamba_exist=}"
+            assert new_prefix_len <= len(
+                new_indices
+            ), f"{new_prefix_len=}, {len(new_indices)=}"
 
-        self.dec_lock_ref(req.last_node)
-        self.inc_lock_ref(new_last_node)
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
+                new_indices[req.cache_protected_len :],
+            )
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-        # NOTE: this is needed for both page_size == 1 and page_size > 1
-        req.prefix_indices = torch.cat(
-            [new_indices, kv_indices_orig[len(new_indices) :]]
-        )
-        req.cache_protected_len = len(new_indices)
-        req.mamba_last_track_seqlen = None
-        req.last_node = new_last_node
+            self.dec_lock_ref(req.last_node)
+            self.inc_lock_ref(new_last_node)
+
+            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            # NOTE: this is needed for both page_size == 1 and page_size > 1
+            self._set_req_prefix_indices(
+                req, torch.cat([new_indices, kv_indices_orig[len(new_indices) :]])
+            )
+            req.cache_protected_len = len(new_indices)
+            req.mamba_last_track_seqlen = None
+            req.last_node = new_last_node
+        finally:
+            if own_free_group:
+                alloc.free_group_end()
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)
@@ -735,10 +1125,14 @@ class MambaRadixCache(BasePrefixCache):
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
-        self.token_to_kv_pool_allocator.free(x.value)
-        full_num_evicted = len(x.value)
-        self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-        mamba_num_evicted = len(x.mamba_value)
+        # Match-aware unbind + free: pass only the slots that the binder
+        # agrees `x` owns to the allocator's `free`. Slots in `x.value`
+        # that are bound to OTHER tree nodes (stale-tensor situation)
+        # are NOT freed — that prevents the allocator from advancing its
+        # watermark past slots still bound to other nodes (eval_results_42
+        # multi-col cascade root cause).
+        full_num_evicted = self._unbind_and_free_node_value(x)
+        mamba_num_evicted = self._unbind_and_free_node_mamba_value(x)
 
         # 2. get the next node, update the lru lists
         if is_evict_mamba:
@@ -790,8 +1184,9 @@ class MambaRadixCache(BasePrefixCache):
 
             if len(x.children) > 0:
                 # 1. an internal node, free mamba tokens.
-                self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-                mamba_num_evicted += len(x.mamba_value)
+                # Match-aware unbind + free (eval_results_42): only
+                # frees slots actually owned by x per the binder.
+                mamba_num_evicted += self._unbind_and_free_node_mamba_value(x)
 
                 # 2. get the next node, update the lru lists
                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
@@ -1059,7 +1454,7 @@ class MambaRadixCache(BasePrefixCache):
                     assert dst_index is not None, "Can not alloc mamba cache"
                 src_index = last_node.mamba_value
                 self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
-                req.mamba_pool_idx = dst_index[0]
+                self._set_req_mamba_pool_idx(req, dst_index[0])
             else:
                 src_index = last_node.mamba_value
                 dst_index = req.mamba_pool_idx.unsqueeze(0)
@@ -1083,10 +1478,13 @@ class MambaRadixCache(BasePrefixCache):
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
-        new_node.mamba_value = None  # mamba cache can not be split
+        # mamba cache can not be split — new_node carries no mamba state.
+        # No prior binding to unbind here (new_node is freshly constructed).
+        new_node.mamba_value = None
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
+        self._unbind_all_node_value(child)
         new_node.value = child.value[:split_len].clone()
 
         # child time should be later than parent's time for mamba tombstone
@@ -1098,6 +1496,8 @@ class MambaRadixCache(BasePrefixCache):
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
+        self._bind_node_value(new_node)
+        self._bind_node_value(child)
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # insert the new node and child into the lru lists, insert
@@ -1141,7 +1541,17 @@ class MambaRadixCache(BasePrefixCache):
 
             if prev_prefix_len < total_prefix_length + prefix_len:
                 start = max(0, prev_prefix_len - total_prefix_length)
-                self.token_to_kv_pool_allocator.free(value[start:prefix_len])
+                # Use `_free_dedup_slots`: skip slots that match `node.value`
+                # (cache-hit reuse of the walker's current node) AND skip
+                # slots bound to another live tree node (freeing those would
+                # leak the OTHER tree's slot — the silent-drift bug surfaced
+                # in eval_results_17 with the smoking-gun warning at
+                # multi_ended_allocator.py:1260, attr='value', cum=114K).
+                # Stale binder entries (bound node detached but
+                # Python-alive) are cleaned up and the slot is freed.
+                self._free_dedup_slots(
+                    value[start:prefix_len], node.value[start:prefix_len]
+                )
 
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1159,15 +1569,15 @@ class MambaRadixCache(BasePrefixCache):
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
-            new_node.value = value.clone()
-            new_node.mamba_value = mamba_value
+            self._set_node_value(new_node, value.clone())
+            self._set_node_mamba_value(new_node, mamba_value)
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
         elif node.mamba_value is None:  # add for mamba tombstone
-            node.mamba_value = mamba_value
+            self._set_node_mamba_value(node, mamba_value)
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
@@ -1194,9 +1604,14 @@ class MambaRadixCache(BasePrefixCache):
             assert (
                 node.parent.mamba_lock_ref == 0
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
-            # delete tombstone node evicts full tokens
-            self.token_to_kv_pool_allocator.free(node.parent.value)
-            full_num_evicted += len(node.parent.value)
+            # delete tombstone node evicts full tokens.
+            # Match-aware unbind + free (eval_results_42): only frees
+            # slots that the binder agrees `node.parent` owns; stale
+            # entries in `node.parent.value` are left to their rightful
+            # owner's eviction. Without this filter, the allocator's
+            # watermark advances past slots still bound in the binder
+            # to OTHER tree nodes, producing the multi-col cascade.
+            full_num_evicted += self._unbind_and_free_node_value(node.parent)
             self.full_lru_list.remove_node(node.parent)
             self._delete_tombstone_leaf(node.parent)
             node = node.parent
@@ -1218,6 +1633,22 @@ class MambaRadixCache(BasePrefixCache):
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
         self.mamba_evictable_size_ -= len(node.mamba_value)
+        # NOTE: the binder unbind has ALREADY been done by the caller —
+        # `evict_mamba` INTERNAL branch (mamba_radix_cache.py:989) calls
+        # `_unbind_node_mamba_value(x)` BEFORE `mamba_pool.free(...)`.
+        # Calling `_unbind_node_mamba_value(node)` here would be:
+        #   (a) redundant (the binder entry was already popped), and
+        #   (b) PREVIOUSLY, harmful: between the caller's unbind and
+        #       this point, `mamba_pool.free`'s eager-compaction
+        #       (`_apply_one` step 6) may have rebound the slot id in
+        #       `node.mamba_value` to a DIFFERENT tree node. A naive
+        #       second unbind would silently pop that other node's
+        #       binding (eval_results_40 cascade). The match-aware
+        #       `_safe_unbind_tree_node` now skips this case, so even
+        #       if a future caller path forgets to unbind first, this
+        #       function would no-op cleanly. But removing the call
+        #       outright avoids the wasted scan and keeps responsibility
+        #       with the caller.
         node.mamba_value = None
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:

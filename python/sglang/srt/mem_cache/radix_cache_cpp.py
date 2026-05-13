@@ -249,11 +249,11 @@ class RadixCacheCpp(BasePrefixCache):
         # NOTE: there might be unaligned tail, so we may need to append it
         assert len(new_indices) <= prefill_len < len(new_indices) + self.page_size
         if self.page_size != 1 and len(new_indices) < prefill_len:
-            req.prefix_indices = torch.cat(
-                [new_indices, kv_indices[len(new_indices) :]]
+            self._set_req_prefix_indices(
+                req, torch.cat([new_indices, kv_indices[len(new_indices) :]])
             )
         else:
-            req.prefix_indices = new_indices
+            self._set_req_prefix_indices(req, new_indices)
         req.last_node = new_last_node
 
     def pretty_print(self):

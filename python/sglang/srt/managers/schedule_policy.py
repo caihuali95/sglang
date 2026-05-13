@@ -456,10 +456,15 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         if self.is_hybrid_swa:
+            # Use the schedulable (byte-coordinated) views: under shared pool
+            # the static slot-conservation views over-promise because they
+            # don't reflect peer-side byte usage. On the non-shared
+            # SWATokenToKVPoolAllocator these alias `*_available_size()`,
+            # so behavior there is unchanged.
             available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
+                self.token_to_kv_pool_allocator.schedulable_full_available_size()
                 + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
+                self.token_to_kv_pool_allocator.schedulable_swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
         elif self.is_hybrid_ssm_cache:
@@ -477,10 +482,12 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         if self.is_hybrid_swa:
+            # See `rem_total_tokens` above for why we use the schedulable
+            # (byte-coordinated) views here.
             available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
+                self.token_to_kv_pool_allocator.schedulable_full_available_size()
                 + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
+                self.token_to_kv_pool_allocator.schedulable_swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
         elif self.is_hybrid_ssm_cache:
@@ -780,7 +787,12 @@ class PrefillAdder:
                         req=req,
                     )
                 )
-                req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
+                # Route through the tree_cache helper so eager-compaction
+                # relocations of the slot ids in prefix_indices stay in sync
+                # via the SlotBacktrackBinder.
+                self.tree_cache._set_req_prefix_indices(
+                    req, torch.cat([req.prefix_indices, new_indices])
+                )
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
