@@ -753,6 +753,12 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    # Replace the statically-partitioned hybrid-model pools (full-attn KV +
+    # SWA/Mamba state) with one shared byte buffer split dynamically. Stage 1:
+    # hybrid Mamba, page_size==1 only; incompatible with PD disaggregation /
+    # speculative decoding for now (Stage 5). See
+    # python/sglang/srt/mem_cache/shared_memory_pool_design.md.
+    enable_shared_memory_pool: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
@@ -1081,6 +1087,9 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
+
+        # Validate the shared memory pool feature gating.
+        self._handle_shared_memory_pool()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -4529,6 +4538,63 @@ class ServerArgs:
                         "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
 
+    def _handle_shared_memory_pool(self):
+        if not self.enable_shared_memory_pool:
+            return
+        # Stage 1/2 gating; Stage 5 lifts the spec/disagg restrictions, Stage 3
+        # the page_size one.
+        assert self.disaggregation_mode == "null", (
+            "--enable-shared-memory-pool is not yet compatible with PD "
+            "disaggregation (Stage 5)."
+        )
+        assert self.speculative_algorithm is None, (
+            "--enable-shared-memory-pool is not yet compatible with speculative "
+            "decoding (Stage 5)."
+        )
+        assert (self.page_size or 1) == 1, (
+            "--enable-shared-memory-pool currently supports page_size == 1 only "
+            "(Stage 3 lifts this)."
+        )
+        # Stage 1 does not wire the cuda-graph input buffers for the shared pool
+        # yet; require eager execution. (Follow-up: capture the per-batch
+        # virtual->physical out_cache_loc translation into a graph buffer.)
+        if not self.disable_cuda_graph:
+            self.disable_cuda_graph = True
+            logger.warning(
+                "--enable-shared-memory-pool: forcing --disable-cuda-graph "
+                "(cuda-graph support for the shared pool is not implemented yet)."
+            )
+        # Overlap-schedule note:
+        # `MultiEndedAllocator._compact_pending` now plumbs the model
+        # `forward_stream` from `_init_pools` -> `init_shared_mamba_pools` and
+        # issues `current_stream().wait_stream(forward_stream)` before its
+        # move kernel, so the relocation serializes after the in-flight
+        # forward's reads/writes of the same KV slots. The reverse direction
+        # (next forward seeing compaction's table updates) is already covered
+        # by `forward_stream.wait_stream(schedule_stream)` at the top of
+        # `run_batch`. The auto-disable for Mamba + MambaRadixCache via
+        # `_handle_mamba` (`mamba_scheduler_strategy='no_buffer'`) remains
+        # untouched.
+        # Only the Triton attention backend's read path (the page-table / kv_indices
+        # build from req_to_token) has been wired to translate virtual->physical
+        # slot ids. FA3 / FlashInfer support is a follow-up. Require Triton for the
+        # full-attention layers.
+        backends = {
+            self.attention_backend,
+            self.prefill_attention_backend,
+            self.decode_attention_backend,
+        }
+        backends.discard(None)
+        assert backends <= {"triton"}, (
+            "--enable-shared-memory-pool (Stage 1) currently only wires the Triton "
+            f"attention backend for the full-attention layers; got {sorted(backends)}. "
+            "Pass --attention-backend triton (FA3 / FlashInfer support is planned)."
+        )
+        # The model-family check (hybrid Mamba for Stage 1; hybrid SWA is Stage 2,
+        # DeepSeek V4 is Stage 4) is enforced at pool-construction time in
+        # model_runner_kv_cache_mixin._init_pools, since the model config isn't
+        # available here.
+
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
@@ -6760,6 +6826,16 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--enable-shared-memory-pool",
+            action="store_true",
+            help=(
+                "For hybrid models (Mamba/SWA), replace the two statically-"
+                "partitioned KV/state pools with one byte buffer split dynamically."
+                "Stage 1: hybrid Mamba, page_size==1 only; not yet compatible with "
+                "PD disaggregation or speculative decoding."
+            ),
         )
         # --- CUDA graph config: canonical JSON entry ---------------------
         parser.add_argument(

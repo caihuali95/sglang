@@ -412,7 +412,18 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
+        # Byte-coordinated availability: the shared `SharedMambaPool` exposes
+        # `schedulable_available_size`, which accounts for the peer pool's byte
+        # usage and triggers eviction when the shared byte buffer is tight even
+        # if slot-wise free space looks plentiful. Fall back to the slot
+        # allocator's free count (upstream's accessor) for the non-shared
+        # `MambaPool`, where the two views coincide. The lazy-extra-buffer
+        # factor below is upstream's (kept intact).
+        mamba_available_size = getattr(
+            req_to_token_pool.mamba_pool,
+            "schedulable_available_size",
+            req_to_token_pool.mamba_allocator.available_size,
+        )()
         if tree_cache.supports_mamba():
             factor = (
                 MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY

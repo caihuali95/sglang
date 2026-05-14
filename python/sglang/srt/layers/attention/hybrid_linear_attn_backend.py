@@ -98,6 +98,22 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        # Shared memory pool: get_mamba_indices returns *virtual* per-request ids;
+        # translate to physical slot ids once per batch (used both for the mamba
+        # forward and for the *_track_* index derivations below). No-op for the
+        # non-shared HybridReqToTokenPool (no translate_mamba_indices method).
+        # Translate BEFORE the cuda-graph padding sentinel below, so the
+        # virtual->physical gather reads only real ids; padded rows are then
+        # poisoned to -1 (the mamba kernels skip -1).
+        _translate_mamba = getattr(
+            self.req_to_token_pool, "translate_mamba_indices", None
+        )
+        if _translate_mamba is not None:
+            mamba_cache_indices = _translate_mamba(mamba_cache_indices)
+            if forward_batch.mamba_track_indices is not None:
+                forward_batch.mamba_track_indices = _translate_mamba(
+                    forward_batch.mamba_track_indices
+                )
         _real_bs = getattr(forward_batch, "_original_batch_size", None)
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()

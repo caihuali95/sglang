@@ -136,6 +136,12 @@ class TritonAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
+        # When the shared memory pool is enabled, req_to_token holds *virtual*
+        # slot ids; the attention kernels need *physical* slot ids. This is the
+        # virtual->physical translation hook (None — a no-op — otherwise).
+        self._translate_kv_loc = getattr(
+            self.token_to_kv_pool_allocator, "translate_kv_loc", None
+        )
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -606,6 +612,8 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     kv_indices,
                 )
+                if self._translate_kv_loc is not None:
+                    kv_indices = self._translate_kv_loc(kv_indices)
                 # Sliding window
                 if (
                     self.sliding_window_size is not None
@@ -728,6 +736,8 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 kv_indices,
             )
+            if self._translate_kv_loc is not None:
+                kv_indices = self._translate_kv_loc(kv_indices)
             # Sliding window
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 (

@@ -416,6 +416,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_shared_memory_pool = getattr(
+            server_args, "enable_shared_memory_pool", False
+        )
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""

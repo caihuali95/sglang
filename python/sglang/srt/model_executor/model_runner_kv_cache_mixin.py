@@ -313,9 +313,95 @@ class ModelRunnerKVCacheMixin:
                 "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
             )
 
+    def _init_shared_mamba_pools(self: ModelRunner, max_num_reqs: int):
+        """Build the shared-memory-pool stack for a hybrid-Mamba model
+        (Stage 1, page_size==1): one byte buffer split between the full-attn
+        MHA KV pool and the per-request Mamba state pool, with virtual slot ids
+        above the allocator. See shared_memory_pool_design.md."""
+        from sglang.srt.mem_cache.shared_memory_pool import init_shared_mamba_pools
+
+        config = self.mambaish_config
+        assert config is not None
+        assert not self.use_mla_backend, (
+            "shared memory pool Stage 1 does not support MLA-hybrid-Mamba yet"
+        )
+        assert self.page_size == 1, (
+            "shared memory pool Stage 1 supports page_size == 1 only"
+        )
+        # Mirror the non-shared path's extra_max_context_len computation.
+        extra_max_context_len = 4
+        if self.server_args.speculative_num_draft_tokens is not None:
+            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+
+        mamba_layer_ids = [
+            i
+            for i in config.mamba2_cache_params.layers
+            if self.start_layer <= i < self.end_layer
+        ]
+        full_attention_layer_ids = [
+            i
+            for i in config.full_attention_layer_ids
+            if self.start_layer <= i < self.end_layer
+        ]
+
+        bundle = init_shared_mamba_pools(
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            page_size=self.page_size,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            is_draft_worker=self.is_draft_worker,
+            use_mla_backend=self.use_mla_backend,
+            mamba_layer_ids=mamba_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            mamba2_cache_params=config.mamba2_cache_params,
+            model_context_len=self.model_config.context_len,
+            extra_max_context_len=extra_max_context_len,
+            max_total_num_tokens=self.max_total_num_tokens,
+            max_mamba_cache_size=self.server_args.max_mamba_cache_size,
+            max_num_reqs=max_num_reqs,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            disable_overlap_schedule=self.server_args.disable_overlap_schedule,
+            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
+            mamba_full_memory_ratio=getattr(
+                self.server_args, "mamba_full_memory_ratio", None
+            ),
+            # Pass the model forward stream so the allocator's `free` can
+            # drop a `schedule_stream.wait_stream(forward_stream)` barrier
+            # at its top — required for correctness in overlap mode, where
+            # `pop_and_process` calls free while the in-flight forward is
+            # still reading v2p / reading+writing K/V slots that the eager
+            # compaction is about to relocate. A near-no-op in normal mode
+            # (sampling's CPU sync already drained forward_stream).
+            forward_stream=getattr(self, "forward_stream", None),
+        )
+        self.req_to_token_pool = bundle.req_to_token_pool
+        self.token_to_kv_pool = bundle.token_to_kv_pool
+        self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
+        # Keep a reference so the shared byte buffer is not GC'd.
+        self._shared_memory_pool = bundle.shared_memory_pool
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+
+        # Shared-memory-pool fast path (Stage 1: hybrid Mamba, page_size==1).
+        # Builds req_to_token_pool + token_to_kv_pool + token_to_kv_pool_allocator
+        # together from one shared byte buffer, then returns. Gated to the target
+        # worker (req_to_token_pool is None ⇒ not a draft worker sharing it);
+        # spec/disagg are asserted off for this feature in server_args.
+        if (
+            getattr(self.server_args, "enable_shared_memory_pool", False)
+            and self.mambaish_config is not None
+            and self.server_args.disaggregation_mode == "null"
+            and self.req_to_token_pool is None
+        ):
+            self._init_shared_mamba_pools(max_num_reqs)
+            return
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
