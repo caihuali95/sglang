@@ -1402,6 +1402,9 @@ class HybridLinearKVPool(KVCache):
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
         start_layer: Optional[int] = None,
+        # When provided (shared-memory-pool path), use this pool for the
+        # full-attention layers instead of constructing one internally.
+        full_kv_pool: Optional[KVCache] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -1416,7 +1419,11 @@ class HybridLinearKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
-        if not use_mla:
+        if full_kv_pool is not None:
+            # Shared-memory-pool path: the caller built a SharedMHATokenToKVPool
+            # (or SharedMLA*...) aliasing the shared byte buffer.
+            self.full_kv_pool = full_kv_pool
+        elif not use_mla:
 
             TokenToKVPoolClass = MHATokenToKVPool
 

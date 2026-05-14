@@ -166,6 +166,19 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
+        # Shared memory pool: get_mamba_indices returns *virtual* per-request ids;
+        # translate to physical slot ids once per batch (used both for the mamba
+        # forward and for the *_track_* index derivations below). No-op for the
+        # non-shared HybridReqToTokenPool (no translate_mamba_indices method).
+        _translate_mamba = getattr(
+            self.req_to_token_pool, "translate_mamba_indices", None
+        )
+        if _translate_mamba is not None:
+            mamba_cache_indices = _translate_mamba(mamba_cache_indices)
+            if forward_batch.mamba_track_indices is not None:
+                forward_batch.mamba_track_indices = _translate_mamba(
+                    forward_batch.mamba_track_indices
+                )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(

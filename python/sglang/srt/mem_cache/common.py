@@ -403,7 +403,14 @@ def alloc_req_slots(
     """Allocate request slots from the pool."""
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
-        mamba_available_size = req_to_token_pool.mamba_pool.available_size()
+        # Use byte-coordinated availability so the planner correctly triggers
+        # eviction when the shared byte buffer is tight even if slot-wise free
+        # space looks plentiful. Falls back to `available_size()` for the
+        # non-shared `MambaPool`, where the two views coincide.
+        mamba_pool = req_to_token_pool.mamba_pool
+        mamba_available_size = getattr(
+            mamba_pool, "schedulable_available_size", mamba_pool.available_size
+        )()
         factor = (
             MAMBA_STATE_PER_REQ_PREFIX_CACHE
             if tree_cache.supports_mamba()
