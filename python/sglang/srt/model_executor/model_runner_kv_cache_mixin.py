@@ -385,23 +385,115 @@ class ModelRunnerKVCacheMixin:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._shared_memory_pool = bundle.shared_memory_pool
 
+    def _init_shared_swa_pools(self: ModelRunner, max_num_reqs: int):
+        """Build the shared-memory-pool stack for a hybrid-SWA model
+        (Stage 2, page_size==1, Triton backend): one byte buffer split between
+        the full-attention KV pool and the SWA-attention KV pool, with virtual
+        slot ids above the allocator. See shared_memory_pool_design.md §10.2."""
+        from sglang.srt.mem_cache.shared_memory_pool import init_shared_swa_pools
+
+        assert self.is_hybrid_swa, (
+            "_init_shared_swa_pools called on a non-SWA model"
+        )
+        assert self.page_size == 1, (
+            "shared memory pool Stage 2 supports page_size == 1 only"
+        )
+        assert not self.use_mla_backend, (
+            "shared memory pool Stage 2 does not support MLA-SWA hybrid yet"
+        )
+        # Mirror the non-shared path's extra_max_context_len computation.
+        extra_max_context_len = 4
+        if self.server_args.speculative_num_draft_tokens is not None:
+            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        self.req_to_token_pool = ReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+        )
+
+        head_num = self.model_config.get_num_kv_heads(get_attention_tp_size())
+        head_dim = self.model_config.head_dim
+        if self.is_hybrid_swa_compress:
+            # Asymmetric head dims between full and SWA (NPU compress path):
+            # pull SWA-specific dims from the hf text config.
+            v_head_dim = self.model_config.hf_text_config.v_head_dim
+            swa_head_num = max(
+                1,
+                self.model_config.hf_text_config.swa_num_key_value_heads
+                // get_attention_tp_size(),
+            )
+            swa_head_dim = self.model_config.hf_text_config.swa_head_dim
+            swa_v_head_dim = self.model_config.hf_text_config.swa_v_head_dim
+        else:
+            v_head_dim = head_dim
+            swa_head_num = head_num
+            swa_head_dim = head_dim
+            swa_v_head_dim = head_dim
+
+        # Filter layer ids to this worker's [start_layer, end_layer) range.
+        swa_attention_layer_ids = [
+            i
+            for i in self.model_config.swa_attention_layer_ids
+            if self.start_layer <= i < self.end_layer
+        ]
+        full_attention_layer_ids = [
+            i
+            for i in self.model_config.full_attention_layer_ids
+            if self.start_layer <= i < self.end_layer
+        ]
+
+        bundle = init_shared_swa_pools(
+            device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            swa_head_num=swa_head_num,
+            swa_head_dim=swa_head_dim,
+            swa_v_head_dim=swa_v_head_dim,
+            page_size=self.page_size,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            full_max_total_num_tokens=self.full_max_total_num_tokens,
+            swa_max_total_num_tokens=self.swa_max_total_num_tokens,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
+            # Same overlap-mode rationale as Stage 1's `_init_shared_mamba_pools`
+            # — the allocator's `free` drops a wait_stream(forward_stream) so
+            # eager compaction serializes after the in-flight forward kernels.
+            forward_stream=getattr(self, "forward_stream", None),
+        )
+        self.token_to_kv_pool = bundle.token_to_kv_pool
+        self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
+        # Keep a reference so the shared byte buffer is not GC'd.
+        self._shared_memory_pool = bundle.shared_memory_pool
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
-        # Shared-memory-pool fast path (Stage 1: hybrid Mamba, page_size==1).
-        # Builds req_to_token_pool + token_to_kv_pool + token_to_kv_pool_allocator
-        # together from one shared byte buffer, then returns. Gated to the target
-        # worker (req_to_token_pool is None ⇒ not a draft worker sharing it);
+        # Shared-memory-pool fast path. Builds req_to_token_pool +
+        # token_to_kv_pool + token_to_kv_pool_allocator together from one
+        # shared byte buffer, then returns. Gated to the target worker
+        # (`req_to_token_pool is None` ⇒ not a draft worker sharing it);
         # spec/disagg are asserted off for this feature in server_args.
+        #
+        # Stage 1: hybrid Mamba (mambaish_config is not None).
+        # Stage 2: hybrid SWA (is_hybrid_swa is True and not DSV4).
         if (
             getattr(self.server_args, "enable_shared_memory_pool", False)
-            and self.mambaish_config is not None
             and self.server_args.disaggregation_mode == "null"
             and self.req_to_token_pool is None
         ):
-            self._init_shared_mamba_pools(max_num_reqs)
-            return
+            if self.mambaish_config is not None:
+                self._init_shared_mamba_pools(max_num_reqs)
+                return
+            if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
+                self._init_shared_swa_pools(max_num_reqs)
+                return
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:

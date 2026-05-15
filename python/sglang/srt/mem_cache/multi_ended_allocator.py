@@ -27,6 +27,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.shared_memory_pool import SharedMemoryPool
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -639,5 +640,375 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self) -> None:
         self.full_attn_allocator.clear()
         self.mamba_allocator.clear()
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+
+class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
+    """Composite allocator for the hybrid SWA pair (full + swa MHA sub-pools)
+    over a `SharedMemoryPool`. Stage 2 of the shared-memory-pool feature.
+
+    Inherits from `SWATokenToKVPoolAllocator` purely for the typing/contract
+    relationship — `isinstance(allocator, SWATokenToKVPoolAllocator)` is
+    asserted across SWARadixCache, schedule_batch, chunk_cache, and disagg.
+    We do NOT call `SWATokenToKVPoolAllocator.__init__`: it would allocate two
+    static-partition sub-pools (`TokenToKVPoolAllocator` over freshly created
+    `MHATokenToKVPool` buffers), which is exactly what shared-pool replaces.
+    Grand-parent `BaseTokenToKVPoolAllocator.__init__` is called directly.
+
+    Three views on capacity (see `shared_memory_pool_design.md` §15.2 and the
+    v1 retrospective at `old_design_and_impl/multi_ended_allocator.py:1133–1196`):
+
+    - `available_size()`            : joint byte-budget, the only safe pre-check
+                                      for `alloc(N)` because N slots cost N*
+                                      (entry_full + entry_swa) bytes out of the
+                                      shared gap.
+    - `full_available_size()` /
+      `swa_available_size()`        : slot-conservation, for the leak invariant.
+                                      Static cap − allocated_count.
+    - `schedulable_full_available_size()` /
+      `schedulable_swa_available_size()` : byte-coordinated, for the scheduler's
+                                           alloc planner — may be smaller than
+                                           the slot-conservation view.
+    """
+
+    # The parent declares `size` as a `@property` without a setter, but
+    # `BaseTokenToKVPoolAllocator.__init__` does `self.size = size`. Override
+    # the property here with a no-op setter so the base init's assignment
+    # doesn't raise; reading still returns `min(_size_full, _size_swa)` as
+    # the parent intends.
+    @property
+    def size(self) -> int:
+        return min(self._size_full, self._size_swa)
+
+    @size.setter
+    def size(self, value) -> None:
+        # No-op: `size` is computed from `_size_full` / `_size_swa`. Base
+        # class init writes here; we ignore.
+        pass
+
+    def __init__(
+        self,
+        *,
+        shared_buffer: SharedMemoryPool,
+        kvcache,  # SharedSWAKVPool
+        device: str,
+        full_max_total_num_tokens: int,
+        swa_max_total_num_tokens: int,
+        need_sort: bool = False,
+        forward_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        # Set _size_full / _size_swa BEFORE base init so anything that reads
+        # `self.size` / `self.size_full` / `self.size_swa` during base init
+        # sees a sane value. Stored as the STATIC partition caps — this is
+        # the value the leak invariant expects (slot-conservation, not
+        # dynamic / byte-coordinated). See v1 lines 1158–1166 for why.
+        self._size_full = full_max_total_num_tokens
+        self._size_swa = swa_max_total_num_tokens
+        self._full_max_total_num_tokens = full_max_total_num_tokens
+        self._swa_max_total_num_tokens = swa_max_total_num_tokens
+
+        # Skip SWATokenToKVPoolAllocator.__init__ — call grand-parent base init
+        # directly. The base's `self.size = size` call is absorbed by our
+        # no-op size setter above.
+        BaseTokenToKVPoolAllocator.__init__(
+            self,
+            size=full_max_total_num_tokens,
+            page_size=1,
+            dtype=shared_buffer.mha_spec("full").store_dtype,
+            device=device,
+            kvcache=kvcache,
+            need_sort=need_sort,
+        )
+        self.shared_buffer = shared_buffer
+        self._kvcache = kvcache
+
+        self.full_attn_allocator = MultiEndedAllocator(
+            kvcache=kvcache.full_kv_pool,
+            shared_buffer=shared_buffer,
+            sub_pool_name="full",
+            device=device,
+            is_id_owner=True,
+            need_sort=need_sort,
+            forward_stream=forward_stream,
+        )
+        self.swa_attn_allocator = MultiEndedAllocator(
+            kvcache=kvcache.swa_kv_pool,
+            shared_buffer=shared_buffer,
+            sub_pool_name="swa",
+            device=device,
+            is_id_owner=False,  # ← non-owner; consumes virtuals minted by full.
+            need_sort=need_sort,
+            forward_stream=forward_stream,
+        )
+        self.full_attn_allocator.bind_peer(self.swa_attn_allocator)
+        self.swa_attn_allocator.bind_peer(self.full_attn_allocator)
+
+        # Wire the pools to translate slot ids via their allocators.
+        kvcache.full_kv_pool.attach_allocator(self.full_attn_allocator)
+        kvcache.swa_kv_pool.attach_allocator(self.swa_attn_allocator)
+        kvcache.attach_allocators(
+            full=self.full_attn_allocator, swa=self.swa_attn_allocator
+        )
+
+        self.is_not_in_free_group = True
+        self.free_group: List[torch.Tensor] = []
+        # Empty (not None) for the leak checker — same as Mamba composite.
+        self.free_pages = torch.empty(0, dtype=torch.int64, device=device)
+        self.release_pages = torch.empty(0, dtype=torch.int64, device=device)
+
+        logger.info(
+            "[shared-pool] SharedSWATokenToKVPoolAllocator ready: "
+            "full max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
+            "swa max_slots=%d (min_slot_index=%d, entry_bytes=%d), "
+            "static caps full=%d swa=%d, joint available=%d",
+            self.full_attn_allocator.max_slots,
+            self.full_attn_allocator.min_slot_index,
+            self.full_attn_allocator.entry_bytes,
+            self.swa_attn_allocator.max_slots,
+            self.swa_attn_allocator.min_slot_index,
+            self.swa_attn_allocator.entry_bytes,
+            self._full_max_total_num_tokens,
+            self._swa_max_total_num_tokens,
+            self.available_size(),
+        )
+
+    # -- capacity reporting (three-way split per v1 lessons #1–#3) --
+
+    def available_size(self) -> int:
+        """Max N such that `alloc(N)` succeeds.
+
+        Joint byte-budget: a single `alloc(N)` costs
+        `N * (entry_full + entry_swa)` bytes out of the shared byte gap. The
+        naive `min(full.available, swa.available)` uses ONE entry size and
+        overshoots — the pre-check passes, then mid-alloc the peer's byte
+        frontier has shifted. Required even when entries are equal because
+        the gap is shared. (v1 lesson #1: lines 1133–1156.)
+        """
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        entry_sum = fa.entry_bytes + sa.entry_bytes
+        # The grow-up full's high frontier and grow-down swa's low frontier
+        # together delimit the unused byte gap.
+        full_high = fa._byte_high_frontier()
+        swa_low = sa._byte_low_frontier()
+        gap_bytes = max(0, swa_low - full_high)
+        slots_by_bytes = gap_bytes // entry_sum
+        full_room = fa.max_slots - fa.min_slot_index - fa.allocated_count()
+        swa_room = sa.max_slots - sa.min_slot_index - sa.allocated_count()
+        return min(slots_by_bytes, full_room, swa_room)
+
+    # Slot-conservation views — the only views the leak invariant should see.
+    # Under shared SWA, the swa side can consume bytes that originally counted
+    # toward the full side's static budget. Returning the byte-coordinated
+    # (dynamic, peer-aware) value here would generate spurious leak
+    # detections. (v1 lesson #2: lines 1158–1177.)
+    def full_available_size(self) -> int:
+        return (
+            self._full_max_total_num_tokens
+            - self.full_attn_allocator.allocated_count()
+        )
+
+    def swa_available_size(self) -> int:
+        return (
+            self._swa_max_total_num_tokens
+            - self.swa_attn_allocator.allocated_count()
+        )
+
+    # Byte-coordinated views — used by the scheduler's alloc planner
+    # (`schedule_policy` etc.). On the non-shared `SWATokenToKVPoolAllocator`
+    # these methods alias the static views (no peer coupling). The split
+    # only matters under shared pool. (v1 lesson #3.)
+    def schedulable_full_available_size(self) -> int:
+        return self.full_attn_allocator.available_size()
+
+    def schedulable_swa_available_size(self) -> int:
+        return self.swa_attn_allocator.available_size()
+
+    # `size_full` / `size_swa` are inherited from `SWATokenToKVPoolAllocator`
+    # — they read `_size_full` / `_size_swa`, which we set to the static
+    # `full_max_total_num_tokens` / `swa_max_total_num_tokens` in __init__.
+    # We deliberately do NOT report `max_slots - 1` here: under shared pool
+    # `max_slots("full") ≈ full_max + swa_max`, which would over-promise to
+    # any caller treating these as static budgets.
+
+    def debug_print(self) -> str:
+        return (
+            f"#full-available={self.full_attn_allocator.available_size()}, "
+            f"#swa-available={self.swa_attn_allocator.available_size()}, "
+            f"#joint-available={self.available_size()}"
+        )
+
+    def get_kvcache(self):
+        return self._kvcache
+
+    def translate_kv_loc(self, loc: torch.Tensor) -> torch.Tensor:
+        """Full-layer read path: virtual token ids -> full-physical slot ids.
+        `-1` inputs map to `-1` via the trailing sentinel."""
+        return self.full_attn_allocator.virtual_to_physical[loc]
+
+    def translate_loc_from_full_to_swa(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """SWA-layer read path: virtual token ids -> swa-physical slot ids.
+        Note: the input semantics differ from the non-shared
+        `SWATokenToKVPoolAllocator.translate_loc_from_full_to_swa`
+        (which takes full-physical), but the output semantics (swa-physical
+        int32) match — downstream consumers don't care."""
+        return self.swa_attn_allocator.virtual_to_physical[kv_indices].to(
+            torch.int32
+        )
+
+    # -- alloc --
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        # Joint pre-check (v1 lesson #1) — accounts for byte pressure across
+        # both sub-pools and both index-space headrooms.
+        if need_size > self.available_size():
+            return None
+        v = self.full_attn_allocator.alloc(need_size)
+        if v is None:
+            return None
+        try:
+            self.swa_attn_allocator.alloc_with_virtual(v)
+        except AssertionError:
+            # Should be unreachable after the joint pre-check above; defensive
+            # rollback so composite state stays coherent. (v1 lesson #5.)
+            self._rollback_full_alloc(v)
+            return None
+        return v
+
+    def _rollback_full_alloc(self, v: torch.Tensor) -> None:
+        """Undo a `full_attn_allocator.alloc(need_size)` whose paired swa-side
+        `alloc_with_virtual` could not complete. Reverse the full-side
+        watermark, clear the v2p / p2v bindings, and push the minted virtual
+        ids back to the head of the free list. Symmetric to `alloc`'s order."""
+        fa = self.full_attn_allocator
+        need_size = int(v.numel())
+        if need_size == 0:
+            return
+        # Reverse the bind.
+        phys = fa.virtual_to_physical[v].clone()
+        fa.virtual_to_physical[v] = -1
+        fa.physical_to_virtual[phys] = -1
+        # Reverse the watermark advance.
+        if fa.grow_direction == "up":
+            fa.watermark_physical -= need_size
+        else:
+            fa.watermark_physical += need_size
+        # Recycle the virtuals to the head of the free list (front, so the
+        # next alloc reuses them — matches the slice-from-front consumption
+        # in `alloc`).
+        fa.free_virtual_ids = torch.cat([v, fa.free_virtual_ids])
+
+    def is_slot_allocated(self, slot: int) -> bool:
+        """Token-slot surface = the full side. SWARadixCache passes virtual
+        ids (which the full sub-allocator owns) to validate before free."""
+        return self.full_attn_allocator.is_slot_allocated(slot)
+
+    def allocator_state_str(self) -> str:
+        return self.full_attn_allocator.allocator_state_str()
+
+    # -- free --
+
+    def free(self, free_index: torch.Tensor) -> None:
+        if free_index is None or free_index.numel() == 0:
+            return
+        if not self.is_not_in_free_group:
+            self.free_group.append(free_index)
+            return
+        # Free both peers. swa first (non-owner — only releases swa-physical;
+        # doesn't touch the virtual id), then full (id-owner — recycles the
+        # virtual id). Order is not load-bearing for correctness in v2 (no
+        # cross-pool mapping coherence to maintain — there is no
+        # `full_to_swa_index_mapping`; the per-sub-pool v2p IS the mapping).
+        #
+        # Filter the swa side to skip already-tombstoned virtuals (where
+        # `swa.v2p[v] == -1` because `free_swa(v)` ran earlier). Mirrors the
+        # v1 `swa_indices > 0` filter at `old_design_and_impl/...:1387`.
+        # The full side does NOT need this filter — under SWARadixCache the
+        # full side is the lifecycle owner, so every value in `free_index`
+        # must still be bound on full.
+        v = free_index.detach().to(torch.int64)
+        swa_phys = self.swa_attn_allocator.virtual_to_physical[v]
+        live_swa = v[swa_phys > 0]
+        if live_swa.numel() > 0:
+            self.swa_attn_allocator.free(live_swa)
+        self.full_attn_allocator.free(v)
+        self.full_attn_allocator.clear_inverse_history()
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def free_swa(self, free_index: torch.Tensor) -> None:
+        """SWA tombstone path: swa-physical released, virtual id and
+        full-physical stay live.
+
+        Mirrors `SWATokenToKVPoolAllocator.free_swa`. Called by
+        `SWARadixCache._evict_swa_only` when a tree node has aged past the
+        sliding-window horizon — its swa state is no longer reachable but
+        its full state still is, so the swa-side budget gets reclaimed
+        without disturbing full bookkeeping. In v2 the SWA allocator's
+        `virtual_to_physical[v] = -1` after this call IS the tombstone."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        # Filter to virtuals that still have an swa-side binding — under v2,
+        # `swa.v2p[v] == -1` means already-tombstoned; calling `swa.free` on
+        # those would assert. (Mirrors the non-shared `free_swa`'s
+        # `swa_indices > 0` filter on its `full_to_swa_index_mapping`.)
+        v = free_index.detach().to(torch.int64)
+        # `> 0` (strict): tombstoned entries have `swa.v2p[v] == -1`; virtual
+        # id 0 is the padding sink bound to physical 0 — never freeable.
+        # Mirrors the non-shared `free_swa`'s `swa_indices > 0` filter
+        # (`swa_memory_pool.py:502`).
+        swa_phys = self.swa_attn_allocator.virtual_to_physical[v]
+        live = v[swa_phys > 0]
+        if live.numel() == 0:
+            return
+        self.swa_attn_allocator.free(live)
+        self.swa_attn_allocator.clear_inverse_history()
+
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        """No-op stub for HiCache load-back compatibility.
+
+        On the non-shared `SWATokenToKVPoolAllocator`, this rewrites the
+        `full_to_swa_index_mapping` after HiCache reallocates full + swa
+        slots. In shared mode there is no mapping tensor — the swa
+        sub-allocator's v2p table IS the mapping, and `alloc()` populates
+        it automatically. HiCache for shared SWA is out of scope for Stage 2.
+        """
+        # HiCache for the shared SWA path is a Stage-2 follow-up; this stub
+        # keeps the non-shared API surface compatible.
+        return
+
+    # -- free-group --
+
+    def free_group_begin(self) -> None:
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self) -> None:
+        self.is_not_in_free_group = True
+        if self.free_group:
+            merged = torch.cat(self.free_group)
+            self.free_group = []
+            self.free(merged)
+
+    # -- spec-decode hooks (asserted off in Stage 2; preserved for Stage 5) --
+
+    def backup_state(self):
+        return [
+            self.full_attn_allocator.backup_state(),
+            self.swa_attn_allocator.backup_state(),
+        ]
+
+    def restore_state(self, state):
+        assert len(state) == 2
+        full_rollback = self.full_attn_allocator.restore_state(state[0])
+        swa_rollback = self.swa_attn_allocator.restore_state(state[1])
+        return full_rollback + swa_rollback
+
+    def clear(self) -> None:
+        self.full_attn_allocator.clear()
+        self.swa_attn_allocator.clear()
         self.is_not_in_free_group = True
         self.free_group = []

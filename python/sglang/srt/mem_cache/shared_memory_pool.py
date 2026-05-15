@@ -29,12 +29,14 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     MambaPool,
     MHATokenToKVPool,
     move_kv_cache_native,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -1018,4 +1020,424 @@ def init_shared_mamba_pools(
         token_to_kv_pool=token_to_kv_pool,
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=req_to_token_pool,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SharedSWAKVPool — Stage 2: hybrid SWA on the shared byte buffer
+# ---------------------------------------------------------------------------
+
+
+class SharedSWAKVPool(SWAKVPool):
+    """Shared-buffer replacement for `SWAKVPool` (Stage 2).
+
+    Composes two `SharedMHATokenToKVPool` instances (full + swa) that alias
+    the same physical byte buffer. Exposes the same interface as `SWAKVPool`
+    so downstream attention/kernel code is unchanged.
+
+    Inherits from `SWAKVPool` purely for the typing/contract relationship —
+    `isinstance(kvcache, SWAKVPool)` (and `BaseSWAKVPool`) is checked across
+    attention backends, disagg, models/utils. We do NOT call the parent
+    `__init__`: it would build static-partition `MHATokenToKVPool` instances,
+    which is exactly what the shared pool replaces. The attribute layout the
+    parent sets is replicated here against the shared buffer.
+
+    Unlike v1's `SharedSWAKVPool` (which maintained an explicit
+    `full_to_swa_index_mapping` tensor), the v2 architecture exposes
+    `translate_loc_from_full_to_swa` directly through the swa sub-allocator's
+    `virtual_to_physical` table — the per-sub-pool v2p IS the mapping.
+    `register_mapping(...)` becomes a no-op (the API surface is kept for
+    `BaseSWAKVPool` ABC compatibility).
+    """
+
+    def __init__(
+        self,
+        *,
+        shared_buffer: SharedMemoryPool,
+        swa_attention_layer_ids: List[int],
+        full_attention_layer_ids: List[int],
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_memory_saver: bool = False,
+    ):
+        # NOTE: do NOT call `super().__init__(...)`. The SWAKVPool body would
+        # allocate two static-partition MHA pools; we replace those with views
+        # into the shared buffer here.
+        self.shared_buffer = shared_buffer
+        self.swa_layer_nums = len(swa_attention_layer_ids)
+        self.full_layer_nums = len(full_attention_layer_ids)
+        self.layer_num = self.full_layer_nums + self.swa_layer_nums
+        self.start_layer = start_layer if start_layer is not None else 0
+        self.page_size = 1
+        self.swa_loc: Optional[torch.Tensor] = None
+        self.layer_transfer_counter = None
+
+        # The parent class exposes `size` / `size_swa` as plain attributes
+        # (set in its __init__). Match that contract — these values are
+        # constants of the SharedMemoryPool, fixed at allocation time.
+        self.size = shared_buffer.max_slots("full") - 1
+        self.size_swa = shared_buffer.max_slots("swa") - 1
+
+        full_spec = shared_buffer.mha_spec("full")
+        swa_spec = shared_buffer.mha_spec("swa")
+        # `dtype` is read from MHASubPoolSpec.store_dtype; both sub-pools share
+        # the same store_dtype in the standard configurations we support
+        # (asymmetric store_dtype across full/swa is not a supported case).
+        assert full_spec.store_dtype == swa_spec.store_dtype, (
+            "SharedSWAKVPool: full and swa sub-pools must share store_dtype; got "
+            f"full={full_spec.store_dtype}, swa={swa_spec.store_dtype}"
+        )
+        self.dtype = full_spec.store_dtype
+        self.head_num = full_spec.head_num
+        self.head_dim = full_spec.head_dim
+        self.device = shared_buffer.device
+
+        self.full_kv_pool = SharedMHATokenToKVPool(
+            shared_buffer=shared_buffer,
+            sub_pool_name="full",
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        self.swa_kv_pool = SharedMHATokenToKVPool(
+            shared_buffer=shared_buffer,
+            sub_pool_name="swa",
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        # for disagg with nvlink — currently disabled in shared-pool, but keep
+        # the attributes present so any caller reading them doesn't AttributeError.
+        self.enable_custom_mem_pool = False
+        self.custom_mem_pool = None
+
+        # {global_layer_id: (per-pool index, is_swa_layer)}
+        self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
+        for idx, gid in enumerate(full_attention_layer_ids):
+            self.layers_mapping[gid] = (idx, False)
+        for idx, gid in enumerate(swa_attention_layer_ids):
+            self.layers_mapping[gid] = (idx, True)
+
+        # `full_to_swa_index_mapping` is the "is the non-shared SWA mapping
+        # registered?" signal in `SWAKVPool.set_kv_buffer` /
+        # `translate_loc_from_full_to_swa`. Under shared mode we leave it
+        # `None` and provide our own overrides that consult the swa
+        # sub-allocator's v2p table instead.
+        self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+
+        # The shared buffer's total size is logged by SharedMemoryPool — set a
+        # cosmetic 0 here to avoid double-counting in any aggregator.
+        self.mem_usage = 0.0
+
+        # Allocator handles wired in via `attach_allocators` from the composite
+        # allocator's __init__.
+        self._full_allocator = None
+        self._swa_allocator = None
+
+        logger.info(
+            "[shared-pool] SharedSWAKVPool wrapped shared buffer: "
+            "full_layers=%d (max_slots=%d), swa_layers=%d (max_slots=%d), "
+            "head_num=%d, head_dim=%d",
+            self.full_layer_nums,
+            shared_buffer.max_slots("full"),
+            self.swa_layer_nums,
+            shared_buffer.max_slots("swa"),
+            self.head_num,
+            self.head_dim,
+        )
+
+    # -- allocator wiring --
+
+    def attach_allocators(self, *, full, swa) -> None:
+        """Wire the two `MultiEndedAllocator`s whose `virtual_to_physical`
+        tables this pool uses to translate slot ids."""
+        self._full_allocator = full
+        self._swa_allocator = swa
+
+    # -- BaseSWAKVPool ABC surface --
+
+    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
+        # No-op in shared mode (allocator's swa-side v2p IS the mapping). Keep
+        # `full_to_swa_index_mapping` None so the parent's `set_kv_buffer`
+        # dispatch routes through our overrides.
+        return
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        """Virtual token ids -> swa-physical slot ids (int32). Differs from
+        non-shared `SWAKVPool.translate_loc_from_full_to_swa` in INPUT
+        semantics (virtual, not full-physical), but the OUTPUT is the same
+        swa-physical int32 contract the downstream consumers expect."""
+        assert self._swa_allocator is not None, (
+            "SharedSWAKVPool.translate_loc_from_full_to_swa called before "
+            "attach_allocators"
+        )
+        return self._swa_allocator.virtual_to_physical[kv_indices].to(torch.int32)
+
+    def set_swa_loc(self, loc: torch.Tensor) -> None:
+        # `loc` is already swa-physical (precomputed once per batch via
+        # `forward_batch.out_cache_loc_swa` ->
+        # `model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa`
+        # in `ForwardBatch.init_new`). Cached here for `set_kv_buffer` to
+        # consume on SWA layers without a per-call gather.
+        self.swa_loc = loc
+
+    def get_state_buf_infos(self):
+        return self.swa_kv_pool.get_contiguous_buf_infos()
+
+    # -- size/info --
+
+    def get_kv_size_bytes(self):
+        # The shared buffer's bytes are logged by SharedMemoryPool; don't
+        # double-count by returning per-side sizes here.
+        return 0, 0
+
+    def get_contiguous_buf_infos(self):
+        return self.full_kv_pool.get_contiguous_buf_infos()
+
+    # -- buffer accessors (verbatim from SWAKVPool, but without _wait_for_layer
+    # double-counting — counter wait is delegated to the inner SharedMHATokenToKVPool
+    # via register_layer_transfer_counter) --
+
+    def get_key_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        pool_layer_id, is_swa = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
+        return pool.get_key_buffer(pool_layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        pool_layer_id, is_swa = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
+        return pool.get_value_buffer(pool_layer_id)
+
+    def get_kv_buffer(self, layer_id: int):
+        self._wait_for_layer(layer_id)
+        pool_layer_id, is_swa = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa else self.full_kv_pool
+        return pool.get_kv_buffer(pool_layer_id)
+
+    # -- kv writing --
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+    ):
+        """Route to the right sub-pool. For SWA layers, prefer the
+        precomputed `swa_loc` (already swa-physical) when set; fall back to
+        a per-call translate via the swa sub-allocator if `swa_loc` is None
+        (slice-safe fallback path — mirrors `SWAKVPool.set_kv_buffer`).
+        Full layers always translate via the full sub-allocator's v2p table
+        (per-call, inside `SharedMHATokenToKVPool.set_kv_buffer`)."""
+        layer_id = layer.layer_id
+        pool_layer_id, is_swa = self.layers_mapping[layer_id]
+        if is_swa:
+            if self.swa_loc is not None:
+                # `swa_loc` is already swa-physical -> bypass the per-call
+                # virtual->physical translate inside `SharedMHATokenToKVPool`
+                # by writing through the parent `MHATokenToKVPool` directly.
+                MHATokenToKVPool.set_kv_buffer(
+                    self.swa_kv_pool,
+                    None,
+                    self.swa_loc,
+                    cache_k,
+                    cache_v,
+                    k_scale,
+                    v_scale,
+                    layer_id_override=pool_layer_id,
+                )
+                return
+            # No precomputed loc — `SharedMHATokenToKVPool.set_kv_buffer` does
+            # the virtual->swa-physical translate per call (slice-safe).
+            self.swa_kv_pool.set_kv_buffer(
+                None,
+                loc,
+                cache_k,
+                cache_v,
+                k_scale,
+                v_scale,
+                layer_id_override=pool_layer_id,
+            )
+            return
+        # Full layer: SharedMHATokenToKVPool translates virtual->full-physical
+        # per call (matches the Stage-1 Mamba path; cheap when the layer count
+        # is small).
+        self.full_kv_pool.set_kv_buffer(
+            None,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale,
+            v_scale,
+            layer_id_override=pool_layer_id,
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Should never be called on the composite — compaction operates
+        # per-sub-pool via `SharedMHATokenToKVPool.move_kv_cache` directly
+        # (each `MultiEndedAllocator._compact_pending` calls
+        # `getattr(self._kvcache, "move_kv_cache", None)` where
+        # `self._kvcache` is the per-sub-pool view, not this composite).
+        raise NotImplementedError(
+            "SharedSWAKVPool.move_kv_cache should not be called; compaction "
+            "operates per-sub-pool via SharedMHATokenToKVPool.move_kv_cache."
+        )
+
+    # -- HiCache shims (translate virtual->physical, then delegate) --
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        assert self._full_allocator is not None
+        assert self._swa_allocator is not None
+        # `indices` are virtual ids; translate per sub-pool.
+        full_phys = self._full_allocator.virtual_to_physical[indices]
+        swa_phys = self._swa_allocator.virtual_to_physical[indices]
+        full_cpu = self.full_kv_pool.get_cpu_copy(full_phys)
+        valid = swa_phys >= 0
+        swa_cpu = None
+        if bool(valid.any().item()):
+            swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
+        return {"full": full_cpu, "swa": swa_cpu}
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        assert self._full_allocator is not None
+        full_phys = self._full_allocator.virtual_to_physical[indices]
+        self.full_kv_pool.load_cpu_copy(kv_cache_cpu["full"], full_phys)
+        if kv_cache_cpu.get("swa") is not None:
+            assert self._swa_allocator is not None
+            swa_phys = self._swa_allocator.virtual_to_physical[indices]
+            self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
+
+
+# ---------------------------------------------------------------------------
+# Factory — Stage 2 SWA bundle
+# ---------------------------------------------------------------------------
+
+
+class SharedSWAPoolBundle(NamedTuple):
+    shared_memory_pool: SharedMemoryPool
+    token_to_kv_pool: object  # SharedSWAKVPool
+    token_to_kv_pool_allocator: object  # SharedSWATokenToKVPoolAllocator
+
+
+def init_shared_swa_pools(
+    *,
+    device: str,
+    kv_cache_dtype: torch.dtype,
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+    swa_head_num: int,
+    swa_head_dim: int,
+    swa_v_head_dim: int,
+    page_size: int,
+    start_layer: int,
+    end_layer: int,
+    swa_attention_layer_ids: List[int],
+    full_attention_layer_ids: List[int],
+    full_max_total_num_tokens: int,
+    swa_max_total_num_tokens: int,
+    enable_memory_saver: bool,
+    need_sort: bool,
+    forward_stream: Optional[torch.cuda.Stream] = None,
+) -> SharedSWAPoolBundle:
+    """Build the SWA-hybrid shared-pool stack: `SharedMemoryPool` (full + swa
+    sub-pools), `SharedSWAKVPool` (composite KV cache), and
+    `SharedSWATokenToKVPoolAllocator`. Stage 2 of the shared-memory-pool
+    feature."""
+    from sglang.srt.mem_cache.multi_ended_allocator import (
+        SharedSWATokenToKVPoolAllocator,
+    )
+
+    assert page_size == 1, "shared memory pool Stage 2 supports page_size == 1 only"
+    assert len(full_attention_layer_ids) > 0, (
+        "SWA-hybrid with zero full-attention layers is degenerate"
+    )
+    assert len(swa_attention_layer_ids) > 0, (
+        "SWA-hybrid with zero SWA-attention layers is degenerate"
+    )
+
+    store_dtype = _store_dtype_for(kv_cache_dtype)
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=len(full_attention_layer_ids),
+        head_num=head_num,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        store_dtype=store_dtype,
+        grow_direction="up",
+    )
+    swa_spec = MHASubPoolSpec(
+        name="swa",
+        layer_num=len(swa_attention_layer_ids),
+        head_num=swa_head_num,
+        head_dim=swa_head_dim,
+        v_head_dim=swa_v_head_dim,
+        store_dtype=store_dtype,
+        grow_direction="down",
+    )
+    total_bytes = (
+        full_max_total_num_tokens * full_spec.entry_bytes()
+        + swa_max_total_num_tokens * swa_spec.entry_bytes()
+    )
+    shared_pool = SharedMemoryPool(
+        total_bytes=total_bytes,
+        sub_pool_specs=[full_spec, swa_spec],
+        device=device,
+        enable_memory_saver=enable_memory_saver,
+    )
+    token_to_kv_pool = SharedSWAKVPool(
+        shared_buffer=shared_pool,
+        swa_attention_layer_ids=swa_attention_layer_ids,
+        full_attention_layer_ids=full_attention_layer_ids,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        enable_memory_saver=enable_memory_saver,
+    )
+    allocator = SharedSWATokenToKVPoolAllocator(
+        shared_buffer=shared_pool,
+        kvcache=token_to_kv_pool,
+        device=device,
+        full_max_total_num_tokens=full_max_total_num_tokens,
+        swa_max_total_num_tokens=swa_max_total_num_tokens,
+        need_sort=need_sort,
+        forward_stream=forward_stream,
+    )
+
+    logger.info(
+        "[shared-pool] ============================================================"
+    )
+    logger.info("[shared-pool] SHARED MEMORY POOL ENABLED -- path=SWA hybrid")
+    logger.info(
+        "[shared-pool]   full_layers=%d, swa_layers=%d, head_num=%d, head_dim=%d, "
+        "v_head_dim=%d, swa_head_num=%d, swa_head_dim=%d, swa_v_head_dim=%d, "
+        "page_size=%d",
+        len(full_attention_layer_ids),
+        len(swa_attention_layer_ids),
+        head_num,
+        head_dim,
+        v_head_dim,
+        swa_head_num,
+        swa_head_dim,
+        swa_v_head_dim,
+        page_size,
+    )
+    logger.info(
+        "[shared-pool]   total_bytes=%d (=%.2f GB), full_max_total_num_tokens=%d, "
+        "swa_max_total_num_tokens=%d, joint_available=%d slots",
+        total_bytes,
+        total_bytes / GB,
+        full_max_total_num_tokens,
+        swa_max_total_num_tokens,
+        allocator.available_size(),
+    )
+    logger.info(
+        "[shared-pool] ============================================================"
+    )
+    return SharedSWAPoolBundle(
+        shared_memory_pool=shared_pool,
+        token_to_kv_pool=token_to_kv_pool,
+        token_to_kv_pool_allocator=allocator,
     )
