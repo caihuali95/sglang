@@ -4342,10 +4342,13 @@ class ServerArgs:
             f"attention backend for the full-attention layers; got {sorted(backends)}. "
             "Pass --attention-backend triton (FA3 / FlashInfer support is planned)."
         )
-        # The model-family check (hybrid Mamba for Stage 1; hybrid SWA is Stage 2,
-        # DeepSeek V4 is Stage 4) is enforced at pool-construction time in
-        # model_runner_kv_cache_mixin._init_pools, since the model config isn't
-        # available here.
+        # The model-family check (Stage 1: hybrid Mamba; Stage 2: hybrid SWA;
+        # Stage 4: DeepSeek V4) is enforced at pool-construction time in
+        # `model_runner_kv_cache_mixin._init_pools` — `mambaish_config is not None`
+        # dispatches to the Mamba shared path; `is_hybrid_swa and not dsv4`
+        # dispatches to the SWA shared path; everything else falls through to
+        # the non-shared path. The model config isn't available here, so the
+        # gate is deferred to pool construction.
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

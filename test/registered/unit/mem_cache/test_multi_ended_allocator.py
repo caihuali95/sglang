@@ -16,7 +16,10 @@ import unittest
 
 import torch
 
-from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    MultiEndedAllocator,
+    SharedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.shared_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
@@ -288,6 +291,374 @@ class TestMultiEndedAllocator(unittest.TestCase):
         self._free(full_alloc, full_kv, v)
         with self.assertRaises(AssertionError):
             full_alloc.free(v)
+
+
+# ---------------------------------------------------------------------------
+# Shared SWA composite — Stage 2 unit tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeSharedSWAKVPool:
+    """Minimal stand-in for `SharedSWAKVPool` that the composite allocator
+    needs. Exposes the two sub-pool views (each a `_FakeKVCache` with an
+    `attach_allocator` no-op) and an `attach_allocators` setter.
+
+    CPU-only — avoids constructing a real `SharedMHATokenToKVPool` (which
+    instantiates `MHATokenToKVPool` and is heavier than these tests need).
+    """
+
+    class _SubKV(_FakeKVCache):
+        def __init__(self, max_slots):
+            super().__init__(max_slots)
+            self.allocator = None
+
+        def attach_allocator(self, allocator):
+            self.allocator = allocator
+
+    def __init__(self, shared_pool: SharedMemoryPool):
+        self.full_kv_pool = self._SubKV(shared_pool.max_slots("full"))
+        self.swa_kv_pool = self._SubKV(shared_pool.max_slots("swa"))
+        self._full_allocator = None
+        self._swa_allocator = None
+
+    def attach_allocators(self, *, full, swa):
+        self._full_allocator = full
+        self._swa_allocator = swa
+
+
+class TestSharedSWATokenToKVPoolAllocator(unittest.TestCase):
+    """Tests for the SWA composite — joint byte-budget, slot-conservation
+    leak invariant, tombstone semantics for `free_swa`, divergent compaction
+    of the two sub-pools, and the alloc-rollback path.
+
+    These tests exercise the v1 lessons captured in
+    `shared_memory_pool_design.md` and the Stage-2 plan: lessons #1 (joint
+    byte-budget), #2 (slot-conservation), #3 (`schedulable_*` split), #5
+    (watermark rollback)."""
+
+    def _build(
+        self,
+        n_full_slots=32,
+        n_swa_slots=16,
+        full_layer_num=4,
+        swa_layer_num=2,
+        head_num=2,
+        head_dim=4,
+    ):
+        full_spec = MHASubPoolSpec(
+            name="full",
+            layer_num=full_layer_num,
+            head_num=head_num,
+            head_dim=head_dim,
+            store_dtype=torch.float16,
+            grow_direction="up",
+        )
+        swa_spec = MHASubPoolSpec(
+            name="swa",
+            layer_num=swa_layer_num,
+            head_num=head_num,
+            head_dim=head_dim,
+            store_dtype=torch.float16,
+            grow_direction="down",
+        )
+        total = (
+            n_full_slots * full_spec.entry_bytes()
+            + n_swa_slots * swa_spec.entry_bytes()
+        )
+        pool = SharedMemoryPool(
+            total_bytes=total,
+            sub_pool_specs=[full_spec, swa_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        kvcache = _FakeSharedSWAKVPool(pool)
+        allocator = SharedSWATokenToKVPoolAllocator(
+            shared_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            full_max_total_num_tokens=n_full_slots,
+            swa_max_total_num_tokens=n_swa_slots,
+            need_sort=False,
+            forward_stream=None,
+        )
+        return pool, allocator, kvcache
+
+    def _alloc(self, allocator, kvcache, n):
+        """Allocate N virtual ids; stamp the data marker on both sub-pools."""
+        v = allocator.alloc(n)
+        if v is None:
+            return None
+        full_phys = allocator.full_attn_allocator.virtual_to_physical[v]
+        swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+        kvcache.full_kv_pool.buf[full_phys] = v
+        kvcache.swa_kv_pool.buf[swa_phys] = v
+        return v
+
+    def _free(self, allocator, kvcache, v):
+        """Erase markers on both sub-pools (mirror compaction's no-data-at
+        -freed-slot invariant), then call the composite's free."""
+        full_phys = allocator.full_attn_allocator.virtual_to_physical[v]
+        swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+        # erase only the LIVE swa entries (`free_swa` may have already
+        # tombstoned some of `v`).
+        valid_swa = swa_phys[swa_phys >= 0]
+        kvcache.full_kv_pool.buf[full_phys] = -1
+        kvcache.swa_kv_pool.buf[valid_swa] = -1
+        allocator.free(v)
+
+    def _check_sub_pool_invariants(self, sub, kv):
+        """Per-sub-pool: v2p ∘ p2v identity on the live set, hole-free
+        allocated band, data followed relocations."""
+        v2p = sub.virtual_to_physical
+        p2v = sub.physical_to_virtual
+        live_v = [
+            v for v in range(1, sub.num_virtual_ids) if int(v2p[v].item()) != -1
+        ]
+        for v in live_v:
+            p = int(v2p[v].item())
+            self.assertEqual(int(p2v[p].item()), v)
+            # data marker followed any relocation
+            self.assertEqual(int(kv.buf[p].item()), v)
+        if sub.grow_direction == "up":
+            lo, hi = sub.min_slot_index, sub.watermark_physical
+        else:
+            lo, hi = sub.watermark_physical + 1, sub.max_slots
+        self.assertEqual(hi - lo, len(live_v))
+        for p in range(lo, hi):
+            self.assertNotEqual(int(p2v[p].item()), -1)
+
+    # 1. Both peers hold a physical slot per virtual after composite alloc.
+    def test_swa_alloc_both_peers_hold(self):
+        _, allocator, _ = self._build()
+        v = allocator.alloc(3)
+        self.assertIsNotNone(v)
+        self.assertEqual(int(v.numel()), 3)
+        full_v2p = allocator.full_attn_allocator.virtual_to_physical
+        swa_v2p = allocator.swa_attn_allocator.virtual_to_physical
+        for vi in v.tolist():
+            self.assertGreaterEqual(int(full_v2p[vi].item()), 0)
+            self.assertGreaterEqual(int(swa_v2p[vi].item()), 0)
+        # Full sub-pool is id-owner -> the minted ids are out of free_virtual_ids.
+        free_full = set(int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist())
+        self.assertTrue(set(v.tolist()).isdisjoint(free_full))
+        # Swa sub-pool is non-owner -> free_virtual_ids is None.
+        self.assertIsNone(allocator.swa_attn_allocator.free_virtual_ids)
+
+    # 2. Composite `free` releases both sub-pools' v2p; the virtual goes back
+    # to the full id-owner's free list.
+    def test_swa_free_releases_both(self):
+        _, allocator, kvcache = self._build()
+        v = self._alloc(allocator, kvcache, 3)
+        self._free(allocator, kvcache, v)
+        for vi in v.tolist():
+            self.assertEqual(
+                int(allocator.full_attn_allocator.virtual_to_physical[vi].item()), -1
+            )
+            self.assertEqual(
+                int(allocator.swa_attn_allocator.virtual_to_physical[vi].item()), -1
+            )
+        free_full = set(int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist())
+        self.assertTrue(set(v.tolist()).issubset(free_full))
+
+    # 3. `free_swa` tombstones swa side only; virtual + full-physical stay live.
+    def test_swa_free_swa_keeps_virtual_alive(self):
+        _, allocator, kvcache = self._build()
+        v = self._alloc(allocator, kvcache, 3)
+        # Tombstone the middle one. Erase its swa marker first (compaction
+        # will run inside `free_swa`).
+        target = v[1:2]
+        target_swa = allocator.swa_attn_allocator.virtual_to_physical[target]
+        kvcache.swa_kv_pool.buf[target_swa] = -1
+        allocator.free_swa(target)
+        tgt = int(target.item())
+        # full side still bound:
+        self.assertGreaterEqual(
+            int(allocator.full_attn_allocator.virtual_to_physical[tgt].item()), 0
+        )
+        # swa side tombstoned:
+        self.assertEqual(
+            int(allocator.swa_attn_allocator.virtual_to_physical[tgt].item()), -1
+        )
+        # NOT recycled to the id-owner's free list yet:
+        free_full = set(int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist())
+        self.assertNotIn(tgt, free_full)
+        # composite `free` of the same virtual still works (filters out
+        # already-tombstoned on the swa side).
+        full_phys = int(allocator.full_attn_allocator.virtual_to_physical[tgt].item())
+        kvcache.full_kv_pool.buf[full_phys] = -1
+        allocator.free(target)
+        # now in free list:
+        free_full = set(int(x) for x in allocator.full_attn_allocator.free_virtual_ids.tolist())
+        self.assertIn(tgt, free_full)
+
+    # 4. Compaction diverges between the two sub-pools (each runs its own).
+    def test_swa_compaction_diverges_physical_layout(self):
+        _, allocator, kvcache = self._build()
+        a = self._alloc(allocator, kvcache, 1)
+        b = self._alloc(allocator, kvcache, 1)
+        c = self._alloc(allocator, kvcache, 1)
+        # Snapshot swa-side physical for c BEFORE we free_swa(b).
+        c_swa_before = int(
+            allocator.swa_attn_allocator.virtual_to_physical[c].item()
+        )
+        c_full_before = int(
+            allocator.full_attn_allocator.virtual_to_physical[c].item()
+        )
+        # Tombstone b on swa only.
+        b_swa = allocator.swa_attn_allocator.virtual_to_physical[b]
+        kvcache.swa_kv_pool.buf[b_swa] = -1
+        allocator.free_swa(b)
+        # c's full-physical UNCHANGED (full side did not compact):
+        self.assertEqual(
+            int(allocator.full_attn_allocator.virtual_to_physical[c].item()),
+            c_full_before,
+        )
+        # c's swa-physical MUST have moved (b was interior to swa's
+        # allocated band on grow-down: a then b then c means b is between
+        # them; freeing b triggers compaction relocating c into b's slot).
+        c_swa_after = int(allocator.swa_attn_allocator.virtual_to_physical[c].item())
+        self.assertNotEqual(c_swa_after, c_swa_before)
+        # Per-sub-pool invariants still hold.
+        self._check_sub_pool_invariants(
+            allocator.full_attn_allocator, kvcache.full_kv_pool
+        )
+        self._check_sub_pool_invariants(
+            allocator.swa_attn_allocator, kvcache.swa_kv_pool
+        )
+
+    # 5. Byte-frontier coordination — peer-aware available_size shrinks as
+    # the peer grows.
+    def test_swa_byte_frontier_coordination(self):
+        _, allocator, kvcache = self._build(n_full_slots=8, n_swa_slots=8)
+        avail0 = allocator.available_size()
+        # Allocate enough that the joint budget visibly tightens.
+        self._alloc(allocator, kvcache, 3)
+        self.assertLess(allocator.available_size(), avail0)
+        # Joint budget enforcement: over-alloc returns None.
+        self.assertIsNone(allocator.alloc(allocator.available_size() + 1))
+
+    # 6. Randomized stress — invariants under mixed alloc / free / free_swa.
+    def test_swa_randomized_alloc_free_freeswa(self):
+        rng = random.Random(0xBADBEE)
+        _, allocator, kvcache = self._build(
+            n_full_slots=48, n_swa_slots=24, full_layer_num=3, swa_layer_num=3
+        )
+        live = []  # list of (virtual-id tensor)
+        for _ in range(400):
+            r = rng.random()
+            if r < 0.5 or not live:  # alloc
+                n = rng.randint(1, 4)
+                v = self._alloc(allocator, kvcache, n)
+                if v is not None:
+                    live.append(("live", v))
+            elif r < 0.8:  # composite free
+                idx = rng.randrange(len(live))
+                kind, v = live.pop(idx)
+                self._free(allocator, kvcache, v)
+            else:  # free_swa on some entries
+                idx = rng.randrange(len(live))
+                kind, v = live[idx]
+                if kind != "live":
+                    continue
+                # Tombstone all of v on swa only.
+                swa_phys = allocator.swa_attn_allocator.virtual_to_physical[v]
+                kvcache.swa_kv_pool.buf[swa_phys] = -1
+                allocator.free_swa(v)
+                live[idx] = ("swa_tomb", v)
+            # Invariants after every op.
+            self._check_sub_pool_invariants(
+                allocator.full_attn_allocator, kvcache.full_kv_pool
+            )
+            self._check_sub_pool_invariants(
+                allocator.swa_attn_allocator, kvcache.swa_kv_pool
+            )
+            # Slot-conservation invariant balances at all times.
+            self.assertEqual(
+                allocator.full_available_size(),
+                allocator._full_max_total_num_tokens
+                - allocator.full_attn_allocator.allocated_count(),
+            )
+            self.assertEqual(
+                allocator.swa_available_size(),
+                allocator._swa_max_total_num_tokens
+                - allocator.swa_attn_allocator.allocated_count(),
+            )
+        # Drain.
+        for _, v in live:
+            self._free(allocator, kvcache, v)
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    # 7. Joint byte-budget pre-check (v1 lesson #1).
+    def test_swa_joint_byte_budget_pre_check(self):
+        # Pick sizes where the byte gap, not slot-index headroom, is the bind.
+        full_spec = MHASubPoolSpec(
+            name="full", layer_num=2, head_num=2, head_dim=4,
+            store_dtype=torch.float16, grow_direction="up",
+        )
+        swa_spec = MHASubPoolSpec(
+            name="swa", layer_num=2, head_num=2, head_dim=4,
+            store_dtype=torch.float16, grow_direction="down",
+        )
+        n_full, n_swa = 10, 10
+        total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
+        pool = SharedMemoryPool(
+            total_bytes=total,
+            sub_pool_specs=[full_spec, swa_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        kvcache = _FakeSharedSWAKVPool(pool)
+        allocator = SharedSWATokenToKVPoolAllocator(
+            shared_buffer=pool, kvcache=kvcache, device=_DEV,
+            full_max_total_num_tokens=n_full, swa_max_total_num_tokens=n_swa,
+            need_sort=False, forward_stream=None,
+        )
+        fa = allocator.full_attn_allocator
+        sa = allocator.swa_attn_allocator
+        # Compute the "naive min" against the joint budget — at idle, the
+        # joint budget is strictly less than min(full.available, swa.available)
+        # because the joint uses (entry_full + entry_swa) per slot.
+        naive = min(fa.available_size(), sa.available_size())
+        joint = allocator.available_size()
+        # The joint must be no greater than naive (typically strictly less).
+        self.assertLessEqual(joint, naive)
+        # And it must equal `gap_bytes // (entry_full + entry_swa)` clamped
+        # by slot-room.
+        gap = sa._byte_low_frontier() - fa._byte_high_frontier()
+        expected = min(
+            gap // (fa.entry_bytes + sa.entry_bytes),
+            fa.max_slots - fa.min_slot_index - fa.allocated_count(),
+            sa.max_slots - sa.min_slot_index - sa.allocated_count(),
+        )
+        self.assertEqual(joint, expected)
+
+    # 8. Watermark rollback on partial alloc failure (v1 lesson #5).
+    def test_swa_alloc_rollback_on_partial_failure(self):
+        _, allocator, kvcache = self._build()
+        fa = allocator.full_attn_allocator
+        sa = allocator.swa_attn_allocator
+        wm_before = fa.watermark_physical
+        free_count_before = int(fa.free_virtual_ids.numel())
+        # Monkeypatch swa.alloc_with_virtual to fail. The composite must
+        # catch the AssertionError and roll back full's allocation.
+        original = sa.alloc_with_virtual
+
+        def _bomb(virtual_ids):
+            raise AssertionError("synthetic alloc_with_virtual failure")
+
+        sa.alloc_with_virtual = _bomb
+        try:
+            v = allocator.alloc(3)
+            self.assertIsNone(v)
+        finally:
+            sa.alloc_with_virtual = original
+        # Full side state must be restored exactly:
+        self.assertEqual(fa.watermark_physical, wm_before)
+        self.assertEqual(int(fa.free_virtual_ids.numel()), free_count_before)
+        # And the now-unbound slot range must be clean:
+        for p in range(fa.watermark_physical, fa.max_slots):
+            self.assertEqual(int(fa.physical_to_virtual[p].item()), -1)
 
 
 if __name__ == "__main__":
