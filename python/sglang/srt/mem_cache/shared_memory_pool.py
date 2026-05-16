@@ -81,6 +81,20 @@ class SubPoolSpec(ABC):
         """Bytes consumed by one slot across all `layer_num` layers of this pool."""
         raise NotImplementedError
 
+    @abstractmethod
+    def get_dtype(self) -> torch.dtype:
+        """The storage dtype of this sub-pool's KV data.
+
+        Used by ``MultiEndedAllocator`` to pass to its base init's
+        ``dtype`` field (informational; matches the upstream allocator's
+        ``self.dtype`` attribute). Subclasses with a single dtype return
+        it directly; subclasses with multiple dtypes (e.g., Mamba's
+        ``conv_dtype`` and ``temporal_dtype``) return the most
+        representative one — by convention the dtype of the dominant
+        state buffer (conv for Mamba) — and document the choice.
+        """
+        raise NotImplementedError
+
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
@@ -109,6 +123,11 @@ class MHASubPoolSpec(SubPoolSpec):
     def entry_bytes(self) -> int:
         return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
 
+    def get_dtype(self) -> torch.dtype:
+        """Storage dtype of the MHA K/V buffers — single dtype shared by
+        both K and V (matches ``MHATokenToKVPool``'s contract)."""
+        return self.store_dtype
+
 
 @dataclass(frozen=True, kw_only=True)
 class MambaSubPoolSpec(SubPoolSpec):
@@ -136,6 +155,17 @@ class MambaSubPoolSpec(SubPoolSpec):
             total += self.layer_num * self.conv_row_bytes(i)
         total += self.layer_num * self.temporal_row_bytes()
         return total
+
+    def get_dtype(self) -> torch.dtype:
+        """Mamba has two distinct dtypes: ``conv_dtype`` for conv state
+        buffers and ``temporal_dtype`` for the SSM temporal state. We
+        return ``conv_dtype`` as the representative — it's the dominant
+        state (one tensor per ``conv_state_shapes`` entry; temporal is
+        single) and matches the convention of ``MambaPool.dtype`` in
+        upstream. The temporal dtype is separately accessible via
+        ``temporal_dtype`` for callers that need it.
+        """
+        return self.conv_dtype
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +436,7 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         *,
         shared_buffer: SharedMemoryPool,
         sub_pool_name: str,
+        page_size: int = 1,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
@@ -419,10 +450,16 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         self._preallocated_k_buffer = k_buffer
         self._preallocated_v_buffer = v_buffer
         self._external_allocator = None  # set via attach_allocator
+        # Stage 3: cached for the `set_kv_buffer` translate path. The K/V
+        # strided views are TOKEN-granular (one row per slot), so paging
+        # doesn't change view construction — only the translate from virtual
+        # TOKEN id → physical TOKEN id goes through page math when
+        # page_size > 1.
+        self._page_size = page_size
 
         super().__init__(
             size=max_slots - 1,  # -1 for reserved slot 0
-            page_size=1,
+            page_size=page_size,
             dtype=spec.store_dtype,
             head_num=spec.head_num,
             head_dim=spec.head_dim,
@@ -488,11 +525,31 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         v_scale=None,
         layer_id_override: Optional[int] = None,
     ):
-        # `loc` arrives as VIRTUAL slot ids (the shared-pool path); translate to
-        # physical here. This is robust to sub-batched callers that pass a slice
-        # of out_cache_loc (radix_attention.unified_attention_with_output).
+        # `loc` arrives as VIRTUAL TOKEN ids (the shared-pool path); translate
+        # to physical TOKEN ids here. This is robust to sub-batched callers
+        # that pass a slice of out_cache_loc
+        # (radix_attention.unified_attention_with_output).
+        #
+        # For page_size == 1 (Stages 1/2): direct table lookup
+        # `v2p[loc]` — behavior byte-identical.
+        #
+        # For page_size > 1 (Stage 3): page math
+        #   virt_pages = loc // page_size
+        #   offsets = loc % page_size
+        #   phys_tokens = v2p[virt_pages] * page_size + offsets
+        # The v2p table is page-granular (sized num_virtual_pages + 1);
+        # offsets within the page are preserved by the math.
         if self._external_allocator is not None:
-            loc = self._external_allocator.virtual_to_physical[loc]
+            if self._page_size == 1:
+                loc = self._external_allocator.virtual_to_physical[loc]
+            else:
+                ps = self._page_size
+                virt_pages = loc // ps
+                offsets = loc % ps
+                phys_pages = self._external_allocator.virtual_to_physical[
+                    virt_pages
+                ]
+                loc = phys_pages * ps + offsets
         super().set_kv_buffer(
             layer, loc, cache_k, cache_v, k_scale, v_scale,
             layer_id_override=layer_id_override,
@@ -616,16 +673,30 @@ class SharedMambaPool(MambaPool):
     def free_slots(self) -> torch.Tensor:
         """Physical-slot-space free list, derived from the allocator's watermark —
         consulted by the scheduler's leak checker. Falls back to the pre-shared
-        convention before `attach_allocator` runs."""
+        convention before `attach_allocator` runs.
+
+        Bounds are PAGE indices (matching the Stage-3 watermark convention).
+        The Mamba sub-allocator is always ``page_size == 1``, so pages and
+        slots coincide; we use the page-named attributes
+        (``num_virtual_pages``, ``min_page_index``) for self-consistency
+        with the rest of the page-aware code, and assert ``page_size == 1``
+        so a future change accidentally introducing a paged Mamba allocator
+        is caught here instead of producing a silent unit mismatch.
+        """
         if self._external_allocator is None:
             return torch.arange(
                 1, self._max_size + 1, dtype=torch.int64, device=self.device
             )
         alloc = self._external_allocator
+        assert alloc.page_size == 1, (
+            "SharedMambaPool.free_slots assumes the mamba allocator is "
+            f"page_size=1; got {alloc.page_size}. Mamba state is per-request "
+            "and orthogonal to per-token paging."
+        )
         if alloc.grow_direction == "up":
-            start, end = alloc.watermark_physical, alloc.max_slots
+            start, end = alloc.watermark_physical, alloc.num_virtual_pages
         else:
-            start, end = alloc.min_slot_index, alloc.watermark_physical + 1
+            start, end = alloc.min_page_index, alloc.watermark_physical + 1
         if start >= end:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
         return torch.arange(start, end, dtype=torch.int64, device=self.device)
@@ -899,9 +970,13 @@ def init_shared_mamba_pools(
     )
 
     assert not use_mla_backend, (
-        "shared memory pool Stage 1 does not support MLA-hybrid-Mamba yet"
+        "shared memory pool does not support MLA-hybrid-Mamba yet"
     )
-    assert page_size == 1, "shared memory pool Stage 1 supports page_size == 1 only"
+    # Stage 3 lifts the page_size == 1 restriction. The full sub-pool becomes
+    # page-aware (via `MultiEndedAllocator(page_size=...)`); the mamba
+    # sub-pool stays page=1 because the Mamba state is per-request,
+    # orthogonal to per-token paging.
+    assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     full_spec = MHASubPoolSpec(
@@ -954,6 +1029,7 @@ def init_shared_mamba_pools(
     shared_full_kv_pool = SharedMHATokenToKVPool(
         shared_buffer=shared_pool,
         sub_pool_name="full",
+        page_size=page_size,
         start_layer=start_layer,
         end_layer=end_layer,
     )
@@ -979,6 +1055,7 @@ def init_shared_mamba_pools(
         shared_buffer=shared_pool,
         kvcache=token_to_kv_pool,
         device=device,
+        page_size=page_size,
         need_sort=need_sort,
         forward_stream=forward_stream,
     )
@@ -1056,6 +1133,7 @@ class SharedSWAKVPool(SWAKVPool):
         shared_buffer: SharedMemoryPool,
         swa_attention_layer_ids: List[int],
         full_attention_layer_ids: List[int],
+        page_size: int = 1,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_memory_saver: bool = False,
@@ -1068,7 +1146,10 @@ class SharedSWAKVPool(SWAKVPool):
         self.full_layer_nums = len(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.start_layer = start_layer if start_layer is not None else 0
-        self.page_size = 1
+        # Stage 3: propagate page_size through to the inner SharedMHATokenToKVPool
+        # views (which translate virtual TOKEN ids → physical TOKEN ids via
+        # page math when page_size > 1).
+        self.page_size = page_size
         self.swa_loc: Optional[torch.Tensor] = None
         self.layer_transfer_counter = None
 
@@ -1095,12 +1176,14 @@ class SharedSWAKVPool(SWAKVPool):
         self.full_kv_pool = SharedMHATokenToKVPool(
             shared_buffer=shared_buffer,
             sub_pool_name="full",
+            page_size=page_size,
             start_layer=start_layer,
             end_layer=end_layer,
         )
         self.swa_kv_pool = SharedMHATokenToKVPool(
             shared_buffer=shared_buffer,
             sub_pool_name="swa",
+            page_size=page_size,
             start_layer=start_layer,
             end_layer=end_layer,
         )
@@ -1162,15 +1245,35 @@ class SharedSWAKVPool(SWAKVPool):
         return
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa-physical slot ids (int32). Differs from
-        non-shared `SWAKVPool.translate_loc_from_full_to_swa` in INPUT
-        semantics (virtual, not full-physical), but the OUTPUT is the same
-        swa-physical int32 contract the downstream consumers expect."""
+        """Virtual token ids -> swa-physical token ids (int32).
+
+        Differs from non-shared ``SWAKVPool.translate_loc_from_full_to_swa``
+        in INPUT semantics (virtual, not full-physical), but the OUTPUT is
+        the same swa-physical-token-id int32 contract the downstream
+        consumers expect.
+
+        For ``page_size == 1``: direct v2p lookup (the v2p table is
+        slot-granular == token-granular).
+        For ``page_size > 1``: page math —
+        ``virt_pages = kv_indices // page_size``,
+        ``offsets = kv_indices % page_size``,
+        ``swa_phys_pages = swa.v2p_page[virt_pages]``,
+        result ``= swa_phys_pages * page_size + offsets``.
+        Mirrors ``SharedSWATokenToKVPoolAllocator.translate_loc_from_full_to_swa``.
+        """
         assert self._swa_allocator is not None, (
             "SharedSWAKVPool.translate_loc_from_full_to_swa called before "
             "attach_allocators"
         )
-        return self._swa_allocator.virtual_to_physical[kv_indices].to(torch.int32)
+        ps = self._swa_allocator.page_size
+        if ps == 1:
+            return self._swa_allocator.virtual_to_physical[kv_indices].to(
+                torch.int32
+            )
+        virt_pages = kv_indices // ps
+        offsets = kv_indices % ps
+        swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
+        return (swa_phys_pages * ps + offsets).to(torch.int32)
 
     def set_swa_loc(self, loc: torch.Tensor) -> None:
         # `loc` is already swa-physical (precomputed once per batch via
@@ -1288,12 +1391,35 @@ class SharedSWAKVPool(SWAKVPool):
 
     # -- HiCache shims (translate virtual->physical, then delegate) --
 
+    @staticmethod
+    def _virt_tokens_to_phys_tokens(
+        virt_tokens: torch.Tensor, allocator
+    ) -> torch.Tensor:
+        """Translate virtual TOKEN ids → physical TOKEN ids on the given
+        sub-allocator. Page-aware: when ``allocator.page_size > 1``, applies
+        the `virt_page * page_size + offset` math.
+
+        Returns ``-1`` for any input whose virtual page is unbound (i.e.
+        ``v2p_page[virt_page] == -1``) — propagated as ``-1 * page_size +
+        offset``, but callers (HiCache) filter out negatives via
+        ``swa_phys >= 0`` so this is safe.
+        """
+        ps = allocator.page_size
+        if ps == 1:
+            return allocator.virtual_to_physical[virt_tokens]
+        virt_pages = virt_tokens // ps
+        offsets = virt_tokens % ps
+        phys_pages = allocator.virtual_to_physical[virt_pages]
+        return phys_pages * ps + offsets
+
     def get_cpu_copy(self, indices, mamba_indices=None):
         assert self._full_allocator is not None
         assert self._swa_allocator is not None
-        # `indices` are virtual ids; translate per sub-pool.
-        full_phys = self._full_allocator.virtual_to_physical[indices]
-        swa_phys = self._swa_allocator.virtual_to_physical[indices]
+        # `indices` are virtual TOKEN ids; translate per sub-pool with the
+        # same page math as `translate_loc_from_full_to_swa` so the produced
+        # physical token ids are correct at any page_size.
+        full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
+        swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
         full_cpu = self.full_kv_pool.get_cpu_copy(full_phys)
         valid = swa_phys >= 0
         swa_cpu = None
@@ -1303,11 +1429,13 @@ class SharedSWAKVPool(SWAKVPool):
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         assert self._full_allocator is not None
-        full_phys = self._full_allocator.virtual_to_physical[indices]
+        full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
         self.full_kv_pool.load_cpu_copy(kv_cache_cpu["full"], full_phys)
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
-            swa_phys = self._swa_allocator.virtual_to_physical[indices]
+            swa_phys = self._virt_tokens_to_phys_tokens(
+                indices, self._swa_allocator
+            )
             self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
 
 
@@ -1351,7 +1479,13 @@ def init_shared_swa_pools(
         SharedSWATokenToKVPoolAllocator,
     )
 
-    assert page_size == 1, "shared memory pool Stage 2 supports page_size == 1 only"
+    # Stage 3 lifts the page_size == 1 restriction; both sub-allocators
+    # become page-aware (one virtual ID space at PAGE granularity, two
+    # physical-holding sub-pools that compact pages independently). The
+    # kernel-once-in-virtual-space discipline in
+    # `SharedSWATokenToKVPoolAllocator.alloc_extend` preserves the upstream
+    # tail-page-reuse contract across both sub-pools.
+    assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
     assert len(full_attention_layer_ids) > 0, (
         "SWA-hybrid with zero full-attention layers is degenerate"
     )
@@ -1392,6 +1526,7 @@ def init_shared_swa_pools(
         shared_buffer=shared_pool,
         swa_attention_layer_ids=swa_attention_layer_ids,
         full_attention_layer_ids=full_attention_layer_ids,
+        page_size=page_size,
         start_layer=start_layer,
         end_layer=end_layer,
         enable_memory_saver=enable_memory_saver,
@@ -1402,6 +1537,7 @@ def init_shared_swa_pools(
         device=device,
         full_max_total_num_tokens=full_max_total_num_tokens,
         swa_max_total_num_tokens=swa_max_total_num_tokens,
+        page_size=page_size,
         need_sort=need_sort,
         forward_stream=forward_stream,
     )
