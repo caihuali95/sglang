@@ -4541,8 +4541,10 @@ class ServerArgs:
     def _handle_shared_memory_pool(self):
         if not self.enable_shared_memory_pool:
             return
-        # Stage 1/2 gating; Stage 5 lifts the spec/disagg restrictions, Stage 3
-        # the page_size one.
+        # Stage 1/2/3 gating; Stage 5 lifts the spec/disagg restrictions.
+        # Stage 3 lifted the page_size == 1 restriction (Stage 3 supports
+        # page_size > 1 via `MultiEndedAllocator(page_size=...)` and the
+        # composite's kernel-once-in-virtual-space discipline).
         assert self.disaggregation_mode == "null", (
             "--enable-shared-memory-pool is not yet compatible with PD "
             "disaggregation (Stage 5)."
@@ -4550,10 +4552,6 @@ class ServerArgs:
         assert self.speculative_algorithm is None, (
             "--enable-shared-memory-pool is not yet compatible with speculative "
             "decoding (Stage 5)."
-        )
-        assert (self.page_size or 1) == 1, (
-            "--enable-shared-memory-pool currently supports page_size == 1 only "
-            "(Stage 3 lifts this)."
         )
         # Stage 1 does not wire the cuda-graph input buffers for the shared pool
         # yet; require eager execution. (Follow-up: capture the per-batch
@@ -4586,12 +4584,13 @@ class ServerArgs:
         }
         backends.discard(None)
         assert backends <= {"triton"}, (
-            "--enable-shared-memory-pool (Stage 1) currently only wires the Triton "
+            "--enable-shared-memory-pool currently only wires the Triton "
             f"attention backend for the full-attention layers; got {sorted(backends)}. "
             "Pass --attention-backend triton (FA3 / FlashInfer support is planned)."
         )
         # The model-family check (Stage 1: hybrid Mamba; Stage 2: hybrid SWA;
-        # Stage 4: DeepSeek V4) is enforced at pool-construction time in
+        # Stage 3 extends both to page_size > 1; Stage 4: DeepSeek V4) is
+        # enforced at pool-construction time in
         # `model_runner_kv_cache_mixin._init_pools` — `mambaish_config is not None`
         # dispatches to the Mamba shared path; `is_hybrid_swa and not dsv4`
         # dispatches to the SWA shared path; everything else falls through to
