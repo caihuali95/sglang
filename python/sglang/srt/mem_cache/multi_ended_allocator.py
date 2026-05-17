@@ -434,6 +434,101 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         for readability at the SWA composite call site."""
         self.bind(virtual_pages, physical_pages)
 
+    # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
+
+    def translate_kv_loc(
+        self,
+        virt_tokens: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Translate token-granular virtual ids to token-granular physical ids.
+
+        Stage 3.5: the ``out=`` parameter writes results in-place into a
+        caller-owned buffer. Required under cuda-graph capture for
+        buffer-stability — the captured graph records the gather/multiply/add
+        sequence against a fixed ``data_ptr``, replay re-runs against the
+        same buffer.
+
+        Args:
+            virt_tokens: int64[N] virtual token ids (page-structured).
+            out: optional int64[N] output tensor. When ``None`` (default),
+                returns a fresh tensor — byte-identical to Stage 1/2/3
+                behavior. When provided, writes in-place and returns ``out``.
+
+        Returns:
+            int64[N] physical token ids. If ``out`` was given, returns ``out``.
+        """
+        if out is not None:
+            assert out.dtype == torch.int64, (
+                f"translate_kv_loc: out= dtype must be int64 (matches v2p), "
+                f"got {out.dtype}"
+            )
+            assert out.shape == virt_tokens.shape, (
+                f"translate_kv_loc: out= shape {tuple(out.shape)} must match "
+                f"virt_tokens shape {tuple(virt_tokens.shape)}"
+            )
+        # Tombstone-safety clamp: tombstoned `v2p` entries (-1) must not reach
+        # `k_buffer[-1]` when read by the captured graph. Under cuda-graph
+        # capture, this method is called eagerly each replay-prep to populate
+        # capture-stable buffers (`out_cache_loc_full_physical`,
+        # `cuda_graph_kv_indices`); the captured kernels then index k/v
+        # buffers with those values. A captured `k_buffer[-1]` is an illegal
+        # memory access and crashes `graph.replay()`.
+        #
+        # Negative outputs can arise from:
+        #   - padded-tail positions in the captured buffer whose stale virtual
+        #     ids point at pages that have since been tombstoned by free /
+        #     `_compact_pending`;
+        #   - the zero-clear sentinel positions in `bs != raw_bs` replays
+        #     (these are 0 -> v2p[0] = 0 -> 0; clamp is a no-op for those).
+        # Clamping to 0 routes any tombstoned read/write to physical slot 0,
+        # which is reserved padding-sink space by Stage 1's `min_slot_index`
+        # invariant: bytes `[0, entry_max)` across all sub-pools hold no real
+        # data (see §S3 dummy-write safety proof). Cost: one elementwise op
+        # per call; safe.
+        if self.page_size == 1:
+            if out is not None:
+                # CRITICAL: `torch.index_select(src, dim, index, out=out)`
+                # does NOT support aliasing between `index` and `out`. The
+                # canonical caller from `triton_backend.py` is
+                # `self._translate_kv_loc(kv_indices, out=kv_indices)`, where
+                # `virt_tokens` and `out` are the SAME buffer (in-place
+                # translate). Route through a transient gather + in-place
+                # `copy_` to satisfy index_select's no-aliasing contract.
+                # The transient `tmp` is fresh per call but caching-allocator-
+                # cached under cuda-graph capture; the observable mutation is
+                # `out.copy_(tmp)` into the stable buffer.
+                tmp = torch.index_select(
+                    self.virtual_to_physical, 0, virt_tokens
+                )
+                tmp = torch.clamp_min(tmp, 0)
+                out.copy_(tmp)
+                return out
+            result = torch.index_select(
+                self.virtual_to_physical, 0, virt_tokens
+            )
+            return torch.clamp_min(result, 0)
+        # page_size > 1: page math.
+        # Note: `virt_pages` and `offsets` are fresh tensors (results of
+        # `// page_size` and `% page_size`), so they cannot alias `out`. The
+        # `index_select(out=out)` below is therefore safe even when `out`
+        # aliases `virt_tokens`.
+        virt_pages = virt_tokens // self.page_size  # fresh int64[N]
+        offsets = virt_tokens % self.page_size  # fresh int64[N]
+        if out is not None:
+            torch.index_select(
+                self.virtual_to_physical, 0, virt_pages, out=out
+            )
+            out.mul_(self.page_size)
+            out.add_(offsets)
+            # Tombstoned page: -1 * ps + offset is in [-ps, -1]; clamp to 0.
+            out.clamp_(min=0)
+            return out
+        phys_pages = self.virtual_to_physical[virt_pages]
+        result = phys_pages * self.page_size + offsets
+        return torch.clamp_min(result, 0)
+
     # -- alloc --
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -1026,29 +1121,24 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens, seq_lens_cpu, last_loc
         )
 
-    def translate_kv_loc(self, loc: torch.Tensor) -> torch.Tensor:
+    def translate_kv_loc(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Full-pool virtual TOKEN ids -> physical TOKEN ids (for the
-        write/read paths).
+        write/read paths). Delegates to the full-side sub-allocator's
+        ``translate_kv_loc`` (page-math is in the base class).
 
-        For page_size == 1: direct table lookup (`v2p[loc]`) — Stage 1/2
-        behavior byte-identical.
-
-        For page_size > 1: page math — `virt_page = loc // page_size`,
-        `offset = loc % page_size`, `phys_token = v2p[virt_page] * page_size
-        + offset`. Output remains TOKEN-granular (preserves
-        `_translate_kv_loc(...)` callers' contract in `triton_backend.py`).
+        Stage 3.5: supports ``out=`` for cuda-graph buffer stability —
+        passes through to the base-class implementation.
 
         `-1` inputs map to `-1` via the trailing sentinel (page=1) or via
         the page math `(-1 // ps == -1)`, `v2p[-1] == -1`, `(-1)*ps + offset
         ≤ 0` — Triton's `select_index` semantics still treat this as padding.
         """
-        if self.full_attn_allocator.page_size == 1:
-            return self.full_attn_allocator.virtual_to_physical[loc]
-        ps = self.full_attn_allocator.page_size
-        virt_pages = loc // ps
-        offsets = loc % ps
-        phys_pages = self.full_attn_allocator.virtual_to_physical[virt_pages]
-        return phys_pages * ps + offsets
+        return self.full_attn_allocator.translate_kv_loc(loc, out=out)
 
     def is_slot_allocated(self, slot: int) -> bool:
         return self.full_attn_allocator.is_slot_allocated(slot)
@@ -1313,23 +1403,25 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
-    def translate_kv_loc(self, loc: torch.Tensor) -> torch.Tensor:
+    def translate_kv_loc(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Full-layer read path: virtual TOKEN ids -> full-physical TOKEN ids.
+        Delegates to the full-side sub-allocator's ``translate_kv_loc``
+        (page-math is in the base class).
 
-        For page_size == 1: direct table lookup. For page_size > 1: page math
-        (virt_page = loc // ps; offset = loc % ps; phys_token = v2p[virt_page]
-        * ps + offset). Output remains token-granular.
+        Stage 3.5: supports ``out=`` for cuda-graph buffer stability.
         """
-        if self.full_attn_allocator.page_size == 1:
-            return self.full_attn_allocator.virtual_to_physical[loc]
-        ps = self.full_attn_allocator.page_size
-        virt_pages = loc // ps
-        offsets = loc % ps
-        phys_pages = self.full_attn_allocator.virtual_to_physical[virt_pages]
-        return phys_pages * ps + offsets
+        return self.full_attn_allocator.translate_kv_loc(loc, out=out)
 
     def translate_loc_from_full_to_swa(
-        self, kv_indices: torch.Tensor
+        self,
+        kv_indices: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """SWA-layer read path: virtual TOKEN ids -> swa-physical TOKEN ids.
 
@@ -1337,20 +1429,59 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         math, identical to ``translate_kv_loc`` but against the swa side's
         v2p table. Output is int32 to match the non-shared API contract.
 
+        Stage 3.5: supports ``out=`` for cuda-graph buffer stability. The
+        ``out=`` buffer MUST be int32 and the same shape as ``kv_indices``.
+
         Note: the input semantics differ from the non-shared
         `SWATokenToKVPoolAllocator.translate_loc_from_full_to_swa`
         (which takes full-physical), but the output semantics (swa-physical
         int32) match — downstream consumers don't care.
         """
-        if self.swa_attn_allocator.page_size == 1:
-            return self.swa_attn_allocator.virtual_to_physical[kv_indices].to(
-                torch.int32
+        if out is not None:
+            assert out.dtype == torch.int32, (
+                f"translate_loc_from_full_to_swa: out= dtype must be int32 "
+                f"(matches SWA Triton kernel contract), got {out.dtype}"
             )
+            assert out.shape == kv_indices.shape, (
+                f"translate_loc_from_full_to_swa: out= shape "
+                f"{tuple(out.shape)} must match kv_indices shape "
+                f"{tuple(kv_indices.shape)}"
+            )
+        # Tombstone-safety clamp (mirrors the full-side clamp in
+        # `MultiEndedAllocator.translate_kv_loc`): v2p_swa entries can be
+        # tombstoned to -1 by `_compact_pending` / `free` / `free_swa`. The
+        # captured SWA attention kernel reads `swa_k_buffer[result[i]]` at
+        # replay; `swa_k_buffer[-1]` is illegal memory access. Negative
+        # outputs are routed to physical slot 0 (the reserved padding sink
+        # under Stage 1's `min_slot_index` invariant — bytes
+        # `[0, entry_max)` across all sub-pools hold no real data; see §S3
+        # dummy-write safety proof). For page_size > 1 a tombstoned page
+        # produces values in `[-ps, -1]` via `swa_phys * ps + offsets`; the
+        # clamp covers that range too.
+        if self.swa_attn_allocator.page_size == 1:
+            if out is not None:
+                # Two-step: gather into a transient int64 then cast into out.
+                # The intermediate `tmp` is fresh per call but caching-
+                # allocator-cached; the observable mutation is `out.copy_`.
+                tmp = torch.index_select(
+                    self.swa_attn_allocator.virtual_to_physical, 0, kv_indices
+                )
+                tmp = torch.clamp_min(tmp, 0)
+                out.copy_(tmp.to(torch.int32))
+                return out
+            result = self.swa_attn_allocator.virtual_to_physical[kv_indices]
+            result = torch.clamp_min(result, 0)
+            return result.to(torch.int32)
         ps = self.swa_attn_allocator.page_size
         virt_pages = kv_indices // ps
         offsets = kv_indices % ps
         swa_phys_pages = self.swa_attn_allocator.virtual_to_physical[virt_pages]
-        return (swa_phys_pages * ps + offsets).to(torch.int32)
+        result = (swa_phys_pages * ps + offsets).to(torch.int32)
+        result = torch.clamp_min(result, 0)
+        if out is not None:
+            out.copy_(result)
+            return out
+        return result
 
     # -- alloc --
 

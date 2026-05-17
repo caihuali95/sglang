@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -303,6 +304,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
+    # Stage 3.5: per-batch full-physical-token-id translation of
+    # `out_cache_loc`, used by the full-attention write path under the
+    # shared-memory-pool. Set only when `model_runner.enable_shared_memory_pool`
+    # is on (else None — the write path falls back to the per-call translate
+    # in `SharedMHATokenToKVPool.set_kv_buffer`). int64 to match the v2p
+    # table dtype.
+    out_cache_loc_full_physical: Optional[torch.Tensor] = None
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -601,6 +609,94 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     ret.out_cache_loc
                 )
             )
+
+        # Stage 3.5: precompute full-physical cache location for the shared-
+        # memory-pool path. Covers BOTH the SWA shared composite and the
+        # Mamba shared composite — `translate_kv_loc` exists on both
+        # `SharedMambaTokenToKVPoolAllocator` and
+        # `SharedSWATokenToKVPoolAllocator`. When shared pool is off, the
+        # allocator does not have `translate_kv_loc` and the precompute is
+        # skipped. Result is int64 (matches v2p table dtype); consumed by
+        # `SharedMHATokenToKVPool.set_kv_buffer`'s fast path which bypasses
+        # the per-layer v2p gather. Required for cuda-graph capture.
+        if (
+            getattr(model_runner, "enable_shared_memory_pool", False)
+            and ret.out_cache_loc is not None
+            and hasattr(model_runner.token_to_kv_pool_allocator, "translate_kv_loc")
+        ):
+            ret.out_cache_loc_full_physical = (
+                model_runner.token_to_kv_pool_allocator.translate_kv_loc(
+                    ret.out_cache_loc
+                )
+            )
+
+        # Stage 3.5 diagnostic: env-gated invariant check. The clamps inside
+        # `translate_kv_loc` / `translate_loc_from_full_to_swa` and inside
+        # `SharedMHATokenToKVPool.set_kv_buffer`'s elif route tombstoned
+        # `v2p[live_virtual]` reads/writes to the reserved padding sink so
+        # the captured graph cannot crash on `k_buffer[-1]`. The clamps mask
+        # any underlying invariant violation (live virtuals should never
+        # have v2p == -1). Enable this check (export
+        # `SGLANG_DEBUG_CHECK_V2P_TOMBSTONES=1`) to surface such violations
+        # eagerly with a Python traceback that names the offending virtuals.
+        # Cost: one gather + one any() per batch — only enabled for
+        # debugging. Validated under heavy pressure (mfs=0.55, 56 cells) to
+        # have zero false positives, suggesting the clamps fire on padded /
+        # zero-cleared entries only — but if any future regression brings a
+        # live tombstone, this check will catch it before the clamp hides it.
+        if (
+            os.environ.get("SGLANG_DEBUG_CHECK_V2P_TOMBSTONES", "0") == "1"
+            and getattr(model_runner, "enable_shared_memory_pool", False)
+            and ret.out_cache_loc is not None
+        ):
+            alloc = model_runner.token_to_kv_pool_allocator
+            full = getattr(alloc, "full_attn_allocator", None)
+            if full is not None:
+                ps = full.page_size
+                v_pages = (
+                    ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
+                )
+                raw_v2p = full.virtual_to_physical[v_pages]
+                bad_mask = raw_v2p < 0
+                if bool(bad_mask.any().item()):
+                    bad_idx = bad_mask.nonzero(as_tuple=False).flatten()
+                    sample = bad_idx[: min(8, bad_idx.numel())]
+                    raise AssertionError(
+                        "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES: v2p_full has "
+                        "tombstoned (-1) entries for live virtual ids in "
+                        f"out_cache_loc. count={int(bad_mask.sum().item())}, "
+                        f"sample_positions={sample.tolist()}, "
+                        f"sample_virtuals={ret.out_cache_loc[sample].tolist()}, "
+                        "indicates an invariant violation — a live virtual "
+                        "should always map to a non-negative physical. The "
+                        "tombstone-safety clamp in translate_kv_loc would "
+                        "otherwise mask this by routing the read/write to "
+                        "physical slot 0 (the padding sink)."
+                    )
+            swa = getattr(alloc, "swa_attn_allocator", None)
+            if swa is not None:
+                ps = swa.page_size
+                v_pages = (
+                    ret.out_cache_loc // ps if ps > 1 else ret.out_cache_loc
+                )
+                raw_v2p_swa = swa.virtual_to_physical[v_pages]
+                # Tombstone on swa side: -1 = freed/never-bound. Don't fail
+                # on 0 (sentinel page) because under SWARadixCache the swa
+                # side can legitimately have padding-page bindings.
+                bad_mask = raw_v2p_swa < 0
+                if bool(bad_mask.any().item()):
+                    bad_idx = bad_mask.nonzero(as_tuple=False).flatten()
+                    sample = bad_idx[: min(8, bad_idx.numel())]
+                    raise AssertionError(
+                        "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES: v2p_swa has "
+                        "tombstoned (-1) entries for live virtual ids in "
+                        f"out_cache_loc. count={int(bad_mask.sum().item())}, "
+                        f"sample_positions={sample.tolist()}, "
+                        f"sample_virtuals={ret.out_cache_loc[sample].tolist()}, "
+                        "indicates an invariant violation. The clamp in "
+                        "translate_loc_from_full_to_swa would otherwise "
+                        "mask this by routing to swa-physical slot 0."
+                    )
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -961,6 +1057,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.out_cache_loc_swa is not None:
             self.out_cache_loc_swa = self._pad_tensor_to_size(
                 self.out_cache_loc_swa, num_tokens
+            )
+        # Stage 3.5: pad the shared-pool full-physical precompute. Padding
+        # value 0 → virtual token 0 → physical token 0 (padding sink, see
+        # §S3 dummy-write safety proof).
+        if self.out_cache_loc_full_physical is not None:
+            self.out_cache_loc_full_physical = self._pad_tensor_to_size(
+                self.out_cache_loc_full_physical, num_tokens
             )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)

@@ -616,6 +616,29 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Stage 3.5: translate virtual->full-physical in-place over
+                # the VALID PREFIX only. `self.cuda_graph_kv_indices` is a
+                # pre-allocated multi-megabyte buffer; the kernel above only
+                # writes the first `kv_indptr[-1]` entries. Translating the
+                # full buffer was a bug: stale data in the
+                # tail (left over from prior replays) would be re-translated
+                # via `v2p`, producing negative values (when a tail entry's
+                # `// page_size` happens to hit a now-unbound virtual page,
+                # `v2p[k] = -1`, then `out.mul_(ps) + offset` yields negative
+                # numbers in [-ps, -1]). On the NEXT replay the cycle repeats
+                # and CUDA's index_select rejects `idx = -1`.
+                #
+                # Slicing with `kv_indptr[-1]` (a 0-d tensor) triggers an
+                # implicit `.item()` sync — mirroring the established pattern
+                # in `update_sliding_window_buffer_cuda_graph` (lines
+                # 1533–1539) which does the same. No-op for non-shared-pool
+                # allocators (no `translate_kv_loc` method).
+                if self._translate_kv_loc is not None:
+                    kv_last_index = kv_indptr[-1]
+                    self._translate_kv_loc(
+                        kv_indices[:kv_last_index],
+                        out=kv_indices[:kv_last_index],
+                    )
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
@@ -778,6 +801,19 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Stage 3.5: in-place translate virtual->full-physical over
+                # the VALID PREFIX only — same fix as the capture path above
+                # Without the `[:kv_last_index]` slice, stale
+                # data in the buffer tail would be re-translated each replay
+                # and eventually produce negative `virt_pages` values that
+                # CUDA's index_select rejects with a scatter-gather OOB
+                # assert.
+                if self._translate_kv_loc is not None:
+                    kv_last_index = kv_indptr[-1]
+                    self._translate_kv_loc(
+                        kv_indices[:kv_last_index],
+                        out=kv_indices[:kv_last_index],
+                    )
                 num_token = bs
                 if (
                     self.sliding_window_size is not None

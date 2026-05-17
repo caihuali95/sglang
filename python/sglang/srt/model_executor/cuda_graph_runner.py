@@ -140,6 +140,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
     out_cache_loc_swa: Optional[torch.Tensor]
+    # Stage 3.5: shared-memory-pool full-physical precompute. int64
+    # (matches v2p table dtype). None if shared pool is off.
+    out_cache_loc_full_physical: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -174,6 +177,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
+        enable_shared_memory_pool: bool = False,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -184,6 +188,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
             out_cache_loc_swa = (
                 torch.zeros((max_num_token,), dtype=torch.int32)
                 if is_hybrid_swa
+                else None
+            )
+            # Stage 3.5: shared-pool full-physical precompute buffer. int64
+            # (NOT int32 — matches v2p table dtype). Pinned to the pool's
+            # `_precomputed_loc` at capture time via set_full_loc.
+            out_cache_loc_full_physical = (
+                torch.zeros((max_num_token,), dtype=torch.int64)
+                if enable_shared_memory_pool
                 else None
             )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -258,6 +270,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             out_cache_loc_swa=out_cache_loc_swa,
+            out_cache_loc_full_physical=out_cache_loc_full_physical,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -295,6 +308,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             # positions map to the sentinel slot (matches piecewise runner).
             if self.out_cache_loc_swa is not None:
                 self.out_cache_loc_swa.zero_()
+            # Stage 3.5: same reasoning for the full-physical buffer — stale
+            # padded entries would target real slots. Zero → physical slot 0
+            # (padding sink, see §S3 dummy-write safety proof).
+            if self.out_cache_loc_full_physical is not None:
+                self.out_cache_loc_full_physical.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -378,6 +396,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ):
             dsts.append(self.out_cache_loc_swa[:raw_num_token])
             srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
+
+        # Stage 3.5: shared-pool full-physical precompute (int64). Joins the
+        # int64 group inside `_grouped_foreach_copy_` automatically.
+        if (
+            self.out_cache_loc_full_physical is not None
+            and forward_batch.out_cache_loc_full_physical is not None
+        ):
+            dsts.append(self.out_cache_loc_full_physical[:raw_num_token])
+            srcs.append(forward_batch.out_cache_loc_full_physical[:raw_num_token])
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
@@ -715,6 +742,13 @@ class CudaGraphRunner:
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
             is_hybrid_swa=model_runner.is_hybrid_swa,
+            # Stage 3.5: when shared pool is enabled, allocate a
+            # capture-stable int64 buffer for `out_cache_loc_full_physical`
+            # and pin it into the pool's `_precomputed_loc` at capture time
+            # (see `capture_one_batch_size` below).
+            enable_shared_memory_pool=getattr(
+                model_runner, "enable_shared_memory_pool", False
+            ),
         )
         self.buffers.share_buffers()
 
@@ -1169,6 +1203,14 @@ class CudaGraphRunner:
         if self.buffers.out_cache_loc_swa is not None:
             self.model_runner.token_to_kv_pool.set_swa_loc(
                 self.buffers.out_cache_loc_swa[:num_tokens]
+            )
+
+        # full_loc precompute pin for the captured forward.
+        if self.buffers.out_cache_loc_full_physical is not None and hasattr(
+            self.model_runner.token_to_kv_pool, "set_full_loc"
+        ):
+            self.model_runner.token_to_kv_pool.set_full_loc(
+                self.buffers.out_cache_loc_full_physical[:num_tokens]
             )
 
         for _ in range(2):

@@ -4305,14 +4305,25 @@ class ServerArgs:
             "--enable-shared-memory-pool is not yet compatible with speculative "
             "decoding (Stage 5)."
         )
-        # Stage 1 does not wire the cuda-graph input buffers for the shared pool
-        # yet; require eager execution. (Follow-up: capture the per-batch
-        # virtual->physical out_cache_loc translation into a graph buffer.)
-        if not self.disable_cuda_graph:
-            self.disable_cuda_graph = True
-            logger.warning(
-                "--enable-shared-memory-pool: forcing --disable-cuda-graph "
-                "(cuda-graph support for the shared pool is not implemented yet)."
+        # Stage 3.5: monolithic decode cuda-graph capture is supported via
+        # the per-batch `out_cache_loc_full_physical` precompute (set on
+        # ForwardBatch.init_new) and the `set_full_loc`/`_precomputed_loc`
+        # fast path in SharedMHATokenToKVPool.set_kv_buffer. Plus the
+        # `_translate_kv_loc(..., out=)` wrap in
+        # `init_forward_metadata_capture/replay_cuda_graph`.
+        #
+        # Piecewise cuda-graph capture (prefill/extend, separate code path
+        # in `piecewise_cuda_graph_runner.py`) has NOT been wired for the
+        # shared pool yet — guard explicitly. Recent SGLang defaults to
+        # `disable_piecewise_cuda_graph=True`, so this guard only fires for
+        # users who explicitly opt into piecewise.
+        if not self.disable_piecewise_cuda_graph:
+            raise ValueError(
+                "--enable-shared-memory-pool currently supports monolithic "
+                "cuda-graph capture only (decode). Piecewise capture is not "
+                "yet wired for the shared pool — pass "
+                "--disable-piecewise-cuda-graph to disable it, or wait for "
+                "Stage 3.6."
             )
         # Overlap-schedule note:
         # `MultiEndedAllocator._compact_pending` now plumbs the model
@@ -4341,13 +4352,15 @@ class ServerArgs:
             "Pass --attention-backend triton (FA3 / FlashInfer support is planned)."
         )
         # The model-family check (Stage 1: hybrid Mamba; Stage 2: hybrid SWA;
-        # Stage 3 extends both to page_size > 1; Stage 4: DeepSeek V4) is
-        # enforced at pool-construction time in
-        # `model_runner_kv_cache_mixin._init_pools` — `mambaish_config is not None`
-        # dispatches to the Mamba shared path; `is_hybrid_swa and not dsv4`
-        # dispatches to the SWA shared path; everything else falls through to
-        # the non-shared path. The model config isn't available here, so the
-        # gate is deferred to pool construction.
+        # Stage 3 extends both to page_size > 1; Stage 3.5 adds cuda-graph
+        # monolithic decode capture; Stage 4: DeepSeek V4) is enforced at
+        # pool-construction time in `model_runner_kv_cache_mixin._init_pools`
+        # — `mambaish_config is not None` dispatches to the Mamba shared path;
+        # `is_hybrid_swa and not dsv4` dispatches to the SWA shared path;
+        # everything else falls through to the non-shared path. The model
+        # config isn't available here, so the gate is deferred to pool
+        # construction. FA3/FlashInfer, spec, PD-disagg, and piecewise
+        # capture are deferred to later stages.
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

@@ -1575,6 +1575,19 @@ class HybridLinearKVPool(KVCache):
                     cache_v,
                 )
 
+    def set_full_loc(self, loc: Optional[torch.Tensor]) -> None:
+        """Stage 3.5: per-batch full-physical loc for the Mamba composite's
+        full-attention layers. Forwards to ``full_kv_pool.set_loc`` when the
+        underlying pool exposes it (i.e., the shared pool path's
+        ``SharedMHATokenToKVPool``). No-op for non-shared full pools (they
+        don't have ``set_loc``).
+
+        Mirrors ``SharedSWAKVPool.set_full_loc`` so model_runner can call
+        ``set_full_loc`` uniformly on either composite.
+        """
+        if hasattr(self.full_kv_pool, "set_loc"):
+            self.full_kv_pool.set_loc(loc)
+
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
