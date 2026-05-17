@@ -319,10 +319,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
+            is_hybrid_swa=model_runner.is_hybrid_swa,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            # Stage 3.5: when shared pool is enabled, allocate a
+            # capture-stable int64 buffer for `out_cache_loc_full_physical`
+            # and pin it into the pool's `_precomputed_loc` at capture time
+            # (see `capture_one_batch_size` below).
+            enable_shared_memory_pool=getattr(
+                model_runner, "enable_shared_memory_pool", False
+            ),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -817,6 +825,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
+            # swa_loc must be set before capture so that set_kv_buffer's
+            # Python branch (if self.swa_loc is not None) takes the fast path,
+            # and the graph records GPU ops using this buffer instead of the
+            # per-layer translate_loc_from_full_to_swa fallback.
+            if self.buffers.out_cache_loc_swa is not None:
+                self.model_runner.token_to_kv_pool.set_swa_loc(
+                    self.buffers.out_cache_loc_swa[:num_tokens]
+                )
+
+            # full_loc precompute pin for the captured forward.
+            if self.buffers.out_cache_loc_full_physical is not None and hasattr(
+                self.model_runner.token_to_kv_pool, "set_full_loc"
+            ):
+                self.model_runner.token_to_kv_pool.set_full_loc(
+                    self.buffers.out_cache_loc_full_physical[:num_tokens]
+                )
+
             with canary_ctx:
                 shape_key = self._make_graph_key(bs, stream_idx, variant_label)
                 self.backend.capture_one(

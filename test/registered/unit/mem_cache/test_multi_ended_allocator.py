@@ -292,6 +292,150 @@ class TestMultiEndedAllocator(unittest.TestCase):
         with self.assertRaises(AssertionError):
             full_alloc.free(v)
 
+    # -- Stage 3.5 `out=` parameter regression tests --
+
+    def test_translate_kv_loc_with_out_writes_inplace(self):
+        """REGRESSION (Stage 3.5): `translate_kv_loc(virt, out=buf)` must
+        modify `buf` in place AND preserve `buf.data_ptr()` — the buffer-
+        stability invariant for cuda-graph capture."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v = self._alloc(full_alloc, full_kv, 5)
+        buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
+        ptr_before = buf.data_ptr()
+        ret = full_alloc.translate_kv_loc(v, out=buf)
+        self.assertIs(ret, buf, "must return the `out=` buffer, not a fresh tensor")
+        self.assertEqual(
+            buf.data_ptr(), ptr_before, "out= buffer's data_ptr must be stable"
+        )
+        # Result matches v2p directly (page_size == 1 here)
+        expected = full_alloc.virtual_to_physical[v]
+        self.assertTrue(bool((buf == expected).all().item()))
+
+    def test_translate_kv_loc_without_out_returns_fresh_tensor(self):
+        """REGRESSION: without `out=`, behavior is byte-identical to
+        Stages 1/2/3 — returns a fresh tensor."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v = self._alloc(full_alloc, full_kv, 5)
+        ret = full_alloc.translate_kv_loc(v)
+        # Fresh tensor: different storage from v2p table
+        self.assertNotEqual(ret.data_ptr(), full_alloc.virtual_to_physical.data_ptr())
+        expected = full_alloc.virtual_to_physical[v]
+        self.assertTrue(bool((ret == expected).all().item()))
+
+    def test_translate_kv_loc_out_matches_no_out(self):
+        """REGRESSION: result of translate_kv_loc(v, out=buf) byte-equals
+        translate_kv_loc(v)."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v = self._alloc(full_alloc, full_kv, 5)
+        buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
+        with_out = full_alloc.translate_kv_loc(v, out=buf)
+        no_out = full_alloc.translate_kv_loc(v)
+        self.assertTrue(bool((with_out == no_out).all().item()))
+
+    def test_translate_kv_loc_dtype_assertion(self):
+        """REGRESSION: wrong-dtype `out=` (int32 instead of int64) raises
+        AssertionError. Guards against the copy/paste hazard where someone
+        might allocate the full-physical buffer with the SWA int32 pattern."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v = self._alloc(full_alloc, full_kv, 5)
+        wrong_dtype = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
+        with self.assertRaises(AssertionError):
+            full_alloc.translate_kv_loc(v, out=wrong_dtype)
+
+    def test_translate_kv_loc_shape_assertion(self):
+        """REGRESSION: mismatched `out=` shape raises AssertionError."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v = self._alloc(full_alloc, full_kv, 5)
+        wrong_shape = torch.empty((v.numel() + 1,), dtype=torch.int64, device=_DEV)
+        with self.assertRaises(AssertionError):
+            full_alloc.translate_kv_loc(v, out=wrong_shape)
+
+    # REGRESSION (eval_results_21): `translate_kv_loc(buf, out=buf)` — same
+    # tensor for input and output — is the canonical in-place form used by
+    # the cuda-graph capture/replay paths in `triton_backend.py`:
+    #
+    #     self._translate_kv_loc(kv_indices, out=kv_indices)
+    #
+    # The first Stage-3.5 implementation routed this through
+    # `torch.index_select(v2p, 0, virt_tokens, out=out)`, which crashes with
+    #     "unsupported operation: some elements of the input tensor and the
+    #      written-to tensor refer to a single memory location"
+    # because index_select does NOT support aliasing between `index` and
+    # `out`. Fix: gather into a transient buffer then `out.copy_(tmp)`.
+    def test_translate_kv_loc_with_out_aliasing_input(self):
+        """REGRESSION: in-place form `translate_kv_loc(buf, out=buf)` must
+        succeed and produce identical results to the no-out form."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v_orig = self._alloc(full_alloc, full_kv, 5).clone()
+        # Save the expected output (no-out form) before mutating `buf`.
+        expected = full_alloc.translate_kv_loc(v_orig)
+        # Now exercise the aliasing form: buf serves as BOTH input and out.
+        buf = v_orig.clone()
+        ptr_before = buf.data_ptr()
+        ret = full_alloc.translate_kv_loc(buf, out=buf)
+        self.assertIs(ret, buf)
+        self.assertEqual(
+            buf.data_ptr(),
+            ptr_before,
+            "out= buffer's data_ptr must be stable (cuda-graph invariant)",
+        )
+        self.assertTrue(
+            bool((buf == expected).all().item()),
+            "in-place result must equal no-out result",
+        )
+
+    # Stage 3.5 tombstone-safety clamp regression.
+    #
+    # The captured cuda-graph paths (full-layer set_kv_buffer elif,
+    # init_forward_metadata_*_cuda_graph kv_indices translate, init_new
+    # precompute) all eventually call `translate_kv_loc` against `v2p_full`.
+    # Padded / stale-tail entries in the cuda-graph input buffers can carry
+    # virtual ids whose v2p entries got tombstoned (-1) by free/compaction
+    # between replays. Without a clamp, the captured `k_buffer[result[i]]`
+    # would index at -1 (illegal memory access). The clamp routes those to
+    # physical slot 0 (the reserved padding sink under Stage 1's
+    # `min_slot_index` invariant — bytes [0, entry_max) hold no real data).
+    # These tests lock in the clamp contract so a future refactor can't
+    # quietly remove it and re-introduce the eval_results_21/26 crash.
+    def test_translate_kv_loc_clamps_tombstoned_v2p(self):
+        """`translate_kv_loc` must clamp `v2p[v] == -1` entries to 0 (the
+        padding sink). Required for cuda-graph capture safety."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v = self._alloc(full_alloc, full_kv, 5)
+        # Inject a tombstone at one of the live virtual id positions WITHOUT
+        # going through `free` (which would also touch p2v / compaction).
+        # This emulates the steady-state where a captured-graph input
+        # buffer's padded/stale entries reference virtual ids that have
+        # since been tombstoned by free/compaction.
+        v_tombstoned = int(v[2].item())
+        full_alloc.virtual_to_physical[v_tombstoned] = -1
+        # No-out form: result must clamp.
+        out = full_alloc.translate_kv_loc(v)
+        self.assertTrue(
+            bool((out >= 0).all().item()),
+            f"translate_kv_loc must clamp tombstoned entries to >=0, got {out.tolist()}",
+        )
+        self.assertEqual(
+            int(out[2].item()),
+            0,
+            "tombstoned virtual id must map to slot 0 (padding sink)",
+        )
+
+    def test_translate_kv_loc_with_out_clamps_tombstoned_v2p(self):
+        """`translate_kv_loc(..., out=buf)` (the captured-graph path) must
+        clamp tombstoned entries in-place."""
+        _, full_alloc, _, full_kv, _ = self._build_pair()
+        v = self._alloc(full_alloc, full_kv, 5).clone()
+        full_alloc.virtual_to_physical[int(v[1].item())] = -1
+        buf = torch.empty_like(v)
+        ret = full_alloc.translate_kv_loc(v, out=buf)
+        self.assertIs(ret, buf)
+        self.assertTrue(
+            bool((buf >= 0).all().item()),
+            "out= path must clamp tombstoned entries",
+        )
+        self.assertEqual(int(buf[1].item()), 0)
+
 
 # ---------------------------------------------------------------------------
 # Shared SWA composite — Stage 2 unit tests
@@ -659,6 +803,76 @@ class TestSharedSWATokenToKVPoolAllocator(unittest.TestCase):
         # And the now-unbound slot range must be clean:
         for p in range(fa.watermark_physical, fa.max_slots):
             self.assertEqual(int(fa.physical_to_virtual[p].item()), -1)
+
+    # -- Stage 3.5 `out=` parameter regression tests for the SWA composite --
+
+    def test_swa_translate_kv_loc_with_out_writes_inplace(self):
+        """REGRESSION (Stage 3.5): composite delegates to base-class
+        translate_kv_loc with `out=` passthrough. Result lands in `buf`."""
+        _, allocator, _ = self._build()
+        v = allocator.alloc(4)
+        self.assertIsNotNone(v)
+        buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
+        ptr_before = buf.data_ptr()
+        ret = allocator.translate_kv_loc(v, out=buf)
+        self.assertIs(ret, buf)
+        self.assertEqual(buf.data_ptr(), ptr_before)
+        expected = allocator.translate_kv_loc(v)
+        self.assertTrue(bool((buf == expected).all().item()))
+
+    def test_swa_translate_loc_from_full_to_swa_with_out_writes_inplace(self):
+        """REGRESSION (Stage 3.5): `translate_loc_from_full_to_swa(v, out=buf)`
+        must modify `buf` in place AND preserve `buf.data_ptr()`. `out=`
+        buffer MUST be int32 (matches SWA Triton kernel contract)."""
+        _, allocator, _ = self._build()
+        v = allocator.alloc(4)
+        self.assertIsNotNone(v)
+        buf = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
+        ptr_before = buf.data_ptr()
+        ret = allocator.translate_loc_from_full_to_swa(v, out=buf)
+        self.assertIs(ret, buf)
+        self.assertEqual(buf.data_ptr(), ptr_before)
+        # Byte-identical to the no-out form:
+        no_out = allocator.translate_loc_from_full_to_swa(v)
+        self.assertEqual(no_out.dtype, torch.int32)
+        self.assertTrue(bool((buf == no_out).all().item()))
+
+    def test_swa_translate_loc_from_full_to_swa_dtype_assertion(self):
+        """REGRESSION (Stage 3.5): wrong-dtype `out=` (int64 instead of int32)
+        raises AssertionError. Guards against accidentally reusing the int64
+        full-physical buffer pattern for the SWA precompute."""
+        _, allocator, _ = self._build()
+        v = allocator.alloc(4)
+        self.assertIsNotNone(v)
+        wrong_dtype = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
+        with self.assertRaises(AssertionError):
+            allocator.translate_loc_from_full_to_swa(v, out=wrong_dtype)
+
+    # Stage 3.5 tombstone-safety clamp for SWA — mirrors the full-side test
+    # in `TestMultiEndedAllocator`. The captured SWA attention kernel reads
+    # `swa_k_buffer[result[i]]` at replay; without the clamp, a tombstoned
+    # `v2p_swa[v] == -1` would index at `swa_k_buffer[-1]` (illegal access).
+    def test_swa_translate_loc_from_full_to_swa_clamps_tombstoned(self):
+        _, allocator, _ = self._build()
+        v = allocator.alloc(4)
+        self.assertIsNotNone(v)
+        # Inject a tombstone on the swa side at one of the live virtual ids.
+        v_tomb = int(v[1].item())
+        allocator.swa_attn_allocator.virtual_to_physical[v_tomb] = -1
+        # No-out form: result must be int32 AND every entry >= 0.
+        out = allocator.translate_loc_from_full_to_swa(v)
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertTrue(
+            bool((out >= 0).all().item()),
+            "translate_loc_from_full_to_swa must clamp tombstoned to >=0",
+        )
+        self.assertEqual(int(out[1].item()), 0)
+        # out= form (int32 buffer) must also clamp.
+        buf = torch.empty(v.shape, dtype=torch.int32, device=_DEV)
+        ret = allocator.translate_loc_from_full_to_swa(v, out=buf)
+        self.assertIs(ret, buf)
+        self.assertTrue(bool((buf >= 0).all().item()))
+        self.assertEqual(int(buf[1].item()), 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1228,6 +1442,160 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
                 page_phys,
                 [p * ps + i for i in range(ps)],
             )
+
+    # Stage 3.5 REGRESSION: `translate_kv_loc(virt, out=buf)` must work
+    # under page_size > 1 — the page-math branch writes via
+    # `index_select(out=out)` + in-place `mul_` / `add_` and must match the
+    # no-`out=` form byte-for-byte. Tests the actual page-math path of the
+    # base-class implementation.
+    def test_paged_translate_kv_loc_with_out(self):
+        _, full_alloc, _, _, _ = self._build()
+        ps = self.PAGE_SIZE
+        v = full_alloc.alloc(2 * ps)
+        self.assertIsNotNone(v)
+        # Compare with-out vs no-out.
+        buf = torch.empty(v.shape, dtype=torch.int64, device=_DEV)
+        ptr_before = buf.data_ptr()
+        with_out = full_alloc.translate_kv_loc(v, out=buf)
+        no_out = full_alloc.translate_kv_loc(v)
+        self.assertIs(with_out, buf, "must return the out= buffer")
+        self.assertEqual(
+            buf.data_ptr(), ptr_before, "out= buffer's data_ptr must be stable"
+        )
+        # Page-math correctness: result equals virt_page * ps + offset
+        # against the real v2p table.
+        virt_pages = v // ps
+        offsets = v % ps
+        phys_pages = full_alloc.virtual_to_physical[virt_pages]
+        expected = phys_pages * ps + offsets
+        self.assertTrue(bool((buf == expected).all().item()))
+        self.assertTrue(bool((with_out == no_out).all().item()))
+
+    # REGRESSION (eval_results_21): the in-place aliasing form
+    # `translate_kv_loc(buf, out=buf)` must work at page_size > 1 too. The
+    # page-math branch computes `virt_pages` and `offsets` BEFORE writing
+    # into `out`, so those fresh tensors capture the pre-mutation values of
+    # virt_tokens. The final result must equal `phys_page * ps + offset`
+    # against the original input.
+    def test_paged_translate_kv_loc_with_out_aliasing_input(self):
+        _, full_alloc, _, _, _ = self._build()
+        ps = self.PAGE_SIZE
+        v_orig = full_alloc.alloc(2 * ps)
+        self.assertIsNotNone(v_orig)
+        # Expected (no-out form) computed BEFORE mutating buf.
+        expected = full_alloc.translate_kv_loc(v_orig)
+        # In-place form: buf serves as both input and out.
+        buf = v_orig.clone()
+        ptr_before = buf.data_ptr()
+        ret = full_alloc.translate_kv_loc(buf, out=buf)
+        self.assertIs(ret, buf)
+        self.assertEqual(buf.data_ptr(), ptr_before)
+        self.assertTrue(
+            bool((buf == expected).all().item()),
+            "page>1 in-place result must equal no-out result",
+        )
+
+    # REGRESSION (eval_results_22): the stale-tail scenario.
+    #
+    # The cuda-graph replay path in `triton_backend.py` used to call
+    # `_translate_kv_loc(kv_indices, out=kv_indices)` on the WHOLE
+    # pre-allocated buffer (`self.cuda_graph_kv_indices`), even though only
+    # the `kv_indptr[-1]`-length prefix was freshly written by
+    # `create_flashinfer_kv_indices_triton`. Stale tail data, when fed
+    # through `v2p` repeatedly across replays, eventually produced negative
+    # values (via `v2p[unbound] = -1 → -1 * page_size + offset` ∈ [-ps,-1]),
+    # and the NEXT translation's `// page_size` produced `-1`, which CUDA's
+    # `index_select` rejects with a scatter-gather OOB device-side assert.
+    #
+    # The fix in `triton_backend.py` slices the translate to the valid
+    # prefix `kv_indices[:kv_indptr[-1]]`. This test confirms slicing is
+    # transparent to the translate — the in-place result on a contiguous
+    # slice of a larger buffer matches the standalone-tensor result.
+    def test_paged_translate_kv_loc_on_buffer_slice(self):
+        _, full_alloc, _, _, _ = self._build()
+        ps = self.PAGE_SIZE
+        v = full_alloc.alloc(2 * ps)
+        self.assertIsNotNone(v)
+        # Simulate the cuda-graph buffer pattern: a large pre-allocated
+        # buffer where only a prefix is freshly written.
+        N = v.numel()
+        big_buf = torch.zeros((N * 4,), dtype=torch.int64, device=_DEV)
+        big_buf[:N] = v
+        # Translate the valid prefix slice in-place (this is what the
+        # post-fix triton_backend call does).
+        slice_view = big_buf[:N]
+        ptr_before = slice_view.data_ptr()
+        ret = full_alloc.translate_kv_loc(slice_view, out=slice_view)
+        self.assertIs(ret, slice_view)
+        self.assertEqual(
+            slice_view.data_ptr(),
+            ptr_before,
+            "slice in-place write must preserve data_ptr",
+        )
+        # The slice's translation must match a standalone translate of v.
+        expected = full_alloc.translate_kv_loc(v)
+        self.assertTrue(
+            bool((slice_view == expected).all().item()),
+            "slice in-place translate must equal standalone translate",
+        )
+        # And the tail [N:] must remain UNTOUCHED — zeros, not corrupted
+        # by the translate.
+        tail = big_buf[N:]
+        self.assertTrue(
+            bool((tail == 0).all().item()),
+            "translating a slice must NOT touch the buffer tail; if this "
+            "test fails, the translate is reading/writing past the slice "
+            "bound — the same regression that caused eval_results_22's "
+            "scatter-gather OOB after several replays.",
+        )
+
+    # REGRESSION (eval_results_26 follow-up, Test D): tombstone-safety
+    # clamp at page_size > 1.
+    #
+    # For ps > 1, `v2p_page[vpage] == -1` produces `-1 * ps + offset` for
+    # output tokens — a negative value in `[-ps, -1]`. Without clamping,
+    # the captured `k_buffer[result[i]]` is an illegal access. The clamp
+    # must produce `>= 0` for every output token.
+    def test_paged_translate_kv_loc_clamps_tombstoned_v2p(self):
+        _, full_alloc, _, _, _ = self._build()
+        ps = self.PAGE_SIZE
+        v = full_alloc.alloc(2 * ps)
+        self.assertIsNotNone(v)
+        # Tombstone one page (any v2p_page entry) -> all ps tokens in that
+        # page should clamp to 0 in the translate output.
+        tomb_page = int((v[0] // ps).item())
+        full_alloc.virtual_to_physical[tomb_page] = -1
+        # No-out form.
+        out = full_alloc.translate_kv_loc(v)
+        self.assertTrue(
+            bool((out >= 0).all().item()),
+            f"paged translate_kv_loc must clamp tombstoned to >=0; got {out.tolist()}",
+        )
+        # The first `ps` tokens belong to the tombstoned page → all 0.
+        self.assertTrue(
+            bool((out[:ps] == 0).all().item()),
+            "all tokens in a tombstoned page must map to slot 0 (padding sink)",
+        )
+        # The second page is still bound; its outputs must be > 0.
+        self.assertTrue(
+            bool((out[ps:] > 0).all().item()),
+            "non-tombstoned pages must still translate to live physical slots",
+        )
+
+    def test_paged_translate_kv_loc_with_out_clamps_tombstoned_v2p(self):
+        _, full_alloc, _, _, _ = self._build()
+        ps = self.PAGE_SIZE
+        v = full_alloc.alloc(2 * ps).clone()
+        tomb_page = int((v[0] // ps).item())
+        full_alloc.virtual_to_physical[tomb_page] = -1
+        buf = torch.empty_like(v)
+        ret = full_alloc.translate_kv_loc(v, out=buf)
+        self.assertIs(ret, buf)
+        self.assertTrue(
+            bool((buf >= 0).all().item()),
+            "paged out= path must clamp tombstoned entries",
+        )
+        self.assertTrue(bool((buf[:ps] == 0).all().item()))
 
     # 13. REGRESSION (eval_results_15): `allocated_count()` MUST return
     # TOKENS, not pages — matching upstream's convention that all external

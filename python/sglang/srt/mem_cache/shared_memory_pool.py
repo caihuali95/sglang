@@ -450,6 +450,16 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         self._preallocated_k_buffer = k_buffer
         self._preallocated_v_buffer = v_buffer
         self._external_allocator = None  # set via attach_allocator
+        # Stage 3.5: when non-None, `set_kv_buffer` uses this directly and
+        # skips the per-call `v2p[loc]` gather — required for cuda-graph
+        # capture (per-call gather is not capture-replayable), also a small
+        # perf win on the non-graph path (one gather per batch instead of
+        # one per layer per batch). Set by `set_loc(loc)`; cleared via
+        # `set_loc(None)` after the batch returns. Slice-safety: if a
+        # sub-batched caller passes a `loc` whose `data_ptr()` differs from
+        # the precomputed buffer, we fall through to the per-call translate
+        # — see `set_kv_buffer` below.
+        self._precomputed_loc: Optional[torch.Tensor] = None
         # Stage 3: cached for the `set_kv_buffer` translate path. The K/V
         # strided views are TOKEN-granular (one row per slot), so paging
         # doesn't change view construction — only the translate from virtual
@@ -515,6 +525,28 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         pool uses to translate slot ids in `set_kv_buffer`."""
         self._external_allocator = allocator
 
+    def set_loc(self, loc: Optional[torch.Tensor]) -> None:
+        """Stage 3.5: precomputed full-physical token ids for the next forward
+        batch. Mirrors `SharedSWAKVPool.set_swa_loc`.
+
+        When set (non-None), ``set_kv_buffer`` uses these directly and skips
+        the per-call ``self._external_allocator.virtual_to_physical[loc]``
+        gather — required for cuda-graph capture (the per-call gather is not
+        capture-replayable). Pass ``None`` to clear (defensive, recommended
+        at the end of each forward to preserve slice-safety for callers like
+        ``unified_attention_with_output`` that pass a sub-slice of
+        ``out_cache_loc``).
+
+        Type contract: ``loc.dtype == torch.int64`` (matches v2p table).
+        """
+        if loc is not None:
+            assert loc.dtype == torch.int64, (
+                f"SharedMHATokenToKVPool.set_loc: loc.dtype must be int64 "
+                f"(matches v2p table); got {loc.dtype}. Hint: don't reuse the "
+                f"int32 swa_loc buffer pattern here — full-physical is int64."
+            )
+        self._precomputed_loc = loc
+
     def set_kv_buffer(
         self,
         layer,
@@ -525,23 +557,54 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         v_scale=None,
         layer_id_override: Optional[int] = None,
     ):
-        # `loc` arrives as VIRTUAL TOKEN ids (the shared-pool path); translate
-        # to physical TOKEN ids here. This is robust to sub-batched callers
-        # that pass a slice of out_cache_loc
-        # (radix_attention.unified_attention_with_output).
+        # Stage 3.5 fast path: when `_precomputed_loc` is set AND the caller's
+        # `loc` matches it (by `data_ptr`), use the precomputed full-physical
+        # ids directly — skips the per-call v2p gather. Required for cuda-
+        # graph capture; also a small perf win on the non-graph path (one
+        # gather per batch instead of one per layer per batch).
         #
-        # For page_size == 1 (Stages 1/2): direct table lookup
-        # `v2p[loc]` — behavior byte-identical.
-        #
-        # For page_size > 1 (Stage 3): page math
-        #   virt_pages = loc // page_size
-        #   offsets = loc % page_size
-        #   phys_tokens = v2p[virt_pages] * page_size + offsets
-        # The v2p table is page-granular (sized num_virtual_pages + 1);
-        # offsets within the page are preserved by the math.
-        if self._external_allocator is not None:
+        # Slice-safety: if a sub-batched caller (e.g. radix_attention's
+        # `unified_attention_with_output`) passes a slice of `out_cache_loc`,
+        # `loc.data_ptr()` differs from the whole-batch precompute. Fall
+        # through to the per-call translate path so the slice's virtual ids
+        # are correctly translated. (Section D.3 option (b) in §S35.)
+        if (
+            self._precomputed_loc is not None
+            and loc is not None
+            and loc.data_ptr() == self._precomputed_loc.data_ptr()
+            and loc.shape == self._precomputed_loc.shape
+        ):
+            loc = self._precomputed_loc
+        elif self._external_allocator is not None:
+            # `loc` arrives as VIRTUAL TOKEN ids (the shared-pool path);
+            # translate to physical TOKEN ids here. Robust to sub-batched
+            # callers passing a slice of out_cache_loc.
+            #
+            # For page_size == 1 (Stages 1/2): direct table lookup
+            # `v2p[loc]` — behavior byte-identical.
+            #
+            # For page_size > 1 (Stage 3): page math
+            #   virt_pages = loc // page_size
+            #   offsets = loc % page_size
+            #   phys_tokens = v2p[virt_pages] * page_size + offsets
+            # The v2p table is page-granular (sized num_virtual_pages + 1);
+            # offsets within the page are preserved by the math.
+            #
+            # Tombstone-safety clamp (Stage 3.5): under cuda-graph capture
+            # the data-ptr fast path above is structurally dead — `loc` is a
+            # slice of `buffers.out_cache_loc` (virtual ids) while
+            # `_precomputed_loc` is a slice of
+            # `buffers.out_cache_loc_full_physical` (precomputed phys ids);
+            # they're different buffers by design, so this elif is always
+            # the captured WRITE path. A captured `k_buffer[-1]` from a
+            # tombstoned v2p entry is an illegal memory access; clamping to
+            # 0 routes those writes to physical slot 0 (the reserved
+            # padding sink under Stage 1's `min_slot_index` invariant).
+            # Cost: one elementwise op per layer; safe by §S3 dummy-write
+            # proof. Mirrored in `MultiEndedAllocator.translate_kv_loc`.
             if self._page_size == 1:
                 loc = self._external_allocator.virtual_to_physical[loc]
+                loc = torch.clamp_min(loc, 0)
             else:
                 ps = self._page_size
                 virt_pages = loc // ps
@@ -550,6 +613,7 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
                     virt_pages
                 ]
                 loc = phys_pages * ps + offsets
+                loc = torch.clamp_min(loc, 0)
         super().set_kv_buffer(
             layer, loc, cache_k, cache_v, k_scale, v_scale,
             layer_id_override=layer_id_override,
@@ -1151,6 +1215,11 @@ class SharedSWAKVPool(SWAKVPool):
         # page math when page_size > 1).
         self.page_size = page_size
         self.swa_loc: Optional[torch.Tensor] = None
+        # Stage 3.5: per-batch full-physical loc for the full-attention layers.
+        # Symmetric with `swa_loc`. Forwarded to `full_kv_pool.set_loc(loc)` so
+        # the underlying `SharedMHATokenToKVPool` bypasses its per-call v2p
+        # translate during `set_kv_buffer`.
+        self.full_loc: Optional[torch.Tensor] = None
         self.layer_transfer_counter = None
 
         # The parent class exposes `size` / `size_swa` as plain attributes
@@ -1275,13 +1344,30 @@ class SharedSWAKVPool(SWAKVPool):
         swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
         return (swa_phys_pages * ps + offsets).to(torch.int32)
 
-    def set_swa_loc(self, loc: torch.Tensor) -> None:
+    def set_swa_loc(self, loc: Optional[torch.Tensor]) -> None:
         # `loc` is already swa-physical (precomputed once per batch via
         # `forward_batch.out_cache_loc_swa` ->
         # `model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa`
         # in `ForwardBatch.init_new`). Cached here for `set_kv_buffer` to
-        # consume on SWA layers without a per-call gather.
+        # consume on SWA layers without a per-call gather. Pass ``None`` to
+        # clear (defensive — recommended at end of forward to preserve
+        # slice-safety for sub-batched callers).
         self.swa_loc = loc
+
+    def set_full_loc(self, loc: Optional[torch.Tensor]) -> None:
+        """Stage 3.5: per-batch full-physical loc for the full-attention
+        layers. Mirror of ``set_swa_loc``.
+
+        Stores ``loc`` locally for symmetry with ``swa_loc`` and forwards to
+        ``full_kv_pool.set_loc(loc)`` so the underlying
+        ``SharedMHATokenToKVPool`` bypasses its per-call v2p translate during
+        ``set_kv_buffer``.
+
+        Pass ``None`` to clear (defensive, recommended at end of forward to
+        preserve slice-safety for sub-batched callers).
+        """
+        self.full_loc = loc
+        self.full_kv_pool.set_loc(loc)
 
     def get_state_buf_infos(self):
         return self.swa_kv_pool.get_contiguous_buf_infos()

@@ -3060,6 +3060,90 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
+        # For MLP sync
+        if forward_batch.global_num_tokens_cpu is not None:
+            forward_batch.prepare_mlp_sync_batch(self)
+        else:
+            forward_batch.prepare_attn_tp_scatter_input(self)
+
+        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        if (
+            forward_batch.num_token_non_padded is not None
+            and forward_batch.global_num_tokens_gpu is not None
+            and require_gathered_buffer(self.server_args)
+            and not is_nsa_enable_prefill_cp()
+        ):
+            forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                server_args=self.server_args,
+            )
+
+        # Use precomputed SWA cache location
+        if forward_batch.out_cache_loc_swa is not None:
+            self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+
+        # Stage 3.5: pin the precomputed full-physical loc so the shared-pool
+        # full-attention `set_kv_buffer` fast path takes effect (one big
+        # gather precomputed in ForwardBatch.init_new instead of one per
+        # layer per iter). `hasattr` guards non-shared paths and any future
+        # pool variant that doesn't implement `set_full_loc`.
+        if forward_batch.out_cache_loc_full_physical is not None and hasattr(
+            self.token_to_kv_pool, "set_full_loc"
+        ):
+            self.token_to_kv_pool.set_full_loc(
+                forward_batch.out_cache_loc_full_physical
+            )
+
+        # Hisparse coordinator
+        forward_batch.hisparse_coordinator = self.hisparse_coordinator
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+        # Forward without cuda graph
+        if forward_batch.forward_mode.is_decode():
+            ret = self.forward_decode(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_split_prefill():
+            ret = self.forward_split_prefill(
+                forward_batch,
+                reinit_attn_backend=reinit_attn_backend,
+                forward_count=split_forward_count,
+            )
+        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            ret, can_run_graph = self.forward_extend(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_idle():
+            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
+        else:
+            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+        if (
+            forward_batch.global_num_tokens_cpu is not None
+            and self.pp_group.is_last_rank
+        ):
+            forward_batch.post_forward_mlp_sync_batch(ret)
+
+        # Stage 3.5: defensive clear after forward. Preserves slice-safety for
+        # any subsequent caller of `set_kv_buffer` that passes a sub-batched
+        # slice (e.g. radix_attention.unified_attention_with_output) — without
+        # a clear, the fast path would re-fire with a stale precomputed loc.
+        # The pool's `set_kv_buffer` data_ptr check protects against this
+        # too, but clearing makes the contract explicit and lets future
+        # changes drop the data_ptr check cheaply.
+        if hasattr(self.token_to_kv_pool, "set_full_loc"):
+            self.token_to_kv_pool.set_full_loc(None)
+        if forward_batch.out_cache_loc_swa is not None and hasattr(
+            self.token_to_kv_pool, "set_swa_loc"
+        ):
+            self.token_to_kv_pool.set_swa_loc(None)
+
+        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
     ):

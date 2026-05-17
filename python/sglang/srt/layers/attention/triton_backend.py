@@ -374,6 +374,29 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
+        # Stage 3.5: translate virtual->full-physical IN-PLACE over the VALID
+        # PREFIX only. `self.cuda_graph_kv_indices` is a pre-allocated
+        # multi-megabyte buffer; `_fill_kv_indptr_and_indices` only wrote the
+        # first `kv_indptr[-1]` entries. Translating the whole buffer was a
+        # bug: stale tail data (from a prior replay) would be re-translated via
+        # `v2p`, and a tail entry whose `// page_size` hits a now-unbound
+        # virtual page (`v2p[k] == -1`) yields `out.mul_(ps) + offset` in
+        # [-ps, -1] — CUDA's index_select then rejects `idx = -1` on the next
+        # replay. The in-place `out=` form is REQUIRED (not the returning form
+        # used in the non-graph path): the captured graph reads
+        # `self.cuda_graph_kv_indices` by identity, so translation must write
+        # back into that same buffer. This single chokepoint covers BOTH the
+        # capture path (delegated here via `init_forward_metadata_replay_*`)
+        # and replay. Slicing with `kv_indptr[-1]` (a 0-d tensor) triggers an
+        # implicit `.item()` sync — same pattern as the sliding-window buffer
+        # update. No-op for non-shared-pool allocators (`_translate_kv_loc is
+        # None`).
+        if self._translate_kv_loc is not None:
+            kv_last_index = kv_indptr[-1]
+            self._translate_kv_loc(
+                self.cuda_graph_kv_indices[:kv_last_index],
+                out=self.cuda_graph_kv_indices[:kv_last_index],
+            )
         window_kv_indptr = self.window_kv_indptr
         window_kv_lens = None
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
