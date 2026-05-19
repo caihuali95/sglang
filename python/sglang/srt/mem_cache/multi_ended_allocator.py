@@ -38,6 +38,7 @@ import logging
 from typing import List, Optional, Tuple
 
 import torch
+from torch.profiler import record_function
 
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -468,6 +469,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"translate_kv_loc: out= shape {tuple(out.shape)} must match "
                 f"virt_tokens shape {tuple(virt_tokens.shape)}"
             )
+        with record_function("MultiEndedAlloc.translate_kv_loc"):
+            return self._translate_kv_loc_impl(virt_tokens, out)
+
+    def _translate_kv_loc_impl(
+        self,
+        virt_tokens: torch.Tensor,
+        out: Optional[torch.Tensor],
+    ) -> torch.Tensor:
         # Tombstone-safety clamp: tombstoned `v2p` entries (-1) must not reach
         # `k_buffer[-1]` when read by the captured graph. Under cuda-graph
         # capture, this method is called eagerly each replay-prep to populate
@@ -828,6 +837,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         All GPU ops here run on the scheduler thread's current stream
         (schedule_stream). The wait_stream barrier in the caller (`free`)
         already serialized us with any in-flight forward kernels."""
+        with record_function("MultiEndedAlloc._compact_pending"):
+            self._compact_pending_impl(freed_physical_pages)
+
+    def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
         freed_set = set(int(x) for x in freed_physical_pages.tolist())
         if not freed_set:
             return

@@ -402,6 +402,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             server_args, "enable_shared_memory_pool", False
         )
 
+        # Profiling: env-gated torch.profiler that wraps `_forward_raw`
+        # and dumps a chrome trace to profile_ps${ps}_${who}.json.gz.
+        # Activated by setting SGLANG_PROFILE_STAGE36=1 in the launch env. The
+        # profiler waits 30 iters (warm-up + cuda-graph capture), warms up 5
+        # iters, then captures 10 iters of activity once. After the active
+        # window finishes, `on_trace_ready` writes the file and the profiler
+        # becomes inert. record_function regions in the mem-cache / triton
+        # paths surface as named slices in the trace.
+        self._stage36_profiler = None
+        self._stage36_profiler_started = False
+        if os.environ.get("SGLANG_PROFILE_STAGE36", "0") == "1":
+            self._init_stage36_profiler()
+
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
@@ -3312,6 +3325,140 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
+    def _init_stage36_profiler(self) -> None:
+        """Build the env-gated torch.profiler used to diagnose
+        page-local layer-major perf vs the envelope page_size=1 baseline.
+
+        Trace destination: ``${SGLANG_PROFILE_DIR:-/workspace/results}/stage36_profile_ps${ps}_pid${pid}.json.gz``.
+
+        Capture window: ``schedule(wait=10, warmup=5, active=20)`` measured
+        in *gated* forward iterations. The gate fires only on forwards with
+        ``forward_batch.batch_size >= SGLANG_PROFILE_MIN_BS`` (default 16),
+        so the profiler skips the ramp-up phase entirely and lands at
+        steady-state saturation regardless of workload size, mfs, or
+        cuda-graph state.
+
+        A fallback timer (``SGLANG_PROFILE_FALLBACK_FORWARDS``, default
+        2000) forces the gate open if the workload never reaches the bs
+        threshold — protects against tiny/latency-bound benchmarks where
+        the trace would otherwise never fire.
+        """
+        try:
+            from torch.profiler import ProfilerActivity, profile, schedule
+        except ImportError:
+            logger.warning("torch.profiler not available; SGLANG_PROFILE_STAGE36 ignored")
+            return
+
+        out_dir = os.environ.get("SGLANG_PROFILE_DIR", "/workspace/results")
+        os.makedirs(out_dir, exist_ok=True)
+        ps = getattr(self, "page_size", 1) or 1
+        pid = os.getpid()
+        trace_path = os.path.join(
+            out_dir, f"stage36_profile_ps{ps}_pid{pid}.json.gz"
+        )
+
+        def _on_trace_ready(prof):
+            try:
+                prof.export_chrome_trace(trace_path)
+                logger.info(
+                    "[stage36-profile] chrome trace written: %s", trace_path
+                )
+            except Exception as e:
+                logger.warning("[stage36-profile] export_chrome_trace failed: %s", e)
+
+        self._stage36_wait = int(os.environ.get("SGLANG_PROFILE_WAIT", "10"))
+        self._stage36_warmup = int(os.environ.get("SGLANG_PROFILE_WARMUP", "5"))
+        self._stage36_active = int(os.environ.get("SGLANG_PROFILE_ACTIVE", "20"))
+        self._stage36_min_bs = int(os.environ.get("SGLANG_PROFILE_MIN_BS", "16"))
+        self._stage36_fallback_forwards = int(
+            os.environ.get("SGLANG_PROFILE_FALLBACK_FORWARDS", "2000")
+        )
+        total_steps = self._stage36_wait + self._stage36_warmup + self._stage36_active
+
+        self._stage36_profiler = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=schedule(
+                wait=self._stage36_wait,
+                warmup=self._stage36_warmup,
+                active=self._stage36_active,
+                repeat=1,
+            ),
+            on_trace_ready=_on_trace_ready,
+            record_shapes=False,
+            with_stack=False,
+            profile_memory=False,
+        )
+        self._stage36_profiler_step_count = 0
+        self._stage36_total_step_target = total_steps
+        self._stage36_total_forward_count = 0
+        self._stage36_fallback_engaged = False
+        logger.info(
+            "[stage36-profile] enabled; trace path=%s; gate: bs>=%d; "
+            "schedule: wait(%d)+warmup(%d)+active(%d)=%d gated iters; "
+            "fallback: open gate after %d total forwards if bs never reaches threshold",
+            trace_path,
+            self._stage36_min_bs,
+            self._stage36_wait, self._stage36_warmup, self._stage36_active,
+            total_steps,
+            self._stage36_fallback_forwards,
+        )
+
+    def _stage36_profiler_step(self, forward_batch: "ForwardBatch") -> None:
+        """Step the profiler iff this forward is at steady-state batch size.
+
+        The schedule's wait/warmup/active counters advance ONLY on forwards
+        that pass the bs gate, so the captured active window is guaranteed
+        to be saturated — independent of workload, mfs, ramp-up dynamics.
+
+        Fallback: if no forward reaches the bs threshold within
+        ``SGLANG_PROFILE_FALLBACK_FORWARDS`` total invocations, open the
+        gate unconditionally so the trace still fires (avoids producing
+        zero-byte output on tiny benchmarks).
+        """
+        if self._stage36_profiler is None:
+            return
+
+        self._stage36_total_forward_count += 1
+        bs = int(getattr(forward_batch, "batch_size", 0) or 0)
+
+        # Engage fallback if too many forwards have passed without saturation.
+        if (
+            not self._stage36_fallback_engaged
+            and self._stage36_total_forward_count >= self._stage36_fallback_forwards
+            and self._stage36_profiler_step_count == 0
+        ):
+            logger.warning(
+                "[stage36-profile] fallback engaged after %d total forwards "
+                "(bs never reached %d); capturing whatever batch sizes occur",
+                self._stage36_total_forward_count, self._stage36_min_bs,
+            )
+            self._stage36_fallback_engaged = True
+
+        # Skip ramp-up: don't advance the schedule counter until the batch
+        # is saturated (or fallback has engaged).
+        if bs < self._stage36_min_bs and not self._stage36_fallback_engaged:
+            return
+
+        if not self._stage36_profiler_started:
+            self._stage36_profiler.__enter__()
+            self._stage36_profiler_started = True
+            logger.info(
+                "[stage36-profile] gate opened at total_forward=%d (bs=%d); "
+                "schedule begins counting now",
+                self._stage36_total_forward_count, bs,
+            )
+        self._stage36_profiler.step()
+        self._stage36_profiler_step_count += 1
+        # After wait+warmup+active gated iters, close the profiler to flush
+        # the trace and free memory. The runner stays alive for the rest of
+        # the eval.
+        if self._stage36_profiler_step_count >= self._stage36_total_step_target:
+            try:
+                self._stage36_profiler.__exit__(None, None, None)
+            except Exception as e:
+                logger.warning("[stage36-profile] profiler exit failed: %s", e)
+            self._stage36_profiler = None
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -3348,6 +3495,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            self._stage36_profiler_step(forward_batch)
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync
@@ -3431,6 +3579,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.token_to_kv_pool, "set_swa_loc"
         ):
             self.token_to_kv_pool.set_swa_loc(None)
+
+        # Profiling: step the profiler at the end of each forward.
+        # No-op when SGLANG_PROFILE_STAGE36 was not set. The forward_batch
+        # is needed for the bs-gated step (skip ramp-up).
+        self._stage36_profiler_step(forward_batch)
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 

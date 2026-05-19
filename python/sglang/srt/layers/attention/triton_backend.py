@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 import triton.language as tl
+from torch.profiler import record_function
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -107,6 +108,13 @@ class TritonAttnBackend(AttentionBackend):
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        # Pass-through to the Triton wrappers so they can extract 4-D KV
+        # view strides + specialize on PAGE_SIZE constexpr. At page_size=1
+        # the kernel branch is byte-identical to slot-based envelope.
+        # `model_runner.page_size` is set in ModelRunner.__init__ (defaults
+        # to 1 if `server_args.page_size` is None); using it here avoids
+        # the Optional[None] case on server_args.
+        self.page_size = getattr(model_runner, "page_size", 1) or 1
         # When the shared memory pool is enabled, req_to_token holds *virtual*
         # slot ids; the attention kernels need *physical* slot ids. This is the
         # virtual->physical translation hook (None — a no-op — otherwise).
@@ -1030,29 +1038,31 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.forward_metadata.qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.forward_metadata.custom_mask,
-            causal,
-            self.forward_metadata.mask_indptr,
-            self.forward_metadata.max_extend_len,
-            k_descale,
-            v_descale,
-            layer.scaling,
-            logit_cap=logits_soft_cap,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks,
-            window_kv_offsets=window_kv_offsets,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        with record_function("triton.extend_attention_fwd"):
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
+                page_size=self.page_size,
+            )
         return o
 
     def _forward_extend_unified(
@@ -1175,28 +1185,30 @@ class TritonAttnBackend(AttentionBackend):
             v_descale = 1.0
 
         # Call unified kernel
-        self.extend_attention_fwd_unified(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            k_descale,
-            v_descale,
-            self.forward_metadata.qo_indptr,
-            unified_kv_indptr,
-            unified_kv_indices,
-            prefix_lens,
-            self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
-            sm_scale=layer.scaling,
-            logit_cap=logits_soft_cap,
-            is_causal=causal,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks,
-            window_start_pos=window_start_pos,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        with record_function("triton.extend_attention_fwd_unified"):
+            self.extend_attention_fwd_unified(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                k_descale,
+                v_descale,
+                self.forward_metadata.qo_indptr,
+                unified_kv_indptr,
+                unified_kv_indices,
+                prefix_lens,
+                self.forward_metadata.max_extend_len,
+                custom_mask=self.forward_metadata.custom_mask,
+                mask_indptr=self.forward_metadata.mask_indptr,
+                sm_scale=layer.scaling,
+                logit_cap=logits_soft_cap,
+                is_causal=causal,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_start_pos=window_start_pos,
+                xai_temperature_len=layer.xai_temperature_len,
+                page_size=self.page_size,
+            )
 
         return o
 
@@ -1268,26 +1280,28 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            k_descale,
-            v_descale,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-            has_mla=self.use_mla,
-            use_pdl=self.use_pdl,
-        )
+        with record_function("triton.decode_attention_fwd"):
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
+                use_pdl=self.use_pdl,
+                page_size=self.page_size,
+            )
         return o
 
 

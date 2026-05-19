@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.triton_ops.decode_attention import _extract_kv_strides
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
@@ -255,6 +256,11 @@ def _fwd_kernel(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    # Page-aware strides (used when PAGE_SIZE > 1).
+    stride_buf_kpage,
+    stride_buf_ktok,
+    stride_buf_vpage,
+    stride_buf_vtok,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -270,6 +276,7 @@ def _fwd_kernel(
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr = 1,
 ):
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -371,12 +378,25 @@ def _fwd_kernel(
                 other=0,
             )
 
-            # load k in transposed way
-            offs_buf_k = (
-                offs_kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[:, None]
-            )
+            # Page-aware KV address math. At PAGE_SIZE==1
+            # (legacy / non-shared / shared-at-ps=1), Triton specializes
+            # the else-branch away — byte-identical SASS to today.
+            if PAGE_SIZE == 1:
+                # load k in transposed way
+                offs_buf_k = (
+                    offs_kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[:, None]
+                )
+            else:
+                page_id = offs_kv_loc // PAGE_SIZE
+                tok_in_p = offs_kv_loc % PAGE_SIZE
+                offs_buf_k = (
+                    page_id[None, :] * stride_buf_kpage
+                    + tok_in_p[None, :] * stride_buf_ktok
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[:, None]
+                )
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
@@ -384,11 +404,19 @@ def _fwd_kernel(
             )
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
-                offs_kpe = (
-                    offs_kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + offs_dpe[:, None]
-                )
+                if PAGE_SIZE == 1:
+                    offs_kpe = (
+                        offs_kv_loc[None, :] * stride_buf_kbs
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
+                else:
+                    offs_kpe = (
+                        page_id[None, :] * stride_buf_kpage
+                        + tok_in_p[None, :] * stride_buf_ktok
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
                 kpe = tl.load(
                     K_Buffer + offs_kpe,
                     mask=mask_n[None, :],
@@ -413,11 +441,19 @@ def _fwd_kernel(
             p = tl.exp(qk - n_e_max[:, None])
             deno = deno * re_scale + tl.sum(p, 1)
 
-            offs_buf_v = (
-                offs_kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
+            if PAGE_SIZE == 1:
+                offs_buf_v = (
+                    offs_kv_loc[:, None] * stride_buf_vbs
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+            else:
+                offs_buf_v = (
+                    page_id[:, None] * stride_buf_vpage
+                    + tok_in_p[:, None] * stride_buf_vtok
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
             v = tl.load(
                 V_Buffer + offs_buf_v,
                 mask=mask_n[:, None] & mask_dv[None, :],
@@ -579,6 +615,7 @@ def extend_attention_fwd(
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
+    page_size: int = 1,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -613,6 +650,13 @@ def extend_attention_fwd(
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
+        k_buffer, page_size
+    )
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
+        v_buffer, page_size
+    )
+
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -639,10 +683,14 @@ def extend_attention_fwd(
         v_extend.stride(1),
         o_extend.stride(0),
         o_extend.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        k_slot_stride,
+        k_head_stride,
+        v_slot_stride,
+        v_head_stride,
+        k_page_stride,
+        k_tok_stride,
+        v_page_stride,
+        v_tok_stride,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
@@ -658,6 +706,7 @@ def extend_attention_fwd(
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
+        PAGE_SIZE=page_size,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
@@ -726,6 +775,11 @@ def _fwd_kernel_unified(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    # Page-aware strides (used when PAGE_SIZE > 1).
+    stride_buf_kpage,
+    stride_buf_ktok,
+    stride_buf_vpage,
+    stride_buf_vtok,
     SLIDING_WINDOW_SIZE: tl.constexpr,
     logit_cap: tl.constexpr,
     xai_temperature_len: tl.constexpr,
@@ -739,6 +793,7 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr = 1,
 ):
     """
     Unified 1-stage kernel for deterministic extend attention.
@@ -874,12 +929,23 @@ def _fwd_kernel_unified(
                 other=0,
             )
 
-            # Load K
-            offs_buf_k = (
-                offs_kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[:, None]
-            )
+            # Page-aware KV address math (see _fwd_kernel_stage1).
+            if PAGE_SIZE == 1:
+                # Load K
+                offs_buf_k = (
+                    offs_kv_loc[None, :] * stride_buf_kbs
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[:, None]
+                )
+            else:
+                page_id = offs_kv_loc // PAGE_SIZE
+                tok_in_p = offs_kv_loc % PAGE_SIZE
+                offs_buf_k = (
+                    page_id[None, :] * stride_buf_kpage
+                    + tok_in_p[None, :] * stride_buf_ktok
+                    + cur_kv_head * stride_buf_kh
+                    + offs_d[:, None]
+                )
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
@@ -888,11 +954,19 @@ def _fwd_kernel_unified(
 
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
-                offs_kpe = (
-                    offs_kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + offs_dpe[:, None]
-                )
+                if PAGE_SIZE == 1:
+                    offs_kpe = (
+                        offs_kv_loc[None, :] * stride_buf_kbs
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
+                else:
+                    offs_kpe = (
+                        page_id[None, :] * stride_buf_kpage
+                        + tok_in_p[None, :] * stride_buf_ktok
+                        + cur_kv_head * stride_buf_kh
+                        + offs_dpe[:, None]
+                    )
                 kpe = tl.load(
                     K_Buffer + offs_kpe,
                     mask=mask_n[None, :],
@@ -920,11 +994,19 @@ def _fwd_kernel_unified(
             deno = deno * re_scale + tl.sum(p, 1)
 
             # Load V
-            offs_buf_v = (
-                offs_kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
+            if PAGE_SIZE == 1:
+                offs_buf_v = (
+                    offs_kv_loc[:, None] * stride_buf_vbs
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
+            else:
+                offs_buf_v = (
+                    page_id[:, None] * stride_buf_vpage
+                    + tok_in_p[:, None] * stride_buf_vtok
+                    + cur_kv_head * stride_buf_vh
+                    + offs_dv[None, :]
+                )
             v = tl.load(
                 V_Buffer + offs_buf_v,
                 mask=mask_n[:, None] & mask_dv[None, :],
@@ -974,6 +1056,7 @@ def extend_attention_fwd_unified(
     sinks=None,
     window_start_pos=None,
     xai_temperature_len=-1,
+    page_size: int = 1,
 ):
     """
     Unified 1-stage extend attention for deterministic inference.
@@ -1008,7 +1091,9 @@ def extend_attention_fwd_unified(
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    # head_num lives at dim 1 (3-D) or dim 2 (4-D view).
+    kv_head_num = k_buffer.shape[-2]
+    kv_group_num = q.shape[1] // kv_head_num
 
     USE_CUSTOM_MASK = custom_mask is not None
     HAS_SINK = sinks is not None
@@ -1025,6 +1110,13 @@ def extend_attention_fwd_unified(
     extra_kargs = {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+
+    k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
+        k_buffer, page_size
+    )
+    v_slot_stride, v_head_stride, v_page_stride, v_tok_stride = _extract_kv_strides(
+        v_buffer, page_size
+    )
 
     _fwd_kernel_unified[grid](
         q,
@@ -1046,10 +1138,14 @@ def extend_attention_fwd_unified(
         q.stride(1),
         o.stride(0),
         o.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        k_slot_stride,
+        k_head_stride,
+        v_slot_stride,
+        v_head_stride,
+        k_page_stride,
+        k_tok_stride,
+        v_page_stride,
+        v_tok_stride,
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
@@ -1063,6 +1159,7 @@ def extend_attention_fwd_unified(
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
+        PAGE_SIZE=page_size,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
