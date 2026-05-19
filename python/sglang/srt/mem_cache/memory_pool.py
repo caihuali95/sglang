@@ -1564,7 +1564,13 @@ class MHATokenToKVPool(KVCache):
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
-            move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+            # page_size=1 for non-shared MHA (its buffers are 3-D); the
+            # native path's 3-D branch matches today's behavior byte-
+            # identically.
+            move_kv_cache_native(
+                self.k_buffer, self.v_buffer, tgt_loc, src_loc,
+                page_size=getattr(self, "page_size", 1),
+            )
             return
 
         N = tgt_loc.numel()
@@ -2754,12 +2760,41 @@ def move_kv_cache_native(
     v_buffer: List[torch.Tensor],
     tgt_loc: torch.Tensor,
     src_loc: torch.Tensor,
+    page_size: int = 1,
 ):
+    """Move token-granular K/V rows from ``src_loc`` to ``tgt_loc``.
+
+    Supports two buffer shapes:
+
+    - 3-D ``[max_slots, head_num, head_dim]`` (legacy / non-shared): direct
+      advanced indexing on dim 0. ``page_size`` is ignored.
+    - 4-D ``[num_pages, page_size, head_num, head_dim]`` (shared pool):
+      split each token index into ``(page_id, tok_in_page)``
+      and use 2-D advanced indexing. PyTorch resolves the strided byte
+      address via the 4-D view's strides — works for both SLOT_MAJOR
+      (page_size==1 degenerate) and LAYER_MAJOR (page_size>1) within-page
+      sub-layouts.
+    """
     if tgt_loc.numel() == 0:
         return
 
     tgt_loc_flat = tgt_loc.view(-1).long()
     src_loc_flat = src_loc.view(-1).long()
     for k_cache, v_cache in zip(k_buffer, v_buffer):
-        k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
-        v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
+        if k_cache.ndim == 4:
+            if page_size == 1:
+                # Degenerate ``(num_pages, 1, head, dim)``: token id == page id;
+                # tok_in_page is always 0.
+                k_cache[tgt_loc_flat, 0] = k_cache[src_loc_flat, 0]
+                v_cache[tgt_loc_flat, 0] = v_cache[src_loc_flat, 0]
+            else:
+                tgt_page = tgt_loc_flat // page_size
+                tgt_tok = tgt_loc_flat % page_size
+                src_page = src_loc_flat // page_size
+                src_tok = src_loc_flat % page_size
+                k_cache[tgt_page, tgt_tok] = k_cache[src_page, src_tok]
+                v_cache[tgt_page, tgt_tok] = v_cache[src_page, src_tok]
+        else:
+            # 3-D legacy path — byte-identical to today.
+            k_cache[tgt_loc_flat] = k_cache[src_loc_flat]
+            v_cache[tgt_loc_flat] = v_cache[src_loc_flat]

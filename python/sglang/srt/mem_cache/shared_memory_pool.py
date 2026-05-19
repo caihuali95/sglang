@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
+from torch.profiler import record_function
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -123,6 +124,35 @@ class MHASubPoolSpec(SubPoolSpec):
     def entry_bytes(self) -> int:
         return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
 
+    # Page-local layer-major byte math.
+    # Within each page's ``page_size * entry_bytes`` block, K and V for each
+    # layer are grouped: page bytes =
+    #   [L0_K * page_size | L0_V * page_size | L1_K * page_size | ...].
+    # Across pages the layout stays envelope (page_bytes per page, preserving
+    # byte-frontier coordination between sub-pools).
+    #
+    # At ``page_size == 1`` this collapses to today's slot-major envelope —
+    # one page is one slot and the within-page block IS the per-slot
+    # ``[L0_K | L0_V | L1_K | L1_V | ...]`` envelope. Byte addresses are
+    # therefore byte-identical to slot-based envelope at ps=1.
+
+    def page_bytes(self, page_size: int) -> int:
+        """Bytes per page (``page_size`` slots)."""
+        return page_size * self.entry_bytes()
+
+    def layer_k_offset_in_page(self, layer_id: int, page_size: int) -> int:
+        """Byte offset (within one page) of layer ``layer_id``'s K block.
+
+        Layer L's K block starts at ``L * page_size * (k_row + v_row)``. At
+        ps=1 this is ``L * (k_row + v_row)`` — same as today's envelope.
+        """
+        return layer_id * page_size * (self.k_row_bytes() + self.v_row_bytes())
+
+    def layer_v_offset_in_page(self, layer_id: int, page_size: int) -> int:
+        """Byte offset (within one page) of layer ``layer_id``'s V block.
+        Immediately after that layer's K block."""
+        return self.layer_k_offset_in_page(layer_id, page_size) + page_size * self.k_row_bytes()
+
     def get_dtype(self) -> torch.dtype:
         """Storage dtype of the MHA K/V buffers — single dtype shared by
         both K and V (matches ``MHATokenToKVPool``'s contract)."""
@@ -188,7 +218,9 @@ class SharedMemoryPool:
         sub_pool_specs: List[SubPoolSpec],
         device: str,
         enable_memory_saver: bool,
+        page_size: int = 1,
     ):
+        assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
         assert len(sub_pool_specs) == 2, (
             f"SharedMemoryPool currently supports exactly 2 sub-pools; got "
             f"{len(sub_pool_specs)} (N>2 is Stage 4)"
@@ -204,6 +236,7 @@ class SharedMemoryPool:
         self.device = device
         self.total_bytes = total_bytes
         self.sub_pool_specs = sub_pool_specs
+        self._page_size = page_size  # feeds _build_mha_views stride math
         self._specs_by_name: Dict[str, SubPoolSpec] = {s.name: s for s in sub_pool_specs}
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -241,7 +274,7 @@ class SharedMemoryPool:
             self._min_slot_index[spec.name] = min_slot_index
             if isinstance(spec, MHASubPoolSpec):
                 self._mha_views[spec.name] = self._build_mha_views(
-                    spec, anchor, max_slots
+                    spec, anchor, max_slots, page_size=page_size,
                 )
             elif isinstance(spec, MambaSubPoolSpec):
                 self._mamba_views[spec.name] = self._build_mamba_views(
@@ -310,43 +343,82 @@ class SharedMemoryPool:
     # -- view construction (envelope layout) --
 
     def _build_mha_views(
-        self, spec: MHASubPoolSpec, anchor_bytes: int, max_slots: int
+        self,
+        spec: MHASubPoolSpec,
+        anchor_bytes: int,
+        max_slots: int,
+        page_size: int,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Inside one slot's envelope: per-layer interleaved K/V (K first, V second
-        per layer): [L0_K | L0_V | L1_K | L1_V | ... | L_{N-1}_V]. K and V may have
-        different per-head dims; the per-layer (k_row + v_row) byte step encodes it.
+        """Page-local layer-major layout.
+
+        Within each ``page_bytes`` block (one page = ``page_size`` slots),
+        K and V for each layer are grouped:
+            page bytes = [L0_K * ps | L0_V * ps | L1_K * ps | L1_V * ps | ...]
+
+        Across pages the layout stays envelope-major (page_bytes per page),
+        preserving the byte-frontier coordination between sub-pools.
+
+        Per-layer K and V views are emitted as 4-D
+        ``(num_pages, page_size, head_num, head_dim)`` with constant strides:
+
+          stride[0] = page_bytes / itemsize      # next page
+          stride[1] = k_row_bytes / itemsize     # next token within layer L's K block
+          stride[2] = head_dim                   # next head
+          stride[3] = 1                          # next dim element
+
+        V analogous, with ``v_row_bytes / itemsize`` and ``v_head_dim``.
+
+        At ``page_size == 1`` this gives byte-identical addresses to
+        slot-based 3-D envelope view — each page is one slot, layer-major-
+        within-a-1-token-page IS envelope. The 4-D shape is just an
+        expression of the same bytes with one extra (size-1) dim.
         """
         entry_bytes = spec.entry_bytes()
+        page_bytes = spec.page_bytes(page_size)
         k_row_bytes = spec.k_row_bytes()
         v_row_bytes = spec.v_row_bytes()
-        layer_step_bytes = k_row_bytes + v_row_bytes
         itemsize = spec.store_dtype.itemsize
         assert entry_bytes % itemsize == 0
         assert anchor_bytes % itemsize == 0
         assert k_row_bytes % itemsize == 0
         assert v_row_bytes % itemsize == 0
+        assert page_bytes % itemsize == 0
+        # Truncate max_slots to a multiple of page_size. The allocator (in
+        # multi_ended_allocator.py) already does this internally for its own
+        # num_virtual_pages bookkeeping (`num_virtual_pages = max_slots //
+        # page_size`); the view must match. The leftover slots in
+        # `[num_pages * page_size, max_slots)` are unreachable via the
+        # 4-D view, but they're also unreachable via the allocator —
+        # `MultiEndedAllocator.free_virtual_ids = arange(min_page_index,
+        # num_virtual_pages)` caps allocation at `num_pages * page_size`
+        # tokens, so no allocated slot id ever falls in the leftover band.
+        num_pages = max_slots // page_size
 
         as_dtype_view = self._raw.view(spec.store_dtype)
-        slot_stride_elems = entry_bytes // itemsize
         anchor_elems = anchor_bytes // itemsize
+        stride_page = page_bytes // itemsize
+        stride_tok_k = k_row_bytes // itemsize
+        stride_tok_v = v_row_bytes // itemsize
 
-        k_shape = (max_slots, spec.head_num, spec.head_dim)
-        v_shape = (max_slots, spec.head_num, spec.v_head_dim)
-        k_stride = (slot_stride_elems, spec.head_dim, 1)
-        v_stride = (slot_stride_elems, spec.v_head_dim, 1)
+        k_shape = (num_pages, page_size, spec.head_num, spec.head_dim)
+        v_shape = (num_pages, page_size, spec.head_num, spec.v_head_dim)
+        k_stride = (stride_page, stride_tok_k, spec.head_dim, 1)
+        v_stride = (stride_page, stride_tok_v, spec.v_head_dim, 1)
 
         k_buffer: List[torch.Tensor] = []
         v_buffer: List[torch.Tensor] = []
         for l in range(spec.layer_num):
-            k_offset_elems = anchor_elems + (l * layer_step_bytes) // itemsize
-            v_offset_elems = anchor_elems + (l * layer_step_bytes + k_row_bytes) // itemsize
+            k_base_bytes = anchor_bytes + spec.layer_k_offset_in_page(l, page_size)
+            v_base_bytes = anchor_bytes + spec.layer_v_offset_in_page(l, page_size)
+            assert k_base_bytes % itemsize == 0
+            assert v_base_bytes % itemsize == 0
             k_tensor = torch.as_strided(
                 as_dtype_view, size=k_shape, stride=k_stride,
-                storage_offset=k_offset_elems,
+                storage_offset=k_base_bytes // itemsize,
             )
             v_tensor = torch.as_strided(
                 as_dtype_view, size=v_shape, stride=v_stride,
-                storage_offset=v_offset_elems,
+                storage_offset=v_base_bytes // itemsize,
             )
             k_buffer.append(k_tensor)
             v_buffer.append(v_tensor)
@@ -511,7 +583,14 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         # _compact_pending). Force the native move (strided views).
         if tgt_loc.numel() == 0:
             return
-        move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
+        # Pass page_size so move_kv_cache_native takes the 4-D
+        # branch and splits token ids into (page_id, tok_in_page) when
+        # operating on layer-major views.
+        with record_function("SharedMHA.move_kv_cache"):
+            move_kv_cache_native(
+                self.k_buffer, self.v_buffer, tgt_loc, src_loc,
+                page_size=self._page_size,
+            )
 
     def get_kv_size_bytes(self):
         # The shared buffer's total size is logged by SharedMemoryPool once;
@@ -537,13 +616,20 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         ``unified_attention_with_output`` that pass a sub-slice of
         ``out_cache_loc``).
 
-        Type contract: ``loc.dtype == torch.int64`` (matches v2p table).
+        Type contract: ``loc.dtype`` must be a 64- or 32-bit integer.
+        - The FULL-side path stores int64 (matches the v2p_full table —
+          ``ForwardBatch.out_cache_loc_full_physical``).
+        - The SWA-side path (routing change in
+          ``SharedSWAKVPool.set_swa_loc``) stores int32 (matches the SWA
+          Triton kernel contract — ``forward_batch.out_cache_loc_swa``).
+        Both work with the 4-D advanced-indexing write in ``set_kv_buffer``
+        — PyTorch tolerates either dtype as an index tensor.
         """
         if loc is not None:
-            assert loc.dtype == torch.int64, (
+            assert loc.dtype in (torch.int64, torch.int32), (
                 f"SharedMHATokenToKVPool.set_loc: loc.dtype must be int64 "
-                f"(matches v2p table); got {loc.dtype}. Hint: don't reuse the "
-                f"int32 swa_loc buffer pattern here — full-physical is int64."
+                f"(full-physical buffer pattern) or int32 (swa-physical "
+                f"buffer pattern); got {loc.dtype}."
             )
         self._precomputed_loc = loc
 
@@ -557,17 +643,46 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         v_scale=None,
         layer_id_override: Optional[int] = None,
     ):
-        # Stage 3.5 fast path: when `_precomputed_loc` is set AND the caller's
-        # `loc` matches it (by `data_ptr`), use the precomputed full-physical
-        # ids directly — skips the per-call v2p gather. Required for cuda-
-        # graph capture; also a small perf win on the non-graph path (one
-        # gather per batch instead of one per layer per batch).
+        # Profiling: thin wrapper adds a named region around the
+        # body so torch.profiler can attribute time to this method. Costs
+        # nothing when no profiler is active (record_function is a no-op
+        # then). Body is in `_do_set_kv_buffer`.
+        with record_function("SharedMHA.set_kv_buffer"):
+            self._do_set_kv_buffer(
+                layer, loc, cache_k, cache_v, k_scale, v_scale, layer_id_override
+            )
+
+    def _do_set_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale,
+        v_scale,
+        layer_id_override: Optional[int],
+    ):
+        # Stage 3.6: always-bypass-super() write path.
         #
-        # Slice-safety: if a sub-batched caller (e.g. radix_attention's
-        # `unified_attention_with_output`) passes a slice of `out_cache_loc`,
-        # `loc.data_ptr()` differs from the whole-batch precompute. Fall
-        # through to the per-call translate path so the slice's virtual ids
-        # are correctly translated. (Section D.3 option (b) in §S35.)
+        # Why bypass `super().set_kv_buffer(...)`?
+        # The parent `MHATokenToKVPool.set_kv_buffer` routes through
+        # `_set_kv_buffer_impl` which calls `k_cache.view(-1, row_dim)`
+        # before invoking the `store_cache` Triton kernel. PyTorch's
+        # `view()` requires `stride[i] == shape[i+1] * stride[i+1]` for the
+        # dimensions being merged. Our 4-D layer-major view
+        # `(num_pages, page_size, head_num, head_dim)` has
+        # `stride[0] = page_bytes/itemsize = layer_num * page_size *
+        # (k_row + v_row) / itemsize` but `page_size * stride[1] =
+        # page_size * k_row/itemsize` — different by a factor of
+        # `layer_num * (1 + v_row/k_row)`. So `.view(-1, row_dim)` raises
+        # at LAYER_MAJOR (page_size > 1). At page_size == 1 the math
+        # happens to satisfy the merge rule, but we use the same code path
+        # for consistency (one path, predictable behavior).
+        #
+        # Step 1: resolve `loc` to PHYSICAL TOKEN ids.
+        # Step 1a: fast path — if `_precomputed_loc` matches
+        # `loc` (by data_ptr+shape), use the precomputed full-physical
+        # value directly.
         if (
             self._precomputed_loc is not None
             and loc is not None
@@ -576,32 +691,16 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         ):
             loc = self._precomputed_loc
         elif self._external_allocator is not None:
-            # `loc` arrives as VIRTUAL TOKEN ids (the shared-pool path);
-            # translate to physical TOKEN ids here. Robust to sub-batched
-            # callers passing a slice of out_cache_loc.
-            #
-            # For page_size == 1 (Stages 1/2): direct table lookup
-            # `v2p[loc]` — behavior byte-identical.
-            #
-            # For page_size > 1 (Stage 3): page math
+            # Step 1b: `loc` arrives as VIRTUAL TOKEN ids (shared-pool
+            # path); translate to physical TOKEN ids. Page-aware math:
             #   virt_pages = loc // page_size
             #   offsets = loc % page_size
             #   phys_tokens = v2p[virt_pages] * page_size + offsets
-            # The v2p table is page-granular (sized num_virtual_pages + 1);
-            # offsets within the page are preserved by the math.
-            #
-            # Tombstone-safety clamp (Stage 3.5): under cuda-graph capture
-            # the data-ptr fast path above is structurally dead — `loc` is a
-            # slice of `buffers.out_cache_loc` (virtual ids) while
-            # `_precomputed_loc` is a slice of
-            # `buffers.out_cache_loc_full_physical` (precomputed phys ids);
-            # they're different buffers by design, so this elif is always
-            # the captured WRITE path. A captured `k_buffer[-1]` from a
-            # tombstoned v2p entry is an illegal memory access; clamping to
-            # 0 routes those writes to physical slot 0 (the reserved
-            # padding sink under Stage 1's `min_slot_index` invariant).
-            # Cost: one elementwise op per layer; safe by §S3 dummy-write
-            # proof. Mirrored in `MultiEndedAllocator.translate_kv_loc`.
+            # At ps=1 this is just `v2p[loc]`. Tombstoned entries (-1 in
+            # v2p, from free / _compact_pending) are clamped to 0 so any
+            # write lands in physical slot 0 (the padding sink —
+            # `min_slot_index` invariant). Safe by the dummy-write
+            # proof.
             if self._page_size == 1:
                 loc = self._external_allocator.virtual_to_physical[loc]
                 loc = torch.clamp_min(loc, 0)
@@ -614,10 +713,44 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
                 ]
                 loc = phys_pages * ps + offsets
                 loc = torch.clamp_min(loc, 0)
-        super().set_kv_buffer(
-            layer, loc, cache_k, cache_v, k_scale, v_scale,
-            layer_id_override=layer_id_override,
-        )
+
+        # Step 2: replicate the parent's dtype-cast logic inline.
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        # Step 3: write into the 4-D layer-major view via advanced indexing.
+        # `loc` is token-granular physical; split into (page_id, tok_in_page)
+        # so PyTorch can resolve the strided byte offset for each token.
+        layer_id = (
+            layer.layer_id if layer_id_override is None else layer_id_override
+        ) - self.start_layer
+        k_view = self.k_buffer[layer_id]
+        v_view = self.v_buffer[layer_id]
+        # 4-D shape: (num_pages, page_size, head_num, head_dim/v_head_dim).
+        # Advanced indexing with two 1-D index tensors handles the strided
+        # write correctly across both SLOT_MAJOR (ps=1) and LAYER_MAJOR
+        # (ps>1) view layouts — PyTorch resolves each (page, tok) pair to
+        # the right byte address via the view's strides.
+        ps = self._page_size
+        if ps == 1:
+            # Degenerate case: page_size=1 means each page holds one token.
+            # The 4-D shape collapses to (max_slots, 1, head_num, head_dim).
+            # tok_in_page is always 0, so we can index by page directly.
+            k_view[loc, 0] = cache_k
+            v_view[loc, 0] = cache_v
+        else:
+            page_id = loc // ps
+            tok_in_p = loc % ps
+            k_view[page_id, tok_in_p] = cache_k
+            v_view[page_id, tok_in_p] = cache_v
 
 
 # ---------------------------------------------------------------------------
@@ -1070,6 +1203,7 @@ def init_shared_mamba_pools(
         sub_pool_specs=[full_spec, mamba_spec],
         device=device,
         enable_memory_saver=enable_memory_saver,
+        page_size=page_size,
     )
     req_to_token_pool = SharedHybridReqToTokenPool(
         shared_buffer=shared_pool,
@@ -1353,6 +1487,14 @@ class SharedSWAKVPool(SWAKVPool):
         # clear (defensive — recommended at end of forward to preserve
         # slice-safety for sub-batched callers).
         self.swa_loc = loc
+        # Also propagate to the underlying SharedMHATokenToKVPool's
+        # `_precomputed_loc` so the swa branch of `set_kv_buffer` (below) can
+        # route through `SharedMHATokenToKVPool.set_kv_buffer`'s new
+        # bypass-super() / 4-D-advanced-indexing path via the data-ptr fast
+        # path. Required because the parent `MHATokenToKVPool.set_kv_buffer`
+        # calls `_set_kv_buffer_impl` -> `k_cache.view(-1, row_dim)` which
+        # fails on the 4-D LAYER_MAJOR view (stride-merge rule).
+        self.swa_kv_pool.set_loc(loc)
 
     def set_full_loc(self, loc: Optional[torch.Tensor]) -> None:
         """Stage 3.5: per-batch full-physical loc for the full-attention
@@ -1425,11 +1567,20 @@ class SharedSWAKVPool(SWAKVPool):
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
             if self.swa_loc is not None:
-                # `swa_loc` is already swa-physical -> bypass the per-call
-                # virtual->physical translate inside `SharedMHATokenToKVPool`
-                # by writing through the parent `MHATokenToKVPool` directly.
-                MHATokenToKVPool.set_kv_buffer(
-                    self.swa_kv_pool,
+                # `swa_loc` is already swa-physical. Route through
+                # `SharedMHATokenToKVPool.set_kv_buffer` (NOT the grandparent
+                # `MHATokenToKVPool.set_kv_buffer`) because the parent's
+                # `_set_kv_buffer_impl` does `k_cache.view(-1, row_dim)` which
+                # FAILS on the 4-D LAYER_MAJOR view at page_size>1. The
+                # SharedMHATokenToKVPool override always bypasses super() and
+                # uses 4-D advanced indexing.
+                #
+                # We rely on `set_swa_loc` having set
+                # `self.swa_kv_pool._precomputed_loc = self.swa_loc`, so the
+                # data-ptr fast path inside `SharedMHATokenToKVPool.set_kv_buffer`
+                # picks up `self.swa_loc` directly (no re-translate; treats
+                # it as already swa-physical).
+                self.swa_kv_pool.set_kv_buffer(
                     None,
                     self.swa_loc,
                     cache_k,
@@ -1607,6 +1758,7 @@ def init_shared_swa_pools(
         sub_pool_specs=[full_spec, swa_spec],
         device=device,
         enable_memory_saver=enable_memory_saver,
+        page_size=page_size,
     )
     token_to_kv_pool = SharedSWAKVPool(
         shared_buffer=shared_pool,

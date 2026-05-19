@@ -136,6 +136,13 @@ class TritonAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.use_sliding_window_kv_pool = isinstance(self.token_to_kv_pool, SWAKVPool)
+        # Pass-through to the Triton wrappers so they can extract 4-D KV
+        # view strides + specialize on PAGE_SIZE constexpr. At page_size=1
+        # the kernel branch is byte-identical to slot-based envelope.
+        # `model_runner.page_size` is set in ModelRunner.__init__ (defaults
+        # to 1 if `server_args.page_size` is None); using it here avoids
+        # the Optional[None] case on server_args.
+        self.page_size = getattr(model_runner, "page_size", 1) or 1
         # When the shared memory pool is enabled, req_to_token holds *virtual*
         # slot ids; the attention kernels need *physical* slot ids. This is the
         # virtual->physical translation hook (None — a no-op — otherwise).
