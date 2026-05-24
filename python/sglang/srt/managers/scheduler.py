@@ -35,6 +35,8 @@ import psutil  # isort: skip
 import setproctitle
 import torch
 import torch.distributed
+import zmq
+from torch.profiler import record_function
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
@@ -2517,6 +2519,10 @@ class Scheduler(
 
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        with record_function("Scheduler.get_next_batch_to_run"):
+            return self._get_next_batch_to_run_impl()
+
+    def _get_next_batch_to_run_impl(self) -> Optional[ScheduleBatch]:
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3112,6 +3118,14 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        with record_function("Scheduler.run_batch"):
+            return self._run_batch_impl(batch, pp_proxy_tensors)
+
+    def _run_batch_impl(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
