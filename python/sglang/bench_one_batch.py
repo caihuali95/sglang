@@ -865,8 +865,17 @@ def latency_test(
     custom_inputs = [tokenizer.encode(p.strip()) for p in custom_inputs]
     custom_input_len = len(custom_inputs)
 
-    # Run the sweep
+    # Run the sweep. Each result is written to the jsonl AS it completes (and
+    # flushed) so a mid-sweep crash keeps the already-completed data points.
+    # Bench configs can OOM or hit an illegal memory access at large
+    # batch×context; the writer used to run only after the whole loop, so one
+    # bad config lost the entire sweep. Output is byte-identical on success.
     result_list = []
+    result_fout = (
+        open(bench_args.result_filename, "a")
+        if (tp_rank == 0 and bench_args.result_filename)
+        else None
+    )
     for bs, il, ol in itertools.product(
         bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
@@ -911,12 +920,12 @@ def latency_test(
         )
         if ret is not None:
             result_list.append(ret)
+            if result_fout is not None:
+                result_fout.write(json.dumps(ret) + "\n")
+                result_fout.flush()
 
-    # Write results in jsonlines format on rank 0.
-    if tp_rank == 0 and bench_args.result_filename:
-        with open(bench_args.result_filename, "a") as fout:
-            for result in result_list:
-                fout.write(json.dumps(result) + "\n")
+    if result_fout is not None:
+        result_fout.close()
 
     if server_args.tp_size > 1:
         destroy_distributed_environment()

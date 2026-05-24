@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
+from torch.profiler import record_function
 
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
 
@@ -146,27 +147,31 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return len(self.free_pages) + len(self.release_pages)
 
     def alloc(self, need_size: int):
-        if self.need_sort and need_size > len(self.free_pages):
-            self.merge_and_sort_free()
+        with record_function("TokenToKVPoolAllocator.alloc"):
+            if self.need_sort and need_size > len(self.free_pages):
+                self.merge_and_sort_free()
 
-        if need_size > len(self.free_pages):
-            return None
+            if need_size > len(self.free_pages):
+                return None
 
-        select_index = self.free_pages[:need_size]
-        self.free_pages = self.free_pages[need_size:]
-        return select_index
+            select_index = self.free_pages[:need_size]
+            self.free_pages = self.free_pages[need_size:]
+            return select_index
 
     def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
+        with record_function("TokenToKVPoolAllocator.free"):
+            if free_index.numel() == 0:
+                return
 
-        if self.is_not_in_free_group:
-            if self.need_sort:
-                self.release_pages = torch.cat((self.release_pages, free_index))
+            if self.is_not_in_free_group:
+                if self.need_sort:
+                    self.release_pages = torch.cat(
+                        (self.release_pages, free_index)
+                    )
+                else:
+                    self.free_pages = torch.cat((self.free_pages, free_index))
             else:
-                self.free_pages = torch.cat((self.free_pages, free_index))
-        else:
-            self.free_group.append(free_index)
+                self.free_group.append(free_index)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
@@ -384,27 +389,28 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def alloc(self, need_size: int):
-        # page-aligned allocation, returning contiguous indices of pages
-        if self.debug_mode:
-            assert (
-                need_size % self.page_size == 0
-            ), "The allocation size should be page-aligned"
+        with record_function("PagedTokenToKVPoolAllocator.alloc"):
+            # page-aligned allocation, returning contiguous indices of pages
+            if self.debug_mode:
+                assert (
+                    need_size % self.page_size == 0
+                ), "The allocation size should be page-aligned"
 
-        num_pages = need_size // self.page_size
-        if self.need_sort and num_pages > len(self.free_pages):
-            self.merge_and_sort_free()
-        if num_pages > len(self.free_pages):
-            return None
+            num_pages = need_size // self.page_size
+            if self.need_sort and num_pages > len(self.free_pages):
+                self.merge_and_sort_free()
+            if num_pages > len(self.free_pages):
+                return None
 
-        out_pages = self.free_pages[:num_pages]
-        self.free_pages = self.free_pages[num_pages:]
+            out_pages = self.free_pages[:num_pages]
+            self.free_pages = self.free_pages[num_pages:]
 
-        out_indices = (
-            out_pages[:, None] * self.page_size
-            + torch.arange(self.page_size, device=self.device)
-        ).reshape(-1)
+            out_indices = (
+                out_pages[:, None] * self.page_size
+                + torch.arange(self.page_size, device=self.device)
+            ).reshape(-1)
 
-        return out_indices
+            return out_indices
 
     def alloc_extend(
         self,
@@ -416,45 +422,46 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
     ):
-        if self.debug_mode:
-            assert torch.all(
-                (last_loc + 1) % self.page_size == prefix_lens % self.page_size
+        with record_function("PagedTokenToKVPoolAllocator.alloc_extend"):
+            if self.debug_mode:
+                assert torch.all(
+                    (last_loc + 1) % self.page_size == prefix_lens % self.page_size
+                )
+
+            bs = len(prefix_lens)
+            if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
+                self.free_pages
+            ):
+                self.merge_and_sort_free()
+
+            out_indices = torch.empty(
+                (extend_num_tokens,), dtype=torch.int64, device=self.device
             )
 
-        bs = len(prefix_lens)
-        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
-            self.free_pages
-        ):
-            self.merge_and_sort_free()
-
-        out_indices = torch.empty(
-            (extend_num_tokens,), dtype=torch.int64, device=self.device
-        )
-
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
-
-        if self.debug_mode:
-            assert len(torch.unique(out_indices)) == len(out_indices)
-
-        if num_new_pages is None:
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
             )
-        if num_new_pages > len(self.free_pages):
-            return None
 
-        self.free_pages = self.free_pages[num_new_pages:]
-        return out_indices
+            if self.debug_mode:
+                assert len(torch.unique(out_indices)) == len(out_indices)
+
+            if num_new_pages is None:
+                num_new_pages = get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+            if num_new_pages > len(self.free_pages):
+                return None
+
+            self.free_pages = self.free_pages[num_new_pages:]
+            return out_indices
 
     def alloc_decode(
         self,
@@ -462,54 +469,60 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
-        if self.debug_mode:
-            assert torch.all(
-                (last_loc + 2) % self.page_size == seq_lens % self.page_size
+        with record_function("PagedTokenToKVPoolAllocator.alloc_decode"):
+            if self.debug_mode:
+                assert torch.all(
+                    (last_loc + 2) % self.page_size == seq_lens % self.page_size
+                )
+
+            bs = len(seq_lens)
+            if self.need_sort and bs > len(self.free_pages):
+                self.merge_and_sort_free()
+
+            out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
             )
 
-        bs = len(seq_lens)
-        if self.need_sort and bs > len(self.free_pages):
-            self.merge_and_sort_free()
+            if self.debug_mode:
+                assert len(torch.unique(out_indices)) == len(out_indices)
 
-        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                decode=True,
+            )
+            if num_new_pages > len(self.free_pages):
+                return None
 
-        if self.debug_mode:
-            assert len(torch.unique(out_indices)) == len(out_indices)
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            decode=True,
-        )
-        if num_new_pages > len(self.free_pages):
-            return None
-
-        self.free_pages = self.free_pages[num_new_pages:]
-        return out_indices
+            self.free_pages = self.free_pages[num_new_pages:]
+            return out_indices
 
     def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
+        with record_function("PagedTokenToKVPoolAllocator.free"):
+            if free_index.numel() == 0:
+                return
 
-        if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
-            if self.need_sort:
-                self.release_pages = torch.cat((free_page_indices, self.release_pages))
+            if self.is_not_in_free_group:
+                free_page_indices = torch.unique(free_index // self.page_size)
+                if self.need_sort:
+                    self.release_pages = torch.cat(
+                        (free_page_indices, self.release_pages)
+                    )
+                else:
+                    self.free_pages = torch.cat(
+                        (free_page_indices, self.free_pages)
+                    )
             else:
-                self.free_pages = torch.cat((free_page_indices, self.free_pages))
-        else:
-            self.free_group.append(free_index)
+                self.free_group.append(free_index)
 
-        if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+            if self.debug_mode:
+                assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.

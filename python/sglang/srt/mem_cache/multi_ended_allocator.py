@@ -381,40 +381,42 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         joint byte-budget in the SWA composite makes a stale-state edge case
         possible, and Stage 1 already has the symmetric guard on grow-down).
         """
-        if need_size <= 0:
-            return torch.empty(0, dtype=torch.int64, device=self.device)
-        assert need_size % self.page_size == 0, (
-            f"take_physical: need_size={need_size} must be a multiple of "
-            f"page_size={self.page_size}"
-        )
-        num_pages = need_size // self.page_size
-        if self.grow_direction == "up":
-            start = self.watermark_physical
-            end_exclusive = start + num_pages
-            # Defensive overflow check — Stage 3 added the symmetric guard
-            # for grow-up (Stage 1 only had it for grow-down).
-            if end_exclusive > self.num_virtual_pages:
-                return None
-            phys_pages = torch.arange(
-                start, end_exclusive, dtype=torch.int64, device=self.device
+        with record_function("MultiEndedAlloc.take_physical"):
+            if need_size <= 0:
+                return torch.empty(0, dtype=torch.int64, device=self.device)
+            assert need_size % self.page_size == 0, (
+                f"take_physical: need_size={need_size} must be a multiple of "
+                f"page_size={self.page_size}"
             )
-            self.watermark_physical = end_exclusive
-            return phys_pages
-        else:
-            end = self.watermark_physical
-            start = end - num_pages + 1
-            if start < self.min_page_index:
-                return None
-            phys_pages = torch.arange(
-                start, end + 1, dtype=torch.int64, device=self.device
-            )
-            self.watermark_physical -= num_pages
-            return phys_pages
+            num_pages = need_size // self.page_size
+            if self.grow_direction == "up":
+                start = self.watermark_physical
+                end_exclusive = start + num_pages
+                # Defensive overflow check — Stage 3 added the symmetric guard
+                # for grow-up (Stage 1 only had it for grow-down).
+                if end_exclusive > self.num_virtual_pages:
+                    return None
+                phys_pages = torch.arange(
+                    start, end_exclusive, dtype=torch.int64, device=self.device
+                )
+                self.watermark_physical = end_exclusive
+                return phys_pages
+            else:
+                end = self.watermark_physical
+                start = end - num_pages + 1
+                if start < self.min_page_index:
+                    return None
+                phys_pages = torch.arange(
+                    start, end + 1, dtype=torch.int64, device=self.device
+                )
+                self.watermark_physical -= num_pages
+                return phys_pages
 
     def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
         """Page-granular wrapper around ``take_physical``. Used by the SWA
         composite's ``alloc_extend`` to bind the non-owner side."""
-        return self.take_physical(num_pages * self.page_size)
+        with record_function("MultiEndedAlloc.take_physical_pages"):
+            return self.take_physical(num_pages * self.page_size)
 
     def bind(
         self, virtual_ids: torch.Tensor, physical_ids: torch.Tensor
@@ -425,15 +427,17 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         (behavior matches Stage 1/2 exactly). For page_size > 1, both are
         PAGE ids — the v2p / p2v tables are page-granular.
         """
-        self.virtual_to_physical[virtual_ids] = physical_ids
-        self.physical_to_virtual[physical_ids] = virtual_ids
+        with record_function("MultiEndedAlloc.bind"):
+            self.virtual_to_physical[virtual_ids] = physical_ids
+            self.physical_to_virtual[physical_ids] = virtual_ids
 
     def bind_pages(
         self, virtual_pages: torch.Tensor, physical_pages: torch.Tensor
     ) -> None:
         """Explicit page-granular binder. Alias of ``bind`` — kept distinct
         for readability at the SWA composite call site."""
-        self.bind(virtual_pages, physical_pages)
+        with record_function("MultiEndedAlloc.bind_pages"):
+            self.bind(virtual_pages, physical_pages)
 
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 
@@ -445,7 +449,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     ) -> torch.Tensor:
         """Translate token-granular virtual ids to token-granular physical ids.
 
-        Stage 3.5: the ``out=`` parameter writes results in-place into a
+        The ``out=`` parameter writes results in-place into a
         caller-owned buffer. Required under cuda-graph capture for
         buffer-stability — the captured graph records the gather/multiply/add
         sequence against a fixed ``data_ptr``, replay re-runs against the
@@ -565,35 +569,38 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             `forward_stream.wait_stream(schedule_stream)` at the top of
             `run_batch`.
         """
-        assert self.is_id_owner, (
-            f"MultiEndedAllocator({self.sub_pool_name!r}).alloc called on a "
-            "non-id-owner allocator; use alloc_with_virtual instead"
-        )
-        if need_size <= 0:
-            return torch.empty(0, dtype=torch.int64, device=self.device)
-        assert need_size % self.page_size == 0, (
-            f"MultiEndedAllocator({self.sub_pool_name!r}).alloc: need_size="
-            f"{need_size} must be a multiple of page_size={self.page_size}"
-        )
-        if need_size > self.available_size():
-            return None
-        num_pages = need_size // self.page_size
-        v_pages = self.free_virtual_ids[:num_pages]
-        self.free_virtual_ids = self.free_virtual_ids[num_pages:]
-        phys_pages = self.take_physical_pages(num_pages)
-        if phys_pages is None:
-            # Undo the virtual pop.
-            self.free_virtual_ids = torch.cat([v_pages, self.free_virtual_ids])
-            return None
-        self.bind_pages(v_pages, phys_pages)
-        if self.page_size == 1:
-            # Avoid the extra reshape — v_pages already IS the token id list.
-            return v_pages
-        # Expand page ids to token ids: (P, 1) * S + (S,) → (P, S) → (P*S,).
-        return (
-            v_pages[:, None] * self.page_size
-            + torch.arange(self.page_size, device=self.device)
-        ).reshape(-1)
+        with record_function("MultiEndedAlloc.alloc"):
+            assert self.is_id_owner, (
+                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc called on a "
+                "non-id-owner allocator; use alloc_with_virtual instead"
+            )
+            if need_size <= 0:
+                return torch.empty(0, dtype=torch.int64, device=self.device)
+            assert need_size % self.page_size == 0, (
+                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc: need_size="
+                f"{need_size} must be a multiple of page_size={self.page_size}"
+            )
+            if need_size > self.available_size():
+                return None
+            num_pages = need_size // self.page_size
+            v_pages = self.free_virtual_ids[:num_pages]
+            self.free_virtual_ids = self.free_virtual_ids[num_pages:]
+            phys_pages = self.take_physical_pages(num_pages)
+            if phys_pages is None:
+                # Undo the virtual pop.
+                self.free_virtual_ids = torch.cat(
+                    [v_pages, self.free_virtual_ids]
+                )
+                return None
+            self.bind_pages(v_pages, phys_pages)
+            if self.page_size == 1:
+                # Avoid the extra reshape — v_pages already IS the token id list.
+                return v_pages
+            # Expand page ids to token ids: (P, 1) * S + (S,) → (P, S) → (P*S,).
+            return (
+                v_pages[:, None] * self.page_size
+                + torch.arange(self.page_size, device=self.device)
+            ).reshape(-1)
 
     def alloc_with_virtual(self, virtual_pages: torch.Tensor) -> None:
         """Take physical PAGES for caller-supplied virtual PAGE ids
@@ -606,14 +613,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         corresponding virtual page ids before consuming them from the
         id-owner's free-list.
         """
-        if virtual_pages.numel() == 0:
-            return
-        phys_pages = self.take_physical_pages(int(virtual_pages.numel()))
-        assert phys_pages is not None, (
-            f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
-            "physical room (the composite's byte-budget check should have caught this)"
-        )
-        self.bind_pages(virtual_pages, phys_pages)
+        with record_function("MultiEndedAlloc.alloc_with_virtual"):
+            if virtual_pages.numel() == 0:
+                return
+            phys_pages = self.take_physical_pages(int(virtual_pages.numel()))
+            assert phys_pages is not None, (
+                f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
+                "physical room (the composite's byte-budget check should have caught this)"
+            )
+            self.bind_pages(virtual_pages, phys_pages)
 
     # -- paged alloc surface (Stage 3) --
 
@@ -648,62 +656,64 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         ``alloc_with_virtual(new_virtual_pages)`` to bind their own physical
         pages to the same virtual pages (the SWA composite handles this).
         """
-        assert self.is_id_owner, (
-            f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
-        )
-        if num_new_pages is None:
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu,
-                page_size=self.page_size,
-                prefix_lens=prefix_lens_cpu,
+        with record_function("MultiEndedAlloc.alloc_extend"):
+            assert self.is_id_owner, (
+                f"alloc_extend on a non-id-owner allocator ({self.sub_pool_name!r})"
             )
-        if num_new_pages > len(self.free_virtual_ids):
-            return None
-        bs = len(prefix_lens)
-        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
-            self.free_virtual_ids
-        ):
-            self.merge_and_sort_free()
-
-        # Snapshot the virtual pages the kernel is about to consume, so we
-        # can bind them to physical pages on THIS sub-allocator afterward.
-        # (eval_results_14 regression: without this, v2p stayed -1 and
-        # `translate_kv_loc` returned negative token ids → CUDA OOB.)
-        if num_new_pages > 0:
-            new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
-        else:
-            new_virtual_pages = None
-
-        out_indices = torch.empty(
-            (extend_num_tokens,), dtype=torch.int64, device=self.device
-        )
-        # Pass `free_virtual_ids` (virtual pages) as `free_page_ptr` — the
-        # kernel just does `page_id * page_size + offset` math and doesn't
-        # care whether page ids are virtual or physical.
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_virtual_ids,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
-
-        # Bind the consumed virtual pages to fresh physical pages on this
-        # sub-allocator. Advances the watermark + sets v2p / p2v. The peer
-        # (swa side, if any) does its own binding via `alloc_with_virtual`.
-        if new_virtual_pages is not None:
-            phys_pages = self.take_physical_pages(num_new_pages)
-            if phys_pages is None:
-                # Defensive — the pre-check should have prevented this. Return
-                # None so the composite can decide whether to roll back.
+            if num_new_pages is None:
+                num_new_pages = get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+            if num_new_pages > len(self.free_virtual_ids):
                 return None
-            self.bind_pages(new_virtual_pages, phys_pages)
+            bs = len(prefix_lens)
+            if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
+                self.free_virtual_ids
+            ):
+                self.merge_and_sort_free()
 
-        # Consume the new virtual pages from the free-list.
-        self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
-        return out_indices  # virtual token ids
+            # Snapshot the virtual pages the kernel is about to consume, so we
+            # can bind them to physical pages on THIS sub-allocator afterward.
+            # (eval_results_14 regression: without this, v2p stayed -1 and
+            # `translate_kv_loc` returned negative token ids → CUDA OOB.)
+            if num_new_pages > 0:
+                new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
+            else:
+                new_virtual_pages = None
+
+            out_indices = torch.empty(
+                (extend_num_tokens,), dtype=torch.int64, device=self.device
+            )
+            # Pass `free_virtual_ids` (virtual pages) as `free_page_ptr` — the
+            # kernel just does `page_id * page_size + offset` math and doesn't
+            # care whether page ids are virtual or physical.
+            with record_function("MultiEndedAlloc.alloc_extend.kernel"):
+                alloc_extend_kernel[(bs,)](
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    self.free_virtual_ids,
+                    out_indices,
+                    next_power_of_2(bs),
+                    self.page_size,
+                )
+
+            # Bind the consumed virtual pages to fresh physical pages on this
+            # sub-allocator. Advances the watermark + sets v2p / p2v. The peer
+            # (swa side, if any) does its own binding via `alloc_with_virtual`.
+            if new_virtual_pages is not None:
+                phys_pages = self.take_physical_pages(num_new_pages)
+                if phys_pages is None:
+                    # Defensive — the pre-check should have prevented this. Return
+                    # None so the composite can decide whether to roll back.
+                    return None
+                self.bind_pages(new_virtual_pages, phys_pages)
+
+            # Consume the new virtual pages from the free-list.
+            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
+            return out_indices  # virtual token ids
 
     def alloc_decode(
         self,
@@ -721,50 +731,52 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         v2p stays -1 and downstream translation produces negative token ids
         → CUDA OOB).
         """
-        assert self.is_id_owner, (
-            f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
-        )
-        bs = len(seq_lens)
-        # Compute num_new_pages BEFORE the kernel so we can snapshot the
-        # exact slice of `free_virtual_ids` the kernel will consume.
-        # `get_num_new_pages` is CPU-only and matches the kernel's count.
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
-        )
-        if num_new_pages > len(self.free_virtual_ids):
-            return None
-        if self.need_sort and bs > len(self.free_virtual_ids):
-            self.merge_and_sort_free()
-
-        # Snapshot the virtual pages the kernel will consume (if any).
-        # Most decode steps reuse the prefix's tail page → num_new_pages == 0.
-        if num_new_pages > 0:
-            new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
-        else:
-            new_virtual_pages = None
-
-        out_indices = torch.empty(
-            (bs,), dtype=torch.int64, device=self.device
-        )
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_virtual_ids,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
-
-        # Bind the consumed virtual pages to fresh physical pages on this
-        # sub-allocator. Advances the watermark + sets v2p / p2v.
-        if new_virtual_pages is not None:
-            phys_pages = self.take_physical_pages(num_new_pages)
-            if phys_pages is None:
+        with record_function("MultiEndedAlloc.alloc_decode"):
+            assert self.is_id_owner, (
+                f"alloc_decode on a non-id-owner allocator ({self.sub_pool_name!r})"
+            )
+            bs = len(seq_lens)
+            # Compute num_new_pages BEFORE the kernel so we can snapshot the
+            # exact slice of `free_virtual_ids` the kernel will consume.
+            # `get_num_new_pages` is CPU-only and matches the kernel's count.
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
+            )
+            if num_new_pages > len(self.free_virtual_ids):
                 return None
-            self.bind_pages(new_virtual_pages, phys_pages)
+            if self.need_sort and bs > len(self.free_virtual_ids):
+                self.merge_and_sort_free()
 
-        self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
-        return out_indices  # virtual token ids
+            # Snapshot the virtual pages the kernel will consume (if any).
+            # Most decode steps reuse the prefix's tail page → num_new_pages == 0.
+            if num_new_pages > 0:
+                new_virtual_pages = self.free_virtual_ids[:num_new_pages].clone()
+            else:
+                new_virtual_pages = None
+
+            out_indices = torch.empty(
+                (bs,), dtype=torch.int64, device=self.device
+            )
+            with record_function("MultiEndedAlloc.alloc_decode.kernel"):
+                alloc_decode_kernel[(bs,)](
+                    seq_lens,
+                    last_loc,
+                    self.free_virtual_ids,
+                    out_indices,
+                    next_power_of_2(bs),
+                    self.page_size,
+                )
+
+            # Bind the consumed virtual pages to fresh physical pages on this
+            # sub-allocator. Advances the watermark + sets v2p / p2v.
+            if new_virtual_pages is not None:
+                phys_pages = self.take_physical_pages(num_new_pages)
+                if phys_pages is None:
+                    return None
+                self.bind_pages(new_virtual_pages, phys_pages)
+
+            self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
+            return out_indices  # virtual token ids
 
     # -- free with eager compaction --
 
@@ -788,35 +800,42 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         before any v2p write or move — eliminating that race without any
         stream switching (which previously introduced data-corruption bugs).
         """
-        if free_index is None or free_index.numel() == 0:
-            return
-        if not self.is_not_in_free_group:
-            self.free_group.append(free_index)
-            return
-        # Overlap-mode barrier (single, at the start). In normal mode this is
-        # a near-no-op because sampling's CPU sync has already drained
-        # forward_stream. In overlap mode it serializes free+compaction with
-        # the in-flight forward, which is what we need for correctness.
-        if self.forward_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.forward_stream)
-        # Recover virtual PAGE ids from token-granular `free_index`. For
-        # page_size == 1, `// page_size` is identity, so this collapses to
-        # Stage 1/2 behavior byte-identically.
-        free_v_pages = torch.unique(
-            free_index.detach().to(torch.int64) // self.page_size
-        )
-        freed_p_pages = self.virtual_to_physical[free_v_pages]
-        if bool((freed_p_pages < 0).any().item()):
-            self._raise_stale_slot_assertion(
-                free_v=free_v_pages, freed_p=freed_p_pages
-            )
-        # Un-map; (if id-owner) recycle the virtual page ids.
-        self.virtual_to_physical[free_v_pages] = -1
-        if self.is_id_owner:
-            self.free_virtual_ids = torch.cat(
-                [self.free_virtual_ids, free_v_pages]
-            )
-        self._compact_pending(freed_p_pages)
+        with record_function("MultiEndedAlloc.free"):
+            if free_index is None or free_index.numel() == 0:
+                return
+            if not self.is_not_in_free_group:
+                self.free_group.append(free_index)
+                return
+            # Overlap-mode barrier (single, at the start). In normal mode this is
+            # a near-no-op because sampling's CPU sync has already drained
+            # forward_stream. In overlap mode it serializes free+compaction with
+            # the in-flight forward, which is what we need for correctness.
+            if self.forward_stream is not None:
+                with record_function("MultiEndedAlloc.free.wait_stream"):
+                    torch.cuda.current_stream().wait_stream(self.forward_stream)
+            # Recover virtual PAGE ids from token-granular `free_index`. For
+            # page_size == 1, `// page_size` is identity, so this collapses to
+            # Stage 1/2 behavior byte-identically.
+            with record_function("MultiEndedAlloc.free.v2p_lookup"):
+                free_v_pages = torch.unique(
+                    free_index.detach().to(torch.int64) // self.page_size
+                )
+                freed_p_pages = self.virtual_to_physical[free_v_pages]
+            with record_function("MultiEndedAlloc.free.sync_check"):
+                # `.item()` here forces CPU/GPU sync — surface it as its own
+                # region in the trace so we can see how much wall-clock time
+                # it actually costs per free call.
+                if bool((freed_p_pages < 0).any().item()):
+                    self._raise_stale_slot_assertion(
+                        free_v=free_v_pages, freed_p=freed_p_pages
+                    )
+            # Un-map; (if id-owner) recycle the virtual page ids.
+            self.virtual_to_physical[free_v_pages] = -1
+            if self.is_id_owner:
+                self.free_virtual_ids = torch.cat(
+                    [self.free_virtual_ids, free_v_pages]
+                )
+            self._compact_pending(freed_p_pages)
 
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
         """Eager compaction over the freed PHYSICAL pages: move the survivor
@@ -1097,7 +1116,8 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        return self.full_attn_allocator.alloc(need_size)
+        with record_function("SharedMambaAlloc.alloc"):
+            return self.full_attn_allocator.alloc(need_size)
 
     def alloc_extend(
         self,
@@ -1112,15 +1132,16 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Paged extend allocation (Stage 3). Mamba state is per-request and
         does NOT advance on per-token alloc, so the composite only forwards
         to the full sub-allocator."""
-        return self.full_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
-        )
+        with record_function("SharedMambaAlloc.alloc_extend"):
+            return self.full_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_new_pages,
+            )
 
     def alloc_decode(
         self,
@@ -1130,9 +1151,10 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ) -> Optional[torch.Tensor]:
         """Paged decode allocation (Stage 3). Same dispatch logic as
         ``alloc_extend`` — the mamba side stays untouched per-decode."""
-        return self.full_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
+        with record_function("SharedMambaAlloc.alloc_decode"):
+            return self.full_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc
+            )
 
     def translate_kv_loc(
         self,
@@ -1160,14 +1182,15 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.full_attn_allocator.allocator_state_str()
 
     def free(self, free_index: torch.Tensor) -> None:
-        if free_index is None or free_index.numel() == 0:
-            return
-        if not self.is_not_in_free_group:
-            self.free_group.append(free_index)
-            return
-        self.full_attn_allocator.free(free_index)
-        self.full_attn_allocator.clear_inverse_history()
-        self.mamba_allocator.clear_inverse_history()
+        with record_function("SharedMambaAlloc.free"):
+            if free_index is None or free_index.numel() == 0:
+                return
+            if not self.is_not_in_free_group:
+                self.free_group.append(free_index)
+                return
+            self.full_attn_allocator.free(free_index)
+            self.full_attn_allocator.clear_inverse_history()
+            self.mamba_allocator.clear_inverse_history()
 
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
@@ -1499,29 +1522,30 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- alloc --
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        # Joint pre-check (v1 lesson #1) — accounts for byte pressure across
-        # both sub-pools and both index-space headrooms.
-        if need_size > self.available_size():
-            return None
-        # Snapshot the virtual PAGES the full-side alloc is about to consume,
-        # so we can bind them on the swa side too. For page_size == 1, this
-        # is just `free_virtual_ids[:need_size]` (token == page). For page>1,
-        # it's `free_virtual_ids[:need_size // page_size]` (page-granular).
-        fa = self.full_attn_allocator
-        num_pages = need_size // self.page_size
-        new_virtual_pages = fa.free_virtual_ids[:num_pages].clone()
+        with record_function("SharedSWAAlloc.alloc"):
+            # Joint pre-check (v1 lesson #1) — accounts for byte pressure across
+            # both sub-pools and both index-space headrooms.
+            if need_size > self.available_size():
+                return None
+            # Snapshot the virtual PAGES the full-side alloc is about to consume,
+            # so we can bind them on the swa side too. For page_size == 1, this
+            # is just `free_virtual_ids[:need_size]` (token == page). For page>1,
+            # it's `free_virtual_ids[:need_size // page_size]` (page-granular).
+            fa = self.full_attn_allocator
+            num_pages = need_size // self.page_size
+            new_virtual_pages = fa.free_virtual_ids[:num_pages].clone()
 
-        v_tokens = fa.alloc(need_size)
-        if v_tokens is None:
-            return None
-        try:
-            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-        except AssertionError:
-            # Should be unreachable after the joint pre-check above; defensive
-            # rollback so composite state stays coherent. (v1 lesson #5.)
-            self._rollback_full_alloc(new_virtual_pages, v_tokens)
-            return None
-        return v_tokens
+            v_tokens = fa.alloc(need_size)
+            if v_tokens is None:
+                return None
+            try:
+                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+            except AssertionError:
+                # Should be unreachable after the joint pre-check above;
+                # defensive rollback (v1 lesson #5).
+                self._rollback_full_alloc(new_virtual_pages, v_tokens)
+                return None
+            return v_tokens
 
     def alloc_extend(
         self,
@@ -1548,46 +1572,47 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         - the cross-sub-pool identity (same virtual page id maps to
           full-physical-page on full side and swa-physical-page on swa side).
         """
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu,
-            page_size=self.page_size,
-            prefix_lens=prefix_lens_cpu,
-        )
-        # Joint pre-check at page granularity (matches v1 lesson #1).
-        # `available_size()` returns TOKENS; divide by page_size for pages.
-        if num_new_pages > (self.available_size() // self.page_size):
-            return None
+        with record_function("SharedSWAAlloc.alloc_extend"):
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=self.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+            # Joint pre-check at page granularity (matches v1 lesson #1).
+            # `available_size()` returns TOKENS; divide by page_size for pages.
+            if num_new_pages > (self.available_size() // self.page_size):
+                return None
 
-        # Snapshot the virtual PAGES that the full-side kernel call is
-        # about to consume — `free_virtual_ids[:num_new_pages]` is the
-        # slice the kernel reads via `free_page_ptr`. Clone so the swa
-        # side has its own view even after the slice is sliced off.
-        fa = self.full_attn_allocator
-        new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
+            # Snapshot the virtual PAGES that the full-side kernel call is
+            # about to consume — `free_virtual_ids[:num_new_pages]` is the
+            # slice the kernel reads via `free_page_ptr`. Clone so the swa
+            # side has its own view even after the slice is sliced off.
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
 
-        # Run the kernel ONCE in virtual space.
-        out_indices = fa.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-            num_new_pages=num_new_pages,
-        )
-        if out_indices is None:
-            return None
+            # Run the kernel ONCE in virtual space.
+            out_indices = fa.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                last_loc,
+                extend_num_tokens,
+                num_new_pages=num_new_pages,
+            )
+            if out_indices is None:
+                return None
 
-        # Bind the new virtual pages on the swa side.
-        try:
-            self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-        except AssertionError:
-            # Defensive rollback (the joint pre-check should have prevented
-            # this). Reverse the full-side state and return None.
-            self._rollback_full_alloc(new_virtual_pages, out_indices)
-            return None
+            # Bind the new virtual pages on the swa side.
+            try:
+                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+            except AssertionError:
+                # Defensive rollback (the joint pre-check should have prevented
+                # this). Reverse the full-side state and return None.
+                self._rollback_full_alloc(new_virtual_pages, out_indices)
+                return None
 
-        return out_indices  # virtual TOKEN ids
+            return out_indices  # virtual TOKEN ids
 
     def alloc_decode(
         self,
@@ -1600,30 +1625,31 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         Same one-kernel-in-virtual-space discipline as ``alloc_extend``.
         """
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
-        )
-        # Joint pre-check at page granularity. (Even when num_new_pages == 0,
-        # we still need to call the kernel to fill out_indices — but the
-        # available-size check is automatic since 0 ≤ anything.)
-        if num_new_pages > (self.available_size() // self.page_size):
-            return None
-
-        fa = self.full_attn_allocator
-        new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-        out_indices = fa.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
-        if out_indices is None:
-            return None
-
-        if new_virtual_pages.numel() > 0:
-            try:
-                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-            except AssertionError:
-                self._rollback_full_alloc(new_virtual_pages, out_indices)
+        with record_function("SharedSWAAlloc.alloc_decode"):
+            num_new_pages = get_num_new_pages(
+                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
+            )
+            # Joint pre-check at page granularity. (Even when num_new_pages == 0,
+            # we still need to call the kernel to fill out_indices — but the
+            # available-size check is automatic since 0 ≤ anything.)
+            if num_new_pages > (self.available_size() // self.page_size):
                 return None
 
-        return out_indices  # virtual TOKEN ids
+            fa = self.full_attn_allocator
+            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
+
+            out_indices = fa.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+            if out_indices is None:
+                return None
+
+            if new_virtual_pages.numel() > 0:
+                try:
+                    self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
+                except AssertionError:
+                    self._rollback_full_alloc(new_virtual_pages, out_indices)
+                    return None
+
+            return out_indices  # virtual TOKEN ids
 
     def _rollback_full_alloc(
         self, v_pages: torch.Tensor, v_tokens: torch.Tensor
@@ -1662,39 +1688,40 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- free --
 
     def free(self, free_index: torch.Tensor) -> None:
-        if free_index is None or free_index.numel() == 0:
-            return
-        if not self.is_not_in_free_group:
-            self.free_group.append(free_index)
-            return
-        # Free both peers. swa first (non-owner — only releases swa-physical;
-        # doesn't touch the virtual id), then full (id-owner — recycles the
-        # virtual id). Order is not load-bearing for correctness in v2 (no
-        # cross-pool mapping coherence to maintain — there is no
-        # `full_to_swa_index_mapping`; the per-sub-pool v2p IS the mapping).
-        #
-        # Filter the swa side to skip already-tombstoned virtuals (where
-        # `swa.v2p_page[v_page] == -1` because `free_swa(...)` ran earlier).
-        # Mirrors the v1 `swa_indices > 0` filter at
-        # `old_design_and_impl/...:1387`. The full side does NOT need this
-        # filter — under SWARadixCache the full side is the lifecycle owner,
-        # so every value in `free_index` must still be bound on full.
-        #
-        # The filter operates at PAGE granularity (recovering v_pages via
-        # `// page_size`) and emits TOKEN-granular `live_swa_tokens` so
-        # `swa.free` can apply its own `unique(// page_size)` internally.
-        v = free_index.detach().to(torch.int64)
-        v_pages = v // self.page_size
-        swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
-        # `> 0` (strict): -1 = tombstoned, 0 = padding-sink page — both
-        # skipped. Mirrors the non-shared `swa_indices > 0`.
-        live_token_mask = swa_v2p_pages > 0
-        live_tokens = v[live_token_mask]
-        if live_tokens.numel() > 0:
-            self.swa_attn_allocator.free(live_tokens)
-        self.full_attn_allocator.free(v)
-        self.full_attn_allocator.clear_inverse_history()
-        self.swa_attn_allocator.clear_inverse_history()
+        with record_function("SharedSWAAlloc.free"):
+            if free_index is None or free_index.numel() == 0:
+                return
+            if not self.is_not_in_free_group:
+                self.free_group.append(free_index)
+                return
+            # Free both peers. swa first (non-owner — only releases swa-physical;
+            # doesn't touch the virtual id), then full (id-owner — recycles the
+            # virtual id). Order is not load-bearing for correctness in v2 (no
+            # cross-pool mapping coherence to maintain — there is no
+            # `full_to_swa_index_mapping`; the per-sub-pool v2p IS the mapping).
+            #
+            # Filter the swa side to skip already-tombstoned virtuals (where
+            # `swa.v2p_page[v_page] == -1` because `free_swa(...)` ran earlier).
+            # Mirrors the v1 `swa_indices > 0` filter at
+            # `old_design_and_impl/...:1387`. The full side does NOT need this
+            # filter — under SWARadixCache the full side is the lifecycle owner,
+            # so every value in `free_index` must still be bound on full.
+            #
+            # The filter operates at PAGE granularity (recovering v_pages via
+            # `// page_size`) and emits TOKEN-granular `live_swa_tokens` so
+            # `swa.free` can apply its own `unique(// page_size)` internally.
+            v = free_index.detach().to(torch.int64)
+            v_pages = v // self.page_size
+            swa_v2p_pages = self.swa_attn_allocator.virtual_to_physical[v_pages]
+            # `> 0` (strict): -1 = tombstoned, 0 = padding-sink page — both
+            # skipped. Mirrors the non-shared `swa_indices > 0`.
+            live_token_mask = swa_v2p_pages > 0
+            live_tokens = v[live_token_mask]
+            if live_tokens.numel() > 0:
+                self.swa_attn_allocator.free(live_tokens)
+            self.full_attn_allocator.free(v)
+            self.full_attn_allocator.clear_inverse_history()
+            self.swa_attn_allocator.clear_inverse_history()
 
     def free_swa(self, free_index: torch.Tensor) -> None:
         """SWA tombstone path: swa-physical released, virtual id and

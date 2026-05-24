@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+from torch.profiler import record_function
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.disaggregation.base import BaseKVSender
@@ -1688,6 +1689,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        with record_function("ScheduleBatch.prepare_for_extend"):
+            return self._prepare_for_extend_impl()
+
+    def _prepare_for_extend_impl(self):
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -2280,6 +2285,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
+        with record_function("ScheduleBatch.prepare_for_decode"):
+            return self._prepare_for_decode_impl()
+
+    def _prepare_for_decode_impl(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale

@@ -34,6 +34,7 @@ import setproctitle
 import torch
 import torch.distributed
 import zmq
+from torch.profiler import record_function
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
@@ -2459,6 +2460,10 @@ class Scheduler(
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        with record_function("Scheduler.get_next_batch_to_run"):
+            return self._get_next_batch_to_run_impl()
+
+    def _get_next_batch_to_run_impl(self) -> Optional[ScheduleBatch]:
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         self._abort_on_waiting_timeout()
@@ -2975,6 +2980,14 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        with record_function("Scheduler.run_batch"):
+            return self._run_batch_impl(batch, pp_proxy_tensors)
+
+    def _run_batch_impl(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
@@ -3142,21 +3155,22 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
-        elif batch.forward_mode.is_extend():
-            if batch.is_dllm():
-                self.process_batch_result_dllm(batch, result)
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.process_batch_result_disagg_prefill(batch, result)
-            else:
-                self.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_prebuilt():
-            self.process_batch_result_prebuilt(batch)
-        elif batch.forward_mode.is_idle():
-            self.process_batch_result_idle(batch, result)
+        with record_function("Scheduler.process_batch_result"):
+            if batch.forward_mode.is_decode():
+                self.process_batch_result_decode(batch, result)
+            elif batch.forward_mode.is_extend():
+                if batch.is_dllm():
+                    self.process_batch_result_dllm(batch, result)
+                elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.process_batch_result_disagg_prefill(batch, result)
+                else:
+                    self.process_batch_result_prefill(batch, result)
+            elif batch.forward_mode.is_prebuilt():
+                self.process_batch_result_prebuilt(batch)
+            elif batch.forward_mode.is_idle():
+                self.process_batch_result_idle(batch, result)
 
-        self.log_batch_result_stats(batch, result)
+            self.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:

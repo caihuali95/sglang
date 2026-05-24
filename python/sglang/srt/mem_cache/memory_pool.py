@@ -1485,6 +1485,12 @@ class HybridLinearKVPool(KVCache):
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
 
+        # Per-batch full-physical loc, pinned by `set_full_loc`.
+        # When set (shared-pool path only), `set_kv_buffer` passes it to the
+        # underlying `SharedMHATokenToKVPool` so its data-ptr fast path fires
+        # and skips the per-call v2p gather on every full-attention layer.
+        self.full_loc: Optional[torch.Tensor] = None
+
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
 
@@ -1564,9 +1570,17 @@ class HybridLinearKVPool(KVCache):
     ):
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
+            # Fast path: when the per-batch full-physical loc is
+            # pinned (`set_full_loc`), pass it so `SharedMHATokenToKVPool`'s
+            # data-ptr fast path fires and skips the per-call v2p gather +
+            # clamp on this (and every other) full-attention layer. Falls
+            # back to the (virtual) `loc` — which the shared pool translates
+            # per call, or which a static pool consumes directly — when no
+            # precompute is pinned (non-shared path / slice-safe callers).
+            write_loc = self.full_loc if self.full_loc is not None else loc
             self.full_kv_pool.set_kv_buffer(
                 None,
-                loc,
+                write_loc,
                 cache_k,
                 cache_v,
                 k_scale,
@@ -1593,6 +1607,12 @@ class HybridLinearKVPool(KVCache):
         ``set_full_loc`` uniformly on either composite.
         """
         if hasattr(self.full_kv_pool, "set_loc"):
+            # Store locally so `set_kv_buffer` can pass it (and hit the inner
+            # pool's data-ptr fast path). Only tracked when the inner pool
+            # actually has the fast path (shared-pool `SharedMHATokenToKVPool`);
+            # for a static `MHATokenToKVPool` (no `set_loc`) `full_loc` stays
+            # None and `set_kv_buffer` keeps passing the direct `loc`.
+            self.full_loc = loc
             self.full_kv_pool.set_loc(loc)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
