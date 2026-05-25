@@ -3225,15 +3225,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
+        # Shared-pool write-path v2p translate, NON-GRAPH path.
+        # The cuda-graph path returns above at `graph_runner.replay`, where the
+        # translate is captured INTO the decode graph (read at replay off the
+        # live v2p). Here — extend / prefill / idle, and any decode that can't
+        # use the graph — we materialize the translate eagerly, just before it
+        # is pinned. `ForwardBatch.init_new` intentionally skips this for the
+        # shared pool (it would be wasted work on the captured-graph critical
+        # path). For non-shared pools / baseline SWA this block is a no-op
+        # (baseline SWA's `out_cache_loc_swa` was already set in init_new).
+        if getattr(self, "enable_shared_memory_pool", False):
+            alloc = self.token_to_kv_pool_allocator
+            if (
+                forward_batch.out_cache_loc is not None
+                and forward_batch.out_cache_loc_full_physical is None
+                and hasattr(alloc, "translate_kv_loc")
+            ):
+                forward_batch.out_cache_loc_full_physical = alloc.translate_kv_loc(
+                    forward_batch.out_cache_loc
+                )
+            if (
+                self.is_hybrid_swa
+                and forward_batch.out_cache_loc is not None
+                and forward_batch.out_cache_loc_swa is None
+                and hasattr(alloc, "translate_loc_from_full_to_swa")
+            ):
+                forward_batch.out_cache_loc_swa = alloc.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+
         # Use precomputed SWA cache location
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
-        # Stage 3.5: pin the precomputed full-physical loc so the shared-pool
+        # Pin the precomputed full-physical loc so the shared-pool
         # full-attention `set_kv_buffer` fast path takes effect (one big
-        # gather precomputed in ForwardBatch.init_new instead of one per
-        # layer per iter). `hasattr` guards non-shared paths and any future
-        # pool variant that doesn't implement `set_full_loc`.
+        # gather precomputed above instead of one per layer per iter).
+        # `hasattr` guards non-shared paths and any future pool variant that
+        # doesn't implement `set_full_loc`.
         if forward_batch.out_cache_loc_full_physical is not None and hasattr(
             self.token_to_kv_pool, "set_full_loc"
         ):

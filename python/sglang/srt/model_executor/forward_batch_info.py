@@ -861,30 +861,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Precompute SWA cache location once for all SWA layers
-        if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
+        # Precompute SWA cache location once for all SWA layers.
+        #
+        # BASELINE (non-shared) hybrid SWA only. The cuda-graph path reads
+        # this via `populate_from_forward_batch`'s copy into the graph buffer
+        # (the baseline decode graph does NOT translate — the full->swa index
+        # mapping must be materialized eagerly here).
+        #
+        # SHARED-POOL SWA is deliberately EXCLUDED here: its
+        # v2p `out_cache_loc_swa` / `out_cache_loc_full_physical` precompute is
+        # NOT done eagerly. On the cuda-graph path the captured decode graph
+        # translates at replay (reading the live v2p), removing ~5 eager
+        # launches/step from the cg_on critical path; on the non-graph path
+        # the translate is computed in `model_runner._forward_raw` right
+        # before `set_swa_loc` / `set_full_loc`. Skipping here is always
+        # correctness-safe — `set_kv_buffer` falls back to a per-call v2p
+        # gather when no precompute is pinned; it is purely a perf move,
+        # gated off the eager critical path for the shared pool.
+        if (
+            model_runner.is_hybrid_swa
+            and ret.out_cache_loc is not None
+            and not getattr(model_runner, "enable_shared_memory_pool", False)
+        ):
             ret.out_cache_loc_swa = (
                 model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                    ret.out_cache_loc
-                )
-            )
-
-        # Stage 3.5: precompute full-physical cache location for the shared-
-        # memory-pool path. Covers BOTH the SWA shared composite and the
-        # Mamba shared composite — `translate_kv_loc` exists on both
-        # `SharedMambaTokenToKVPoolAllocator` and
-        # `SharedSWATokenToKVPoolAllocator`. When shared pool is off, the
-        # allocator does not have `translate_kv_loc` and the precompute is
-        # skipped. Result is int64 (matches v2p table dtype); consumed by
-        # `SharedMHATokenToKVPool.set_kv_buffer`'s fast path which bypasses
-        # the per-layer v2p gather. Required for cuda-graph capture.
-        if (
-            getattr(model_runner, "enable_shared_memory_pool", False)
-            and ret.out_cache_loc is not None
-            and hasattr(model_runner.token_to_kv_pool_allocator, "translate_kv_loc")
-        ):
-            ret.out_cache_loc_full_physical = (
-                model_runner.token_to_kv_pool_allocator.translate_kv_loc(
                     ret.out_cache_loc
                 )
             )

@@ -510,6 +510,48 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             tp_rank=get_tensor_model_parallel_rank(),
         )
 
+    def _capture_shared_pool_write_translate(
+        self, out_cache_loc: torch.Tensor, num_tokens: int
+    ) -> None:
+        """Run the shared-pool write-path v2p translate so it
+        is recorded as cuda-graph nodes at the FRONT of the captured decode
+        graph.
+
+        Reads the *virtual* ``out_cache_loc`` graph buffer + the live v2p
+        table and writes the full-physical (int64) and — for hybrid SWA —
+        swa-physical (int32) graph buffers in place (via ``out=``). The pinned
+        ``set_full_loc`` / ``set_swa_loc`` (in ``capture_one_shape``)
+        point the pool's ``_precomputed_loc`` at the SAME buffers, so the
+        captured per-layer ``set_kv_buffer`` consumes them via its data-ptr
+        fast path. This replaces the eager ``init_new`` translate + the
+        ``populate_from_forward_batch`` copy on the cg_on critical path.
+
+        No-op for non-shared pools — the captured graph then has zero
+        translate/clamp nodes (Invariant 2), keeping baseline cg_on
+        byte-identical.
+        """
+        if not getattr(self.model_runner, "enable_shared_memory_pool", False):
+            return
+        alloc = self.model_runner.token_to_kv_pool_allocator
+        buffers = self.buffers
+        if buffers.out_cache_loc_full_physical is not None and hasattr(
+            alloc, "translate_kv_loc"
+        ):
+            alloc.translate_kv_loc(
+                out_cache_loc,
+                out=buffers.out_cache_loc_full_physical[:num_tokens],
+            )
+        # `out_cache_loc_swa` buffer exists for any hybrid-SWA model, but this
+        # method is gated on the shared pool above — so baseline SWA never
+        # reaches here (it keeps its eager init_new translate + populate copy).
+        if buffers.out_cache_loc_swa is not None and hasattr(
+            alloc, "translate_loc_from_full_to_swa"
+        ):
+            alloc.translate_loc_from_full_to_swa(
+                out_cache_loc,
+                out=buffers.out_cache_loc_swa[:num_tokens],
+            )
+
     def capture_prepare(
         self,
         size: int,
@@ -769,6 +811,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             size, stream_idx=stream_idx
         )
+        # The virtual out_cache_loc graph buffer (built in capture_prepare and
+        # carried on the dummy FB). run_once's shared-pool write-path translate
+        # closes over it; capture_prepare keeps it as a local, so surface it here.
+        out_cache_loc = forward_batch.out_cache_loc
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -782,8 +828,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
             def run_once():
-                # Must run inside the capture block: warmup mutations here are
-                # undone by on_after_cuda_graph_warmup so capture starts clean.
+                # Capture the shared-pool WRITE-path v2p translate as graph
+                # nodes at the FRONT of the decode graph, before the model
+                # forward reads the physical loc buffers via set_kv_buffer.
+                # Reads the virtual `out_cache_loc` graph buffer (refilled by
+                # the buffer registry each replay) + the live v2p; writes the
+                # full-physical / swa graph buffers that set_full_loc /
+                # set_swa_loc pinned above. No-op for non-shared pools.
+                self._capture_shared_pool_write_translate(out_cache_loc, num_tokens)
+
+                # Graph-recordable READ-path metadata prep — the upstream #27091
+                # `init_forward_metadata_in_graph` hook. For the shared pool,
+                # TritonAttnBackend.init_forward_metadata_in_graph records the
+                # kv_indices virtual->physical translate (in place, GPU-bounded
+                # by kv_indptr[bs], no .item()) at the front of the graph; base
+                # no-op otherwise (Invariant 2: a baseline graph has zero
+                # translate nodes). Must run inside the capture block: warmup
+                # mutations here are undone by on_after_cuda_graph_warmup so
+                # capture starts clean.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
 
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
