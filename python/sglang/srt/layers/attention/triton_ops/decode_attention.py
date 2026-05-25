@@ -49,14 +49,24 @@ def _extract_kv_strides(buf, page_size: int):
     ``stride_buf_*h``, ``stride_buf_*page``, ``stride_buf_*tok``.
     """
     if buf.ndim == 4:
-        # 4-D view. stride_bs is unused at PAGE_SIZE>1 but we
-        # set it to a reasonable value (page_stride / page_size) so that
-        # if someone accidentally compiles at PAGE_SIZE=1 against this
-        # 4-D view, the math still works.
+        # 4-D view ``[num_pages, page_size, head_num, head_dim]``.
+        #   stride(0) = per-PAGE stride (page_bytes/itemsize)
+        #   stride(1) = within-page per-TOKEN stride (k_row/v_row bytes/itemsize)
+        # The PAGE_SIZE>1 kernel branch uses page_stride/tok_stride and does
+        # NOT read slot_stride. slot_stride is consumed ONLY by the
+        # PAGE_SIZE==1 branch (``offs = kv_loc * stride_buf_*bs``), where one
+        # page holds exactly one slot, so the per-slot stride is the per-page
+        # stride — NOT the within-page token stride. Concretely the per-slot
+        # stride is ``page_stride // page_size`` (= entry_bytes/itemsize),
+        # which at ps=1 equals page_stride. Setting it to ``tok_stride``
+        # (= one layer's k_row, ~entry_bytes/(layer_num·2) too small) made the
+        # ps=1 read address ``kv_loc * k_row`` instead of ``kv_loc *
+        # entry_bytes`` — every slot >0 read garbage KV (slot 0 was fine since
+        # offset 0). See design-doc §19 / the ps1-SWA garbled-output bisection.
         page_stride = buf.stride(0)
         tok_stride = buf.stride(1)
         head_stride = buf.stride(2)
-        slot_stride = tok_stride  # at ps=1 the slot stride equals tok stride
+        slot_stride = page_stride // page_size  # per-slot stride; == page_stride at ps=1
         assert buf.shape[1] == page_size, (
             f"4-D KV buffer's dim-1 must equal page_size; got "
             f"shape[1]={buf.shape[1]}, page_size={page_size}"

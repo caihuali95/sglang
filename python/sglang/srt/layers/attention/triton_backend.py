@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -120,6 +121,32 @@ class TritonAttnBackend(AttentionBackend):
         # virtual->physical translation hook (None — a no-op — otherwise).
         self._translate_kv_loc = getattr(
             self.token_to_kv_pool_allocator, "translate_kv_loc", None
+        )
+        # GPU-bounded, capture-friendly in-place
+        # translate variants. Present only on the shared-pool composites, so
+        # `_translate_kv_loc_bounded is not None` doubles as the Invariant-2
+        # capture gate (no translate node recorded for non-shared graphs).
+        self._translate_kv_loc_bounded = getattr(
+            self.token_to_kv_pool_allocator, "translate_kv_loc_bounded", None
+        )
+        self._translate_loc_from_full_to_swa_bounded = getattr(
+            self.token_to_kv_pool_allocator,
+            "translate_loc_from_full_to_swa_bounded",
+            None,
+        )
+        # Removed the eager full-attn translate from the cuda-graph
+        # capture/replay path unconditionally; the captured hook
+        # (`translate_metadata_in_graph`, gated on `_translate_kv_loc_bounded`)
+        # must re-add it whenever a translate is needed. So the two gates MUST
+        # agree — otherwise the cuda-graph path would feed VIRTUAL ids to
+        # attention. Guaranteed by construction (both methods live on the same
+        # shared-pool composites); asserted here to catch future divergence.
+        assert (self._translate_kv_loc is None) == (
+            self._translate_kv_loc_bounded is None
+        ), (
+            "shared-pool allocator must expose both `translate_kv_loc` and "
+            "`translate_kv_loc_bounded` (or neither); the cuda-graph read-path "
+            "capture (§S362 Phase 2b) depends on this invariant."
         )
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
@@ -592,6 +619,40 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+    def translate_metadata_in_graph(self, bs: int):
+        """The shared-pool read-path v2p translate,
+        recorded as cuda-graph node(s) at the FRONT of the captured decode
+        graph (called from ``cuda_graph_runner.run_once``, before the model
+        forward reads the metadata).
+
+        The eager replay-prep build wrote VIRTUAL ids into
+        ``cuda_graph_kv_indices``; this rewrites them in place to PHYSICAL ids,
+        reading the live ``virtual_to_physical`` table at replay (late-read
+        invariant) and bounding the work GPU-side by ``kv_indptr[bs]`` (no
+        ``.item()`` sync). No-op for non-shared pools — Invariant 2: a baseline
+        decode graph then contains zero translate nodes.
+        """
+        if self._translate_kv_loc_bounded is None:
+            return  # non-shared → translate-free graph (Invariant 2)
+        # Full-attention read path: cuda_graph_kv_indices[0:kv_indptr[bs]].
+        self._translate_kv_loc_bounded(
+            self.cuda_graph_kv_indices, self.kv_indptr, bs
+        )
+        # SWA window read path (Phase 2c): window_kv_indices[0:window_kv_indptr[bs]],
+        # virtual full-token -> swa-physical, in place, against the swa sub-pool's
+        # v2p. Only for hybrid-SWA shared pools (the bounded swa variant exists).
+        # The eager translate in `update_sliding_window_buffer_cuda_graph` is
+        # skipped for the shared pool (it left these VIRTUAL); this rewrites them
+        # at replay, GPU-bounded by window_kv_indptr[bs] (no `.item()`).
+        if (
+            self._translate_loc_from_full_to_swa_bounded is not None
+            and self.sliding_window_size is not None
+            and self.sliding_window_size > 0
+        ):
+            self._translate_loc_from_full_to_swa_bounded(
+                self.cuda_graph_window_kv_indices, self.window_kv_indptr, bs
+            )
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -624,29 +685,15 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
-                # Stage 3.5: translate virtual->full-physical in-place over
-                # the VALID PREFIX only. `self.cuda_graph_kv_indices` is a
-                # pre-allocated multi-megabyte buffer; the kernel above only
-                # writes the first `kv_indptr[-1]` entries. Translating the
-                # full buffer was a bug: stale data in the
-                # tail (left over from prior replays) would be re-translated
-                # via `v2p`, producing negative values (when a tail entry's
-                # `// page_size` happens to hit a now-unbound virtual page,
-                # `v2p[k] = -1`, then `out.mul_(ps) + offset` yields negative
-                # numbers in [-ps, -1]). On the NEXT replay the cycle repeats
-                # and CUDA's index_select rejects `idx = -1`.
-                #
-                # Slicing with `kv_indptr[-1]` (a 0-d tensor) triggers an
-                # implicit `.item()` sync — mirroring the established pattern
-                # in `update_sliding_window_buffer_cuda_graph` (lines
-                # 1533–1539) which does the same. No-op for non-shared-pool
-                # allocators (no `translate_kv_loc` method).
-                if self._translate_kv_loc is not None:
-                    kv_last_index = kv_indptr[-1]
-                    self._translate_kv_loc(
-                        kv_indices[:kv_last_index],
-                        out=kv_indices[:kv_last_index],
-                    )
+                # The full-attn virtual->physical
+                # translate is CAPTURED into the decode graph (see
+                # `translate_metadata_in_graph`, called from
+                # `cuda_graph_runner.run_once`), NOT done eagerly here. The
+                # build above wrote VIRTUAL ids into `cuda_graph_kv_indices`;
+                # the captured graph node translates them in place at replay,
+                # bounded GPU-side by `kv_indptr[bs]` (no `.item()` sync). At
+                # capture time `req_to_token` is all-zero so the captured
+                # translate is idempotent (0 -> v2p[0]=0 -> 0).
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
@@ -809,19 +856,43 @@ class TritonAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
-                # Stage 3.5: in-place translate virtual->full-physical over
-                # the VALID PREFIX only — same fix as the capture path above
-                # Without the `[:kv_last_index]` slice, stale
-                # data in the buffer tail would be re-translated each replay
-                # and eventually produce negative `virt_pages` values that
-                # CUDA's index_select rejects with a scatter-gather OOB
-                # assert.
-                if self._translate_kv_loc is not None:
-                    kv_last_index = kv_indptr[-1]
-                    self._translate_kv_loc(
-                        kv_indices[:kv_last_index],
-                        out=kv_indices[:kv_last_index],
+                # The full-attn translate is
+                # CAPTURED into the decode graph (`translate_metadata_in_graph`
+                # at the front of `cuda_graph_runner.run_once`), not done
+                # eagerly here — the build above wrote VIRTUAL ids; the captured
+                # node rewrites them in place at replay, GPU-bounded by
+                # `kv_indptr[bs]` (no `.item()` sync).
+                #
+                # R4 — read-path tombstone debug check (env-gated, eager,
+                # debug-only). The captured kernel's `clamp_min(0)` would
+                # silently route a LIVE read-side use-after-free to physical
+                # slot 0; this surfaces it loudly before the clamp hides it.
+                # `.item()` is acceptable on this debug-only path.
+                if (
+                    self._translate_kv_loc is not None
+                    and os.environ.get("SGLANG_DEBUG_CHECK_V2P_TOMBSTONES", "0")
+                    == "1"
+                ):
+                    full = getattr(
+                        self.token_to_kv_pool_allocator, "full_attn_allocator", None
                     )
+                    if full is not None:
+                        kv_last = int(kv_indptr[-1].item())
+                        if kv_last > 0:
+                            ps = full.page_size
+                            virt = kv_indices[:kv_last]
+                            pages = virt // ps if ps > 1 else virt
+                            raw = full.virtual_to_physical[pages]
+                            if bool((raw < 0).any().item()):
+                                bad = (raw < 0).nonzero(as_tuple=False).flatten()
+                                raise AssertionError(
+                                    "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES (read "
+                                    "path): live virtual kv_indices map to "
+                                    f"v2p==-1; count={int((raw < 0).sum().item())}, "
+                                    f"sample_pos={bad[:8].tolist()}. A live "
+                                    "read-side use-after-free that the captured "
+                                    "translate's clamp would route to slot 0."
+                                )
                 num_token = bs
                 if (
                     self.sliding_window_size is not None
@@ -839,6 +910,48 @@ class TritonAttnBackend(AttentionBackend):
                         bs,
                         self.token_to_kv_pool_allocator,
                     )
+                    # The SWA window read-path tombstone check. For the shared pool,
+                    # the build above left window_kv_indices VIRTUAL (the translate
+                    # is captured); here
+                    # we gather swa.v2p[window_kv_indices[:window_total]] and
+                    # assert no LIVE -1 before the captured translate's clamp
+                    # would route it to swa slot 0. Window tokens are inside the
+                    # sliding window, so free_swa (which evicts BEHIND the window)
+                    # should never tombstone them — a fire is a window/eviction
+                    # frontier off-by-one (swa-side analog of the full-path UAF).
+                    # Debug-only; `.item()` acceptable. Only meaningful for the
+                    # shared pool; baseline SWA already translated the window to
+                    # swa-physical inside the call above, so it is skipped.
+                    if (
+                        self._translate_loc_from_full_to_swa_bounded is not None
+                        and os.environ.get("SGLANG_DEBUG_CHECK_V2P_TOMBSTONES", "0")
+                        == "1"
+                    ):
+                        swa = getattr(
+                            self.token_to_kv_pool_allocator,
+                            "swa_attn_allocator",
+                            None,
+                        )
+                        if swa is not None:
+                            w_last = int(self.window_kv_indptr[bs].item())
+                            if w_last > 0:
+                                ps = swa.page_size
+                                wv = window_kv_indices[:w_last]
+                                wpages = wv // ps if ps > 1 else wv
+                                wraw = swa.virtual_to_physical[wpages]
+                                if bool((wraw < 0).any().item()):
+                                    wbad = (
+                                        (wraw < 0).nonzero(as_tuple=False).flatten()
+                                    )
+                                    raise AssertionError(
+                                        "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES (swa "
+                                        "window): live virtual window_kv_indices "
+                                        "map to swa v2p==-1; "
+                                        f"count={int((wraw < 0).sum().item())}, "
+                                        f"sample_pos={wbad[:8].tolist()}. A live "
+                                        "window-token use-after-free on the swa "
+                                        "side (window/eviction frontier off-by-one)."
+                                    )
                     self.get_num_kv_splits(
                         window_num_kv_splits[:num_token], window_kv_lens[:bs]
                     )
@@ -1542,7 +1655,7 @@ def update_sliding_window_buffer(
         window_kv_indices,
         req_to_token.stride(0),
     )
-    # full to swa index mapping
+    # full to swa index mapping (non-graph path: always eager)
     if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
         kv_last_index = window_kv_indptr[-1]
         window_kv_indices[:kv_last_index] = (
@@ -1579,9 +1692,23 @@ def update_sliding_window_buffer_cuda_graph(
         window_kv_indices,
         req_to_token.stride(0),
     )
-    # full to swa index mapping
-    if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
-        kv_last_index = window_kv_indptr[-1]
+    # full to swa index mapping.
+    #
+    # For the SHARED pool the window translate is
+    # CAPTURED into the decode graph (`TritonAttnBackend.translate_metadata_in_graph`),
+    # NOT done eagerly here — leave `window_kv_indices` as VIRTUAL full-token
+    # ids; the captured node rewrites them to swa-physical in place at replay,
+    # GPU-bounded by `window_kv_indptr[bs]` (no `.item()` sync). The shared
+    # composite is detected by `translate_loc_from_full_to_swa_bounded` (only it
+    # has the bounded variant). BASELINE hybrid SWA — which has
+    # `translate_loc_from_full_to_swa` but NOT the bounded variant — keeps its
+    # eager full->swa index translate (the baseline cuda-graph does not capture
+    # a translate, so its window must be materialized eagerly here). The two
+    # gates use the SAME discriminator, so the window is never left untranslated.
+    if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa_bounded"):
+        pass  # SHARED: captured in-graph (Phase 2c)
+    elif hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
+        kv_last_index = window_kv_indptr[-1]  # BASELINE SWA: eager (unchanged)
         window_kv_indices[:kv_last_index] = (
             token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                 window_kv_indices[:kv_last_index]

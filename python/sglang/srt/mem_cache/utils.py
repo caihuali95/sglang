@@ -321,6 +321,126 @@ def store_cache_4d(
     )
 
 
+# ---------------------------------------------------------------------------
+# translate_kv_indices_inplace — fused, GPU-bounded, in-place virtual->physical
+# translate of a shared-memory-pool attention index buffer. Used to CAPTURE
+# the read-path translate into the decode cuda-graph: the build
+# (`create_flashinfer_kv_indices_triton`) writes VIRTUAL
+# ids into `cuda_graph_kv_indices` / `cuda_graph_window_kv_indices` eagerly in
+# replay-prep; this kernel — recorded as a graph node at the front of the
+# captured decode graph — rewrites that buffer in place to PHYSICAL ids,
+# reading the live v2p table at replay.
+#
+# Why a dedicated kernel instead of reusing `MultiEndedAllocator.translate_kv_loc`
+# over a fixed slice (the original §S362 sketch, now REJECTED for the read
+# path):
+#   - No `.item()`: the valid extent is read on-device from `kv_indptr[BS]`,
+#     so there is no D2H sync — the per-step `cudaStreamSynchronize` the eager
+#     `.item()` slice incurred is removed, and the op is cuda-graph-capturable.
+#   - No over-translation: a grid-stride loop bounded by `kv_indptr[BS]`
+#     touches ONLY the valid prefix `[0, total)`; the multi-MB stale tail is
+#     never loaded/stored.
+#   - No transient / no cuda-graph-pool growth: in-place, register-only — vs
+#     `index_select`/page-math which allocate an N-sized transient the graph
+#     pool would hold per captured batch size.
+#   - Single launch; tombstone-safe via `clamp_min(0)`.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def translate_kv_indices_inplace_kernel(
+    kv_indices_ptr,  # in/out: VIRTUAL token ids -> PHYSICAL token ids, in place
+    v2p_ptr,  # virtual_to_physical table (int64); full OR swa sub-pool's table
+    bound_ptr,  # the kv_indptr buffer; bound = bound_ptr[BS] = sum(seq_lens)
+    BS,  # batch size (runtime int): index of the valid-extent entry in kv_indptr
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """In-place translate ``kv_indices[0:total] = v2p_resolve(kv_indices[0:total])``
+    where ``total = bound_ptr[BS]`` is read on-device (no ``.item()``).
+
+    Fixed grid (``tl.num_programs(0)``) + GPU-side grid-stride loop bounded by
+    ``total`` so the launch is cuda-graph-stable while the work tracks the
+    actual valid extent. Tombstoned entries (``v2p == -1``, or ``[-ps,-1]`` at
+    ``page_size>1``) are clamped to physical slot 0 (the reserved padding sink).
+    """
+    # Everything int64: `total`/offsets index buffers that can exceed int32
+    # (max_num_tokens * max_context_len), and keeping a single dtype avoids
+    # Triton loop type-inference issues regardless of kv_indptr's dtype.
+    total = tl.load(bound_ptr + BS).to(tl.int64)
+    num_active_blocks = tl.cdiv(total, BLOCK)  # GPU-side loop bound
+    pid = tl.program_id(0).to(tl.int64)
+    nprog = tl.num_programs(0).to(tl.int64)
+    block_arange = tl.arange(0, BLOCK).to(tl.int64)
+    for blk in range(pid, num_active_blocks, nprog):
+        offs = blk * BLOCK + block_arange
+        mask = offs < total
+        virt = tl.load(kv_indices_ptr + offs, mask=mask, other=0).to(tl.int64)
+        if PAGE_SIZE == 1:
+            phys = tl.load(v2p_ptr + virt, mask=mask, other=0)
+        else:
+            page = virt // PAGE_SIZE
+            off = virt % PAGE_SIZE
+            phys = tl.load(v2p_ptr + page, mask=mask, other=0) * PAGE_SIZE + off
+        phys = tl.maximum(phys, 0)  # clamp_min(0): tombstone -> padding sink
+        tl.store(kv_indices_ptr + offs, phys, mask=mask)
+
+
+def translate_kv_indices_inplace(
+    kv_indices: torch.Tensor,
+    v2p: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    bs: int,
+    page_size: int,
+    *,
+    block: int = 512,
+    num_programs: int = 1024,
+) -> None:
+    """Launch :func:`translate_kv_indices_inplace_kernel`.
+
+    Rewrites ``kv_indices[0:kv_indptr[bs]]`` in place from virtual to physical
+    token ids using ``v2p`` (the relevant sub-pool's ``virtual_to_physical``
+    table). The valid extent ``kv_indptr[bs]`` is read on-device, so no
+    ``.item()`` / D2H sync occurs — this is what makes the op capturable into
+    the decode cuda-graph (Stage 3.6.2 Phase 2).
+
+    Contract:
+        - ``kv_indices``: 1-D int64, the metadata buffer (e.g.
+          ``cuda_graph_kv_indices`` or ``cuda_graph_window_kv_indices``).
+          Holds VIRTUAL token ids on entry; PHYSICAL on return.
+        - ``v2p``: 1-D int64 ``virtual_to_physical`` (page-granular for ps>1,
+          sized ``num_virtual_pages + 1`` with a trailing ``-1`` sentinel).
+        - ``kv_indptr``: 1-D int tensor whose element ``[bs]`` is the valid
+          extent ``sum(seq_lens)``. The buffer (not a slice) is passed so the
+          kernel can index ``[bs]`` on-device.
+        - ``page_size``: a Python int (constexpr in the kernel).
+        - ``bs``: batch size, index of the valid-extent entry in ``kv_indptr``.
+
+    The grid is fixed (``num_programs``) so the launch is cuda-graph-stable;
+    the kernel grid-strides over the active blocks (bounded GPU-side by
+    ``kv_indptr[bs]``).
+    """
+    assert kv_indices.is_cuda and v2p.is_cuda and kv_indptr.is_cuda
+    assert kv_indices.ndim == 1, (
+        f"translate_kv_indices_inplace: kv_indices must be 1-D, "
+        f"got shape {tuple(kv_indices.shape)}"
+    )
+    assert v2p.dtype == torch.int64, (
+        f"translate_kv_indices_inplace: v2p must be int64, got {v2p.dtype}"
+    )
+    if kv_indices.numel() == 0:
+        return
+    grid = (num_programs,)
+    translate_kv_indices_inplace_kernel[grid](
+        kv_indices,
+        v2p,
+        kv_indptr,
+        bs,
+        PAGE_SIZE=page_size,
+        BLOCK=block,
+    )
+
+
 @triton.jit
 def set_mla_kv_buffer_fp8_quant_kernel(
     kv_buffer_fp8_ptr,
