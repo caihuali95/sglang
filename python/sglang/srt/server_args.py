@@ -4599,6 +4599,36 @@ class ServerArgs:
             f"attention backend for the full-attention layers; got {sorted(backends)}. "
             "Pass --attention-backend triton (FA3 / FlashInfer support is planned)."
         )
+        # Same requirement for the LINEAR-ATTENTION / Mamba kernels (declarative,
+        # mirroring the attention gate above). The shared pool stores Mamba
+        # conv/temporal state in envelope-STRIDED views; only the stride-aware
+        # Triton causal-conv + Triton SSM/GDN kernels read them correctly — the
+        # CUDA causal-conv path and the FlashInfer GDN path mishandle the strided
+        # state and produce garbled output. So require the Triton linear-attn /
+        # mamba backends; `Mamba2AttnBackend` then uses the Triton causal-conv
+        # kernels (it "follows" this gated backend — see
+        # `_resolve_use_triton_causal_conv`). These default to "triton", so this
+        # fires only if the user opted into flashinfer — INCLUDING the SM100+
+        # auto-default to `--linear-attn-decode-backend flashinfer` that
+        # `_handle_linear_attn_backend` (run just above this handler) sets when
+        # `--mamba-ssm-dtype bfloat16`. Failing loud here beats silent garbage.
+        linear_backends = {
+            self.linear_attn_backend,
+            self.linear_attn_decode_backend,
+            self.linear_attn_prefill_backend,
+            self.mamba_backend,
+        }
+        linear_backends.discard(None)
+        assert linear_backends <= {"triton"}, (
+            "--enable-shared-memory-pool currently only wires the Triton "
+            "linear-attention / Mamba kernels (the shared pool's strided "
+            f"conv/SSM state needs the stride-aware Triton path); got "
+            f"{sorted(linear_backends)}. Pass --linear-attn-backend triton and "
+            "--mamba-backend triton. NOTE on SM100+: --mamba-ssm-dtype bfloat16 "
+            "auto-selects the FlashInfer GDN decode backend, which is not yet "
+            "wired for the shared pool — leave --mamba-ssm-dtype unset or pass "
+            "--linear-attn-decode-backend triton. (FlashInfer support is planned.)"
+        )
         # The model-family check (Stage 1: hybrid Mamba; Stage 2: hybrid SWA;
         # Stage 3 extends both to page_size > 1; Stage 3.5 adds cuda-graph
         # monolithic decode capture; Stage 4: DeepSeek V4) is enforced at

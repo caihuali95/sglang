@@ -446,8 +446,15 @@ class SharedMemoryPool:
             return tuple(reversed(strides))
 
         conv_itemsize = spec.conv_dtype.itemsize
-        assert entry_bytes % conv_itemsize == 0
-        assert anchor_bytes % conv_itemsize == 0
+        assert entry_bytes % conv_itemsize == 0, (
+            f"conv view misaligned: mamba entry_bytes={entry_bytes} is not a "
+            f"multiple of the conv itemsize {conv_itemsize} "
+            f"(conv_dtype={spec.conv_dtype})."
+        )
+        assert anchor_bytes % conv_itemsize == 0, (
+            f"conv view misaligned: anchor_bytes={anchor_bytes} is not a "
+            f"multiple of the conv itemsize {conv_itemsize}."
+        )
         as_conv_dtype = self._raw.view(spec.conv_dtype)
         conv_slot_stride_elems = entry_bytes // conv_itemsize
 
@@ -455,7 +462,10 @@ class SharedMemoryPool:
         conv_views: List[torch.Tensor] = []
         for i, conv_shape in enumerate(spec.conv_state_shapes):
             inner_shape_bytes = spec.conv_row_bytes(i)
-            assert inner_shape_bytes % conv_itemsize == 0
+            assert inner_shape_bytes % conv_itemsize == 0, (
+                f"conv view misaligned: conv_row_bytes[{i}]={inner_shape_bytes} "
+                f"is not a multiple of the conv itemsize {conv_itemsize}."
+            )
             offset_elems = (anchor_bytes + offset_bytes_within_entry) // conv_itemsize
             inner_strides = c_strides(conv_shape)
             stride = (
@@ -470,10 +480,51 @@ class SharedMemoryPool:
             offset_bytes_within_entry += N * inner_shape_bytes
 
         itemsize = spec.temporal_dtype.itemsize
-        assert entry_bytes % itemsize == 0
-        assert anchor_bytes % itemsize == 0
+        # The temporal/SSM-state view's storage_offset is computed in temporal-
+        # dtype ELEMENTS by integer-dividing a BYTE offset by `itemsize`; every
+        # term of that byte offset (entry stride, anchor, the conv region, the
+        # temporal row) must therefore be a whole multiple of `itemsize`, else
+        # `// itemsize` truncates and silently mis-offsets the view. These three
+        # asserts cover entry-stride / anchor / temporal-row alignment; together
+        # they also SUBSUME the conv-region check below (since conv_region =
+        # entry_bytes - N*temporal_row_bytes, and all three are multiples of
+        # itemsize ⇒ conv_region is too), which is kept as a defensive backstop.
+        assert entry_bytes % itemsize == 0, (
+            f"temporal view misaligned: mamba entry_bytes={entry_bytes} is not a "
+            f"multiple of the temporal itemsize {itemsize} "
+            f"(conv_dtype={spec.conv_dtype}, temporal_dtype={spec.temporal_dtype}, "
+            f"layer_num={spec.layer_num}). Pad the per-slot entry (its conv region) "
+            f"to a temporal-itemsize boundary so the temporal/SSM-state as_strided "
+            f"offset lands on a whole element."
+        )
+        assert anchor_bytes % itemsize == 0, (
+            f"temporal view misaligned: anchor_bytes={anchor_bytes} is not a "
+            f"multiple of the temporal itemsize {itemsize}."
+        )
         inner_shape_bytes = spec.temporal_row_bytes()
-        assert inner_shape_bytes % itemsize == 0
+        assert inner_shape_bytes % itemsize == 0, (
+            f"temporal view misaligned: temporal_row_bytes={inner_shape_bytes} is "
+            f"not a multiple of the temporal itemsize {itemsize}."
+        )
+        # The temporal view starts AFTER the conv region (offset_bytes_within_entry
+        # now == N * sum_i conv_row_bytes(i)). Its storage_offset is computed in
+        # temporal-dtype ELEMENTS via integer division by `itemsize`. If the conv
+        # region's byte size is NOT a multiple of the temporal itemsize (e.g. conv
+        # is bf16/2B and temporal is fp32/4B and the conv region is an odd multiple
+        # of 2B), `// itemsize` TRUNCATES — silently placing the temporal/SSM-state
+        # view a few bytes off, so every decode reads/writes garbage SSM state.
+        # `as_strided` can't express a sub-element storage_offset, so this MUST be
+        # caught here rather than producing a misaligned view. (Conv views are
+        # always conv-itemsize-aligned by construction, since every offset is a
+        # multiple of conv_row_bytes which is a multiple of conv_itemsize.)
+        assert (anchor_bytes + offset_bytes_within_entry) % itemsize == 0, (
+            f"temporal view misaligned: (anchor={anchor_bytes} + "
+            f"conv_region={offset_bytes_within_entry}) = "
+            f"{anchor_bytes + offset_bytes_within_entry} is not a multiple of the "
+            f"temporal itemsize {itemsize} (conv_dtype={spec.conv_dtype}, "
+            f"temporal_dtype={spec.temporal_dtype}, layer_num={spec.layer_num}). "
+            f"The conv region must be padded to a temporal-itemsize boundary."
+        )
         offset_elems = (anchor_bytes + offset_bytes_within_entry) // itemsize
         as_dtype = self._raw.view(spec.temporal_dtype)
         inner_strides = c_strides(spec.temporal_state_shape)
