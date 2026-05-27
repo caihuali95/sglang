@@ -151,6 +151,27 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def _maybe_translate_mamba_indices(
+        self, mamba_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Shared memory pool: ``get_mamba_indices`` returns *virtual* per-request
+        mamba ids; translate them to *physical* slot ids. No-op for the
+        non-shared ``HybridReqToTokenPool`` (it has no ``translate_mamba_indices``).
+
+        MUST be applied EVERYWHERE the mamba indices feed the SSM/conv kernels:
+        the eager ``_forward_metadata`` AND the cuda-graph
+        ``_capture_metadata`` / ``_replay_metadata`` (which copy the indices into
+        the captured-graph's stable ``state_indices_list`` buffer). Omitting it on
+        the cuda-graph path made cg_on feed VIRTUAL ids to the captured Mamba
+        kernels as if PHYSICAL → wrong state slot → garbled/truncated output,
+        while cg_off (eager) was correct. The translate runs in replay-prep
+        (eager, before ``graph.replay()``), so it reads the LIVE v2p table
+        post-compaction; the physical result is copied into the stable buffer the
+        captured graph reads.
+        """
+        _translate = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
+        return _translate(mamba_indices) if _translate is not None else mamba_indices
+
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
@@ -167,18 +188,19 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices
         )
         # Shared memory pool: get_mamba_indices returns *virtual* per-request ids;
-        # translate to physical slot ids once per batch (used both for the mamba
-        # forward and for the *_track_* index derivations below). No-op for the
-        # non-shared HybridReqToTokenPool (no translate_mamba_indices method).
+        # translate to *physical* slot ids once per batch (no-op for the
+        # non-shared HybridReqToTokenPool). MUST also happen on the cuda-graph
+        # capture/replay metadata path — see `_maybe_translate_mamba_indices`.
+        mamba_cache_indices = self._maybe_translate_mamba_indices(mamba_cache_indices)
         _translate_mamba = getattr(
             self.req_to_token_pool, "translate_mamba_indices", None
         )
-        if _translate_mamba is not None:
-            mamba_cache_indices = _translate_mamba(mamba_cache_indices)
-            if forward_batch.mamba_track_indices is not None:
-                forward_batch.mamba_track_indices = _translate_mamba(
-                    forward_batch.mamba_track_indices
-                )
+        if _translate_mamba is not None and forward_batch.mamba_track_indices is not None:
+            # The *_track_* index derivations below index by mamba slot too
+            # (speculative path; spec is off for the shared pool today).
+            forward_batch.mamba_track_indices = _translate_mamba(
+                forward_batch.mamba_track_indices
+            )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
@@ -495,6 +517,10 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        # Shared pool: virtual -> physical (no-op otherwise). The captured Mamba
+        # kernels read state_indices_list as PHYSICAL slot ids, so we must
+        # translate before copying — same as the eager _forward_metadata path.
+        mamba_indices = self._maybe_translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
@@ -529,6 +555,11 @@ class MambaAttnBackendBase(AttentionBackend):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
+        # Shared pool: virtual -> physical (no-op otherwise), reading the LIVE
+        # v2p table in replay-prep, BEFORE the padding sentinel below. The
+        # captured Mamba kernels read state_indices_list as PHYSICAL slot ids.
+        # (cg_on Mamba garble bug: this translate was missing here.)
+        mamba_indices = self._maybe_translate_mamba_indices(mamba_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
@@ -706,6 +737,39 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             draft_token_num=draft_token_num,
         )
 
+    def _resolve_use_triton_causal_conv(self, use_triton_causal_conv: bool) -> bool:
+        """Decide the causal-conv kernel: it FOLLOWS ``--linear-attn-backend``.
+
+        ``--linear-attn-backend triton`` (the default) ⇒ the stride-aware Triton
+        causal-conv kernels; any other linear-attn backend ⇒ the model's own
+        choice (CUDA sgl-kernel by default). This keeps the conv kernel
+        consistent with the declared linear-attn backend instead of being a
+        per-model hardcode.
+
+        Why it matters for the shared pool: it stores Mamba conv/temporal state
+        in envelope-STRIDED views (slot stride == ``entry_bytes``, not the inner
+        size); only the stride-aware Triton conv reads them correctly — the CUDA
+        ``causal_conv1d`` path GARBLES them (eval_68 garbled → eval_69
+        byte-identical to baseline once Triton conv was used). The shared pool's
+        gate (``ServerArgs._handle_shared_memory_pool``) already asserts
+        ``--linear-attn-backend triton``, so the shared pool always lands on
+        Triton conv here — no per-pool special-casing, no env knob.
+
+        A model that explicitly requested Triton conv (e.g. spec decoding's
+        intermediate-state path in Nemotron-H / Granite) is always honored.
+        Logged ONCE per backend instance.
+        """
+        la_backend = get_global_server_args().linear_attn_backend
+        resolved = use_triton_causal_conv or (la_backend == "triton")
+        if not getattr(self, "_logged_conv_kernel_choice", False):
+            self._logged_conv_kernel_choice = True
+            logger.info(
+                "[mamba] causal-conv kernel = %s (linear_attn_backend=%s)",
+                "TRITON (stride-aware)" if resolved else "CUDA (sgl-kernel)",
+                la_backend,
+            )
+        return resolved
+
     def forward(
         self,
         mixer: MambaMixer2,
@@ -716,6 +780,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
+        use_triton_causal_conv = self._resolve_use_triton_causal_conv(
+            use_triton_causal_conv
+        )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         return mixer.forward(
             hidden_states=hidden_states,
@@ -754,6 +821,30 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
+
+    def translate_metadata_in_graph(self, bs: int):
+        """Forward the shared-pool READ-path v2p translate (Stage 3.6.2 Phase 2)
+        to the sub-backend(s) that define it — the full-attention (Triton)
+        backend. The Mamba sub-backend has no kv_indices read path, so it lacks
+        the method and is skipped.
+
+        WHY THIS EXISTS: `cuda_graph_runner.run_once` calls
+        `attn_backend.translate_metadata_in_graph(bs)` (guarded by `hasattr`) to
+        capture the kv_indices virtual->physical translate at the FRONT of the
+        decode graph. For a hybrid model the top-level `attn_backend` is THIS
+        wrapper; without this forward, `hasattr` was False, the translate was
+        SILENTLY SKIPPED, and the captured graph read VIRTUAL kv_indices → the
+        full-attention read the WRONG KV slots under cg_on. That surfaced as the
+        long-hunted "cg_on Mamba garble" — actually a full-attention READ bug;
+        the Mamba state divergence was downstream (layer 0's wrong attention
+        output flowed through the residual). Pinned by eval_97/98 (layer-0
+        attn_y diverges; mamba_y + KV-write identical). Same class as the
+        eval_72 R4 `_replay_forward_batch` non-propagation.
+        """
+        for attn_backend in self.attn_backend_list:
+            fn = getattr(attn_backend, "translate_metadata_in_graph", None)
+            if fn is not None:
+                fn(bs)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
@@ -816,7 +907,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        # The cuda_graph_runner sets the implicit `_replay_forward_batch`
+        # channel on THIS top-level backend (model_runner.attn_backend), NOT on
+        # the sub-backends. Propagate it so the full-attn sub-backend's R4
+        # read-path tombstone check (debug-only, SGLANG_DEBUG_CHECK_V2P_TOMBSTONES)
+        # can recover raw_bs = forward_batch.batch_size and bound itself to the
+        # real (non-padding) tokens [0, kv_indptr[raw_bs]). Without this it falls
+        # back to the padded `bs` and re-fires on cuda-graph PADDING reqs — the
+        # eval_72 Falcon 15-fire false positives. (gpt-oss, whose TritonAttnBackend
+        # IS the top-level backend, gets the channel directly and showed 0 fires.)
+        rfb = getattr(self, "_replay_forward_batch", None)
         for attn_backend in self.attn_backend_list:
+            attn_backend._replay_forward_batch = rfb
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,

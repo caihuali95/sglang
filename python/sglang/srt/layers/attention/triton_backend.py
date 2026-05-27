@@ -38,6 +38,110 @@ if TYPE_CHECKING:
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _v2p_tombstone_diagnostic(
+    *,
+    label: str,
+    bad_pos: torch.Tensor,
+    virt_vals: torch.Tensor,
+    indptr: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    free_virtual_ids: Optional[torch.Tensor],
+    num_virtual: int,
+    page_size: int,
+    max_samples: int = 24,
+) -> str:
+    """Rich per-token diagnostic for a read-path v2p tombstone fire (the
+    `SGLANG_DEBUG_CHECK_V2P_TOMBSTONES` read-path check). DEBUG-ONLY — uses
+    `.item()`/`.tolist()` freely.
+
+    For each bad flat position it resolves: the owning request (via
+    `searchsorted` on `indptr`), token-position-within-context, that req's
+    `seq_len` and `req_pool_index`, the virtual id + page, and a CLASS:
+      - FREED   : the virtual page is in the allocator free-list → a
+                  freed-while-still-referenced use-after-free (the smoking gun);
+      - OOB     : virtual page out of [0, num_virtual) → bad index build;
+      - UNBOUND : v2p==-1 but NOT in the free-list → alloc never bound it
+                  (alloc-boundary off-by-one / clear() default).
+    Returns a multi-line report (header with aggregate stats + up to
+    `max_samples` per-token rows).
+    """
+    bad_pos = bad_pos.to(torch.int64)
+    indptr64 = indptr.to(torch.int64)
+    n = int(bad_pos.numel())
+    reqs = torch.searchsorted(indptr64, bad_pos, right=True) - 1
+    reqs = reqs.clamp_(0, max(0, indptr64.numel() - 2))
+    tok_in_ctx = bad_pos - indptr64[reqs]
+    vv = virt_vals.to(torch.int64)
+    vpages = (vv // page_size) if page_size > 1 else vv
+    if free_virtual_ids is not None and free_virtual_ids.numel() > 0:
+        in_free = torch.isin(vpages, free_virtual_ids.to(torch.int64))
+    else:
+        in_free = torch.zeros_like(vpages, dtype=torch.bool)
+    oob = (vpages < 0) | (vpages >= num_virtual)
+    n_freed = int(in_free.sum().item())
+    n_oob = int((oob & ~in_free).sum().item())
+    n_unbound = n - n_freed - n_oob
+    distinct_reqs = int(torch.unique(reqs).numel())
+    header = (
+        f"[{label}] read-path v2p tombstone: count={n} over {distinct_reqs} "
+        f"req(s); FREED={n_freed} OOB={n_oob} UNBOUND={n_unbound}; "
+        f"tok_in_ctx=[{int(tok_in_ctx.min().item())},{int(tok_in_ctx.max().item())}]"
+    )
+    k = min(n, max_samples)
+    # Move the small sample to CPU once to avoid k separate D2H syncs.
+    s_pos = bad_pos[:k].tolist()
+    s_req = reqs[:k].tolist()
+    s_tok = tok_in_ctx[:k].tolist()
+    s_vv = vv[:k].tolist()
+    s_vp = vpages[:k].tolist()
+    s_free = in_free[:k].tolist()
+    s_oob = oob[:k].tolist()
+    rp = req_pool_indices.to(torch.int64).tolist()
+    sl = seq_lens.to(torch.int64).tolist()
+    lines = []
+    for i in range(k):
+        r = s_req[i]
+        cls = (
+            "FREED(in free-list)"
+            if s_free[i]
+            else ("OOB-virtual" if s_oob[i] else "UNBOUND(v2p=-1,not-freed)")
+        )
+        rp_i = rp[r] if 0 <= r < len(rp) else -1
+        sl_i = sl[r] if 0 <= r < len(sl) else -1
+        lines.append(
+            f"  pos={s_pos[i]} req={r} req_pool={rp_i} "
+            f"tok_in_ctx={s_tok[i]}/{sl_i} virt={s_vv[i]} page={s_vp[i]} -> {cls}"
+        )
+    return header + "\n" + "\n".join(lines)
+
+
+def _emit_v2p_tombstone(report: str) -> None:
+    """Surface a read-path v2p tombstone fire. `SGLANG_DEBUG_V2P_TOMBSTONE_MODE`:
+      - "raise" (default): raise AssertionError (stops the cell — original
+        behavior).
+      - "warn": log at ERROR and CONTINUE — for a DEBUG serving run that should
+        collect EVERY occurrence across all steps/requests (rich dataset to
+        root-cause the UAF) instead of dying on the first fire.
+    """
+    mode = os.environ.get("SGLANG_DEBUG_V2P_TOMBSTONE_MODE", "raise").lower()
+    if mode == "warn":
+        logger.error(
+            "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES (warn mode — continuing):\n%s",
+            report,
+        )
+    else:
+        raise AssertionError(
+            "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES read-path tombstone "
+            "(set SGLANG_DEBUG_V2P_TOMBSTONE_MODE=warn to log-and-continue and "
+            "collect all occurrences):\n" + report
+        )
+
 
 def _mla_decode_kv_splits_cap(
     base_max_kv_splits: int, sm_count: int, max_context_len: int
@@ -877,7 +981,21 @@ class TritonAttnBackend(AttentionBackend):
                         self.token_to_kv_pool_allocator, "full_attn_allocator", None
                     )
                     if full is not None:
-                        kv_last = int(kv_indptr[-1].item())
+                        # Bound the check to the REAL (non-padding) tokens
+                        # [0, kv_indptr[raw_bs]). cuda-graph PADDING reqs
+                        # [raw_bs:bs] (seq_len=1 each) read stale finished-request
+                        # req_to_token rows whose virtuals are legitimately freed;
+                        # the captured translate's clamp routes them to slot 0
+                        # (padding sink) and their attention output is discarded —
+                        # exactly as the non-shared baseline reads-and-discards junk
+                        # KV for padding. Including them yields benign false
+                        # positives that would drown a real LIVE-token UAF. raw_bs
+                        # comes from the replay forward_batch (implicit channel set
+                        # by cuda_graph_runner.replay_prepare).
+                        rfb = getattr(self, "_replay_forward_batch", None)
+                        raw_bs = getattr(rfb, "batch_size", bs)
+                        raw_bs = max(0, min(raw_bs, bs))
+                        kv_last = int(kv_indptr[raw_bs].item())
                         if kv_last > 0:
                             ps = full.page_size
                             virt = kv_indices[:kv_last]
@@ -885,13 +1003,24 @@ class TritonAttnBackend(AttentionBackend):
                             raw = full.virtual_to_physical[pages]
                             if bool((raw < 0).any().item()):
                                 bad = (raw < 0).nonzero(as_tuple=False).flatten()
-                                raise AssertionError(
-                                    "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES (read "
-                                    "path): live virtual kv_indices map to "
-                                    f"v2p==-1; count={int((raw < 0).sum().item())}, "
-                                    f"sample_pos={bad[:8].tolist()}. A live "
-                                    "read-side use-after-free that the captured "
-                                    "translate's clamp would route to slot 0."
+                                _emit_v2p_tombstone(
+                                    _v2p_tombstone_diagnostic(
+                                        label="FULL",
+                                        bad_pos=bad,
+                                        virt_vals=virt[bad],
+                                        indptr=kv_indptr,
+                                        seq_lens=seq_lens[:bs],
+                                        req_pool_indices=req_pool_indices[:bs],
+                                        free_virtual_ids=getattr(
+                                            full, "free_virtual_ids", None
+                                        ),
+                                        num_virtual=getattr(
+                                            full,
+                                            "num_virtual_pages",
+                                            full.virtual_to_physical.numel(),
+                                        ),
+                                        page_size=ps,
+                                    )
                                 )
                 num_token = bs
                 if (
@@ -933,7 +1062,12 @@ class TritonAttnBackend(AttentionBackend):
                             None,
                         )
                         if swa is not None:
-                            w_last = int(self.window_kv_indptr[bs].item())
+                            # Same padding exclusion as the full-attn check above:
+                            # bound to the real prefix [0, window_kv_indptr[raw_bs]).
+                            rfb = getattr(self, "_replay_forward_batch", None)
+                            raw_bs_w = getattr(rfb, "batch_size", bs)
+                            raw_bs_w = max(0, min(raw_bs_w, bs))
+                            w_last = int(self.window_kv_indptr[raw_bs_w].item())
                             if w_last > 0:
                                 ps = swa.page_size
                                 wv = window_kv_indices[:w_last]
@@ -943,14 +1077,29 @@ class TritonAttnBackend(AttentionBackend):
                                     wbad = (
                                         (wraw < 0).nonzero(as_tuple=False).flatten()
                                     )
-                                    raise AssertionError(
-                                        "SGLANG_DEBUG_CHECK_V2P_TOMBSTONES (swa "
-                                        "window): live virtual window_kv_indices "
-                                        "map to swa v2p==-1; "
-                                        f"count={int((wraw < 0).sum().item())}, "
-                                        f"sample_pos={wbad[:8].tolist()}. A live "
-                                        "window-token use-after-free on the swa "
-                                        "side (window/eviction frontier off-by-one)."
+                                    # swa is a non-owner allocator (the full side
+                                    # owns the virtual ids), so it has no
+                                    # free_virtual_ids — swa.v2p==-1 means the swa
+                                    # PHYSICAL was released via free_swa. Pass
+                                    # free_virtual_ids=None → fires classify as
+                                    # UNBOUND; the req / tok_in_ctx / virt fields
+                                    # are the actionable signal here.
+                                    _emit_v2p_tombstone(
+                                        _v2p_tombstone_diagnostic(
+                                            label="SWA-WINDOW",
+                                            bad_pos=wbad,
+                                            virt_vals=wv[wbad],
+                                            indptr=self.window_kv_indptr[: bs + 1],
+                                            seq_lens=seq_lens[:bs],
+                                            req_pool_indices=req_pool_indices[:bs],
+                                            free_virtual_ids=None,
+                                            num_virtual=getattr(
+                                                swa,
+                                                "num_virtual_pages",
+                                                swa.virtual_to_physical.numel(),
+                                            ),
+                                            page_size=ps,
+                                        )
                                     )
                     self.get_num_kv_splits(
                         window_num_kv_splits[:num_token], window_kv_lens[:bs]
