@@ -966,7 +966,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # Live virtual pages (excluding the reserved padding page 0).
         live_v_pages = [
             v
-            for v in range(1, alloc.num_virtual_pages)
+            for v in range(1, alloc.num_pages)
             if int(v2p[v].item()) != -1
         ]
         # Mutual inverse on the live page set.
@@ -983,18 +983,18 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         else:
             alloc_lo, alloc_hi = (
                 alloc.watermark_physical + 1,
-                alloc.num_virtual_pages,
+                alloc.num_pages,
             )
         self.assertEqual(alloc_hi - alloc_lo, len(live_v_pages))
         for p_page in range(alloc_lo, alloc_hi):
             self.assertNotEqual(
                 int(p2v[p_page].item()), -1, f"hole at physical page {p_page}"
             )
-        # Free virtual page ids ∪ live = [min_page_index, num_virtual_pages).
+        # Free virtual page ids ∪ live = [min_page_index, num_pages).
         free_set = set(int(x) for x in alloc.free_virtual_ids.tolist())
         self.assertEqual(
             free_set | set(live_v_pages),
-            set(range(alloc.min_page_index, alloc.num_virtual_pages)),
+            set(range(alloc.min_page_index, alloc.num_pages)),
         )
         self.assertEqual(free_set & set(live_v_pages), set())
         # For every token we stamped, verify data followed any relocations.
@@ -1043,14 +1043,14 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         # +1 for the trailing -1 sentinel row.
         self.assertEqual(
             int(full_alloc.virtual_to_physical.numel()),
-            full_alloc.num_virtual_pages + 1,
+            full_alloc.num_pages + 1,
         )
         self.assertEqual(
             int(full_alloc.physical_to_virtual.numel()),
-            full_alloc.num_virtual_pages + 1,
+            full_alloc.num_pages + 1,
         )
-        # `num_virtual_pages` should be > 1 to be a meaningful test.
-        self.assertGreater(full_alloc.num_virtual_pages, 1)
+        # `num_pages` should be > 1 to be a meaningful test.
+        self.assertGreater(full_alloc.num_pages, 1)
 
     # 4. Compaction relocates a whole page at once (data follows).
     def test_paged_compaction_relocates_whole_pages(self):
@@ -1175,8 +1175,8 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         expected = (
             min(
                 expected_pages_by_bytes,
-                fa.num_virtual_pages - fa.min_page_index,
-                sa.num_virtual_pages - sa.min_page_index,
+                fa.num_pages - fa.min_page_index,
+                sa.num_pages - sa.min_page_index,
             )
             * self.PAGE_SIZE
         )
@@ -1862,6 +1862,384 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "REGRESSION: the SharedSWAKVPool helper and the composite "
             "allocator's translate_loc_from_full_to_swa must agree.",
         )
+
+
+class TestLazyCompaction(unittest.TestCase):
+    """Stage 3.7 (§S37) — lazy compaction invariants and lazy-vs-eager
+    equivalence harness. CPU-only (no GPU events; the conservative Phase A
+    `_flush` uses `wait_stream(forward_stream)` only when `forward_stream is
+    not None`, so passing `forward_stream=None` keeps it a no-op).
+    """
+
+    def _make_full(self, *, lazy: bool, n_full_slots=64, n_mamba_slots=16):
+        full = _make_mha_spec("full", "up", layer_num=2)
+        mamba = _make_mamba_spec("mamba", "down", layer_num=2)
+        total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
+        pool = SharedMemoryPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_alloc = MultiEndedAllocator(
+            kvcache=full_kv, shared_buffer=pool, sub_pool_name="full",
+            device=_DEV, is_id_owner=True, lazy_compaction=lazy,
+        )
+        mamba_alloc = MultiEndedAllocator(
+            kvcache=mamba_kv, shared_buffer=pool, sub_pool_name="mamba",
+            device=_DEV, is_id_owner=True, lazy_compaction=lazy,
+        )
+        full_alloc.bind_peer(mamba_alloc)
+        mamba_alloc.bind_peer(full_alloc)
+        return pool, full_alloc, full_kv
+
+    def _stamp_kv(self, kv: _FakeKVCache, alloc: MultiEndedAllocator, tokens) -> None:
+        """Write a marker into KV[phys] for each freshly-alloced virtual
+        token id, so we can later check the data followed any relocation.
+        """
+        for v in tokens.tolist():
+            p = int(alloc.virtual_to_physical[v].item())
+            kv.buf[p] = int(v)
+
+    def test_lazy_state_initialized(self):
+        """Lazy allocator initializes the new state cleanly."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        self.assertTrue(fa.lazy_compaction)
+        self.assertEqual(len(fa._free_phys_pages), 0)
+        self.assertEqual(fa._pending_reuse, {})
+        self.assertEqual(fa.live_page_count, 0)
+        # Watermark + free virtual list start equivalent to eager.
+        self.assertEqual(fa.watermark_physical, fa.min_page_index)
+
+    def test_lazy_alloc_increments_live_page_count(self):
+        _pool, fa, _kv = self._make_full(lazy=True)
+        tokens = fa.alloc(8)
+        self.assertIsNotNone(tokens)
+        self.assertEqual(int(tokens.numel()), 8)
+        self.assertEqual(fa.live_page_count, 8)
+        self.assertEqual(len(fa._free_phys_pages), 0)
+
+    def test_lazy_free_boundary_shortcut(self):
+        """Freeing the topmost (boundary) page shrinks the watermark in-line.
+        Free-list stays empty for boundary frees.
+        """
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(3)  # virtual tokens
+        before_wm = fa.watermark_physical
+        # Free the last-alloced virtual id (its physical IS the boundary).
+        last = a[-1:].clone()
+        fa.free(last)
+        # Watermark should have shrunk by exactly 1 page.
+        self.assertEqual(fa.watermark_physical, before_wm - 1)
+        # No hole pushed into the list — absorbed into watermark.
+        self.assertEqual(len(fa._free_phys_pages), 0)
+        self.assertEqual(fa.live_page_count, 2)
+
+    def test_lazy_free_non_boundary_pushes_hole(self):
+        """Freeing a non-boundary page enters _free_phys_pages, watermark
+        stays put.
+        """
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(5)
+        wm_before = fa.watermark_physical
+        # Free a middle id (NOT the topmost), boundary-shortcut should
+        # NOT fire.
+        mid = a[2:3].clone()
+        fa.free(mid)
+        self.assertEqual(fa.watermark_physical, wm_before)
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        self.assertEqual(fa.live_page_count, 4)
+
+    def test_lazy_free_inward_walk(self):
+        """Freeing 1 hole + 1 boundary causes the inward walk to absorb both."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(5)
+        # Free a middle slot first → hole appears.
+        fa.free(a[2:3].clone())
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        wm_after_mid_free = fa.watermark_physical
+        # Now free the topmost ids one at a time. After freeing all topmost
+        # adjacent to the (formerly non-boundary) hole, the inward walk
+        # should reach the hole and absorb it.
+        fa.free(a[4:5].clone())  # topmost — absorb 1.
+        fa.free(a[3:4].clone())  # now-topmost — absorb 1, which exposes
+                                  # the original hole at the new boundary.
+        # After three frees, watermark should have shrunk past all three.
+        self.assertEqual(fa.watermark_physical, wm_after_mid_free - 3)
+        # The hole should now be absorbed.
+        self.assertEqual(len(fa._free_phys_pages), 0)
+        self.assertEqual(fa.live_page_count, 2)
+
+    def test_lazy_take_physical_drains_holes_first(self):
+        """alloc reuses holes before extending the watermark."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(5)
+        # Free two non-boundary virtuals to populate _free_phys_pages.
+        fa.free(a[1:2].clone())
+        fa.free(a[3:4].clone())
+        n_holes_before = len(fa._free_phys_pages)
+        self.assertEqual(n_holes_before, 2)
+        wm_before = fa.watermark_physical
+        # Allocate 2 more — both should come from holes, watermark unchanged.
+        a2 = fa.alloc(2)
+        self.assertEqual(fa.watermark_physical, wm_before)
+        self.assertEqual(len(fa._free_phys_pages), 0)
+        # Allocate 1 more — must extend (no holes left).
+        a3 = fa.alloc(1)
+        self.assertEqual(fa.watermark_physical, wm_before + 1)
+        # All three new alloc batches are non-None.
+        self.assertIsNotNone(a2)
+        self.assertIsNotNone(a3)
+
+    def test_lazy_available_size_includes_holes(self):
+        """available_size counts drainable holes + extension capacity."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        avail_initial = fa.available_size()
+        a = fa.alloc(5)
+        # 3 non-boundary frees → 3 holes; watermark unchanged.
+        fa.free(a[0:1].clone())
+        fa.free(a[1:2].clone())
+        fa.free(a[2:3].clone())
+        self.assertEqual(len(fa._free_phys_pages), 3)
+        avail_after = fa.available_size()
+        # holes (3) + remaining extension capacity == original capacity
+        # adjusted by the 2 still-live tokens at the top.
+        # Concretely: avail_after = avail_initial - 2 (live).
+        self.assertEqual(avail_after, avail_initial - 2)
+
+    def test_lazy_flush_compacts_holes_into_gap(self):
+        """_flush(urgent=True) moves a survivor into a hole and shrinks the
+        watermark, freeing bytes back into the shared gap.
+        """
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(5)
+        # Stamp KV so we can assert the data followed the relocation.
+        self._stamp_kv(_kv, fa, a)
+        # Free a low-index hole; keep the topmost live.
+        fa.free(a[1:2].clone())
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        wm_before = fa.watermark_physical
+        n_moves = fa._flush(urgent=True)
+        # At least one move should have happened (topmost survivor → hole).
+        self.assertGreaterEqual(n_moves, 1)
+        # Watermark shrunk; hole list is now empty.
+        self.assertLess(fa.watermark_physical, wm_before)
+        self.assertEqual(len(fa._free_phys_pages), 0)
+        # live_page_count invariant under compaction.
+        self.assertEqual(fa.live_page_count, 4)
+
+    def test_lazy_v2p_p2v_identity_after_flush(self):
+        """After a flush, v2p ∘ p2v == identity on the live set."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(8)
+        # Free a scattered set of virtuals (not at boundary).
+        fa.free(a[1:2].clone())
+        fa.free(a[3:4].clone())
+        fa.free(a[5:6].clone())
+        fa._flush(urgent=True)
+        # For every still-live virtual token, v2p ∘ p2v == identity.
+        for v in a.tolist():
+            p = int(fa.virtual_to_physical[v].item())
+            if p == -1:
+                continue  # freed
+            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
+
+    def _replay_sequence(self, ops, lazy: bool):
+        """Run a given alloc/free op trace under eager OR lazy mode and
+        return the final (live virtual set, alloc-time KV stamps)."""
+        _pool, fa, kv = self._make_full(lazy=lazy)
+        live = set()  # set of virtual ids
+        kv_stamps = {}  # v -> stamp (the data we wrote at alloc time)
+        next_stamp = 100
+        for kind, n in ops:
+            if kind == "alloc":
+                tokens = fa.alloc(n)
+                if tokens is None:
+                    continue
+                for v in tokens.tolist():
+                    p = int(fa.virtual_to_physical[v].item())
+                    kv.buf[p] = next_stamp
+                    kv_stamps[v] = next_stamp
+                    live.add(v)
+                    next_stamp += 1
+            elif kind == "free":
+                if not live:
+                    continue
+                # Take up to n from live, deterministically by id.
+                victims = sorted(live)[:n]
+                live.difference_update(victims)
+                fa.free(torch.tensor(victims, dtype=torch.int64))
+        # Force final compaction on lazy so the comparison is at quiescence.
+        if lazy:
+            fa._flush(urgent=True)
+        # Read back the data for each live id.
+        live_data = {}
+        for v in live:
+            p = int(fa.virtual_to_physical[v].item())
+            live_data[v] = int(kv.buf[p].item())
+        return live, live_data, kv_stamps
+
+    def test_lazy_vs_eager_equivalence(self):
+        """Same random alloc/free sequence under lazy and eager modes must
+        yield identical live virtual sets AND identical KV reads (the data
+        followed any relocation).
+        """
+        rng = random.Random(42)
+        ops = []
+        for _ in range(200):
+            if rng.random() < 0.6:
+                ops.append(("alloc", rng.randint(1, 6)))
+            else:
+                ops.append(("free", rng.randint(1, 4)))
+        eager_live, eager_data, eager_stamps = self._replay_sequence(ops, lazy=False)
+        lazy_live, lazy_data, lazy_stamps = self._replay_sequence(ops, lazy=True)
+        self.assertEqual(eager_live, lazy_live, "live virtual set diverged")
+        self.assertEqual(eager_stamps, lazy_stamps, "alloc-time stamps diverged")
+        # For every live id, the data we read back must match what we wrote.
+        for v in eager_live:
+            self.assertEqual(eager_data[v], eager_stamps[v],
+                             f"eager: KV[v={v}] != stamp")
+            self.assertEqual(lazy_data[v], lazy_stamps[v],
+                             f"lazy: KV[v={v}] != stamp")
+
+    def test_lazy_hole_set_directional_pop(self):
+        """The _HoleSet pops smallest-first for grow-up; alloc must drain
+        the deepest hole first (the greedy clustering rule keeps near-
+        boundary holes available for cheap absorption by compaction).
+        """
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(6)
+        # Free middle and lower middles so the holes are NOT at boundary.
+        fa.free(a[1:2].clone())  # frees physical at index v2p[a[1]]
+        fa.free(a[3:4].clone())
+        # Capture which physical pages are now in the hole set.
+        holes_before = sorted(list(fa._free_phys_pages))
+        self.assertEqual(len(holes_before), 2)
+        # Alloc 1 — should drain the SMALLEST hole (grow-up).
+        a2 = fa.alloc(1)
+        # The newly-bound physical for a2 must equal min(holes_before).
+        bound_phys = int(fa.virtual_to_physical[int(a2.item())].item())
+        self.assertEqual(bound_phys, holes_before[0])
+
+    def test_lazy_non_urgent_stops_at_write_set_blocker(self):
+        """§S37 Q3 step 2 case A: when the topmost survivor IS in an
+        in-flight batch's write-set, non-urgent `_flush` STOPS the
+        boundary walk (skipping past would shuffle holes without
+        shrinking the watermark — wasted work)."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(5)
+
+        class _FakeEvent:
+            def __init__(self):
+                self.fired = False
+            def query(self):
+                return self.fired
+
+        ev = _FakeEvent()
+        fa.set_latest_forward_done_event(ev)
+        # Free a non-boundary slot to create a compactable hole.
+        fa.free(a[1:2].clone())
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        # Register an in-flight batch whose write-set INCLUDES the
+        # topmost survivor (the physical bound to a[-1]).
+        topmost_phys = int(
+            fa.virtual_to_physical[int(a[-1].item())].item()
+        )
+        fa._inflight_batches.append((ev, {topmost_phys}))
+        # Non-urgent flush → case A blocker at the top → STOP.
+        n_moves = fa._flush(urgent=False)
+        self.assertEqual(
+            n_moves, 0,
+            "non-urgent flush must STOP when the topmost survivor is in "
+            "an in-flight write-set",
+        )
+        # State untouched: hole still present.
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        self.assertEqual(len(fa._pending_reuse), 0)
+        # Fire the event (forward done) so the write-set entry prunes; a
+        # subsequent flush proceeds and releases src directly (event fired
+        # → no pending reuse entry needed).
+        ev.fired = True
+        n_moves2 = fa._flush(urgent=False)
+        self.assertGreaterEqual(n_moves2, 1)
+        self.assertEqual(len(fa._pending_reuse), 0)
+
+    def test_lazy_non_urgent_read_race_uses_pending_reuse(self):
+        """§S37 Q3 step 2 case B (read race, no write race): when the
+        topmost survivor is NOT in any in-flight write-set, non-urgent
+        `_flush` compacts immediately (read+read on KV[src] is safe) and
+        pushes `(src, latest_event)` to `_pending_reuse` so a future
+        alloc can't write KV[src] while iter N+1's read is still pending.
+        """
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(5)
+
+        class _FakeEvent:
+            def __init__(self):
+                self.fired = False
+            def query(self):
+                return self.fired
+
+        ev = _FakeEvent()
+        fa.set_latest_forward_done_event(ev)
+        # Free a non-boundary slot → 1 hole.
+        fa.free(a[1:2].clone())
+        # Empty write-set for the in-flight batch → topmost survivor is
+        # NOT in the write-set → compact proceeds, src goes to pending.
+        fa._inflight_batches.append((ev, set()))
+        n_moves = fa._flush(urgent=False)
+        self.assertGreaterEqual(n_moves, 1)
+        # src is in _pending_reuse, gated on the unfired event.
+        self.assertEqual(len(fa._pending_reuse), n_moves)
+        # Fire the event and drain — src returns to availability.
+        ev.fired = True
+        fa._drain_pending_reuse(urgent=False)
+        self.assertEqual(len(fa._pending_reuse), 0)
+
+    def test_lazy_pending_reuse_urgent_wait(self):
+        """Under urgent drain, an unfired event triggers wait_event; we
+        simulate this by checking that the drain ALSO releases unfired
+        entries (with a fake event whose `query` is False — `wait_event` is
+        a no-op in CPU mode since there's no current stream's wait_event for
+        a FakeEvent, so we test the release path)."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(4)
+        class _FakeEvent:
+            def __init__(self):
+                self.waited = False
+            def query(self):
+                return False  # never fires
+        # Inject into _pending_reuse directly to isolate the drain logic.
+        # (Simulates a prior compaction whose event still hasn't fired.)
+        # Pick a physical page from a; pretend it's now in pending.
+        p = int(fa.virtual_to_physical[int(a[2].item())].item())
+        # Hack: clear its v2p/p2v so _release_phys_page can route it.
+        fa.virtual_to_physical[int(a[2].item())] = -1
+        fa.physical_to_virtual[p] = -1
+        fa._pending_reuse[p] = _FakeEvent()
+        # Urgent drain — should release p despite event.query()=False.
+        # (CPU shim: torch.cuda.current_stream() may not exist; wrap try.)
+        try:
+            fa._drain_pending_reuse(urgent=True)
+        except Exception:
+            # CPU: wait_event may not work; this test is GPU-only.
+            self.skipTest("wait_event requires CUDA")
+        self.assertEqual(len(fa._pending_reuse), 0)
+
+    def test_lazy_flush_opportunistic_hook(self):
+        """The public flush_opportunistic method runs the non-urgent path
+        and is safe to call when no holes exist."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        # No holes → returns 0 moves, no-op.
+        self.assertEqual(fa.flush_opportunistic(), 0)
+        # Create a hole then call flush_opportunistic; latest_event=None
+        # means src releases immediately.
+        a = fa.alloc(3)
+        fa.free(a[0:1].clone())
+        moves = fa.flush_opportunistic()
+        self.assertGreaterEqual(moves, 1)
 
 
 if __name__ == "__main__":

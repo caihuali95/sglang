@@ -387,12 +387,12 @@ class SharedMemoryPool:
         assert page_bytes % itemsize == 0
         # Truncate max_slots to a multiple of page_size. The allocator (in
         # multi_ended_allocator.py) already does this internally for its own
-        # num_virtual_pages bookkeeping (`num_virtual_pages = max_slots //
+        # num_pages bookkeeping (`num_pages = max_slots //
         # page_size`); the view must match. The leftover slots in
         # `[num_pages * page_size, max_slots)` are unreachable via the
         # 4-D view, but they're also unreachable via the allocator —
         # `MultiEndedAllocator.free_virtual_ids = arange(min_page_index,
-        # num_virtual_pages)` caps allocation at `num_pages * page_size`
+        # num_pages)` caps allocation at `num_pages * page_size`
         # tokens, so no allocated slot id ever falls in the leftover band.
         num_pages = max_slots // page_size
 
@@ -948,7 +948,7 @@ class SharedMambaPool(MambaPool):
         Bounds are PAGE indices (matching the Stage-3 watermark convention).
         The Mamba sub-allocator is always ``page_size == 1``, so pages and
         slots coincide; we use the page-named attributes
-        (``num_virtual_pages``, ``min_page_index``) for self-consistency
+        (``num_pages``, ``min_page_index``) for self-consistency
         with the rest of the page-aware code, and assert ``page_size == 1``
         so a future change accidentally introducing a paged Mamba allocator
         is caught here instead of producing a silent unit mismatch.
@@ -964,7 +964,7 @@ class SharedMambaPool(MambaPool):
             "and orthogonal to per-token paging."
         )
         if alloc.grow_direction == "up":
-            start, end = alloc.watermark_physical, alloc.num_virtual_pages
+            start, end = alloc.watermark_physical, alloc.num_pages
         else:
             start, end = alloc.min_page_index, alloc.watermark_physical + 1
         if start >= end:
@@ -1229,6 +1229,7 @@ def init_shared_mamba_pools(
     need_sort: bool,
     mamba_full_memory_ratio: Optional[float] = None,  # informational only
     forward_stream: Optional[torch.cuda.Stream] = None,
+    lazy_compaction: bool = False,
 ) -> SharedPoolBundle:
     """Build the Mamba-hybrid shared-pool stack: `SharedMemoryPool` (full + mamba
     sub-pools), `SharedHybridReqToTokenPool` (with its `SharedMambaPool`),
@@ -1329,6 +1330,7 @@ def init_shared_mamba_pools(
         page_size=page_size,
         need_sort=need_sort,
         forward_stream=forward_stream,
+        lazy_compaction=lazy_compaction,
     )
 
     logger.info(
@@ -1799,6 +1801,7 @@ def init_shared_swa_pools(
     enable_memory_saver: bool,
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
+    lazy_compaction: bool = False,
 ) -> SharedSWAPoolBundle:
     """Build the SWA-hybrid shared-pool stack: `SharedMemoryPool` (full + swa
     sub-pools), `SharedSWAKVPool` (composite KV cache), and
@@ -1870,6 +1873,7 @@ def init_shared_swa_pools(
         page_size=page_size,
         need_sort=need_sort,
         forward_stream=forward_stream,
+        lazy_compaction=lazy_compaction,
     )
 
     logger.info(
