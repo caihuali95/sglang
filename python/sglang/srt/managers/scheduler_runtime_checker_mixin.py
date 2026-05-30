@@ -563,6 +563,18 @@ class SchedulerRuntimeCheckerMixin:
         if not self.is_fully_idle():
             return
 
+        # Opportunistic flush: reclaim lazy-compaction
+        # holes into the gap while the GPU is idle. Sync-free on
+        # schedule_stream (polls events only). No-op for non-lazy /
+        # non-shared-pool allocators (the method only exists on the
+        # shared-pool composites). Best-effort — wrap defensively.
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if allocator is not None and hasattr(allocator, "flush_opportunistic"):
+            try:
+                allocator.flush_opportunistic()
+            except Exception:
+                pass  # idle-path housekeeping; do not fault the scheduler
+
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
         if not self.enable_hisparse:

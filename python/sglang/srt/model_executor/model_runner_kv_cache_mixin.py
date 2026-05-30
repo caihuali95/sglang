@@ -47,6 +47,14 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 
+def _lazy_compaction_default() -> bool:
+    """Lazy compaction default — ON unless
+    `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
+    Centralized here so both shared-pool factory call sites stay in sync.
+    """
+    return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
+
+
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
@@ -301,6 +309,9 @@ class ModelRunnerKVCacheMixin:
             # compaction is about to relocate. A near-no-op in normal mode
             # (sampling's CPU sync already drained forward_stream).
             forward_stream=getattr(self, "forward_stream", None),
+            # Lazy compaction: default ON, with env var
+            # escape hatch for rollback / A/B.
+            lazy_compaction=_lazy_compaction_default(),
         )
         self.req_to_token_pool = bundle.req_to_token_pool
         self.token_to_kv_pool = bundle.token_to_kv_pool
@@ -390,6 +401,8 @@ class ModelRunnerKVCacheMixin:
             # — the allocator's `free` drops a wait_stream(forward_stream) so
             # eager compaction serializes after the in-flight forward kernels.
             forward_stream=getattr(self, "forward_stream", None),
+            # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
+            lazy_compaction=_lazy_compaction_default(),
         )
         self.token_to_kv_pool = bundle.token_to_kv_pool
         self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator

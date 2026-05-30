@@ -409,7 +409,7 @@ def translate_kv_indices_inplace(
           ``cuda_graph_kv_indices`` or ``cuda_graph_window_kv_indices``).
           Holds VIRTUAL token ids on entry; PHYSICAL on return.
         - ``v2p``: 1-D int64 ``virtual_to_physical`` (page-granular for ps>1,
-          sized ``num_virtual_pages + 1`` with a trailing ``-1`` sentinel).
+          sized ``num_pages + 1`` with a trailing ``-1`` sentinel).
         - ``kv_indptr``: 1-D int tensor whose element ``[bs]`` is the valid
           extent ``sum(seq_lens)``. The buffer (not a slice) is passed so the
           kernel can index ``[bs]`` on-device.

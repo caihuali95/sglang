@@ -1014,11 +1014,7 @@ class TritonAttnBackend(AttentionBackend):
                                         free_virtual_ids=getattr(
                                             full, "free_virtual_ids", None
                                         ),
-                                        num_virtual=getattr(
-                                            full,
-                                            "num_virtual_pages",
-                                            full.virtual_to_physical.numel(),
-                                        ),
+                                        num_virtual=full.num_pages,
                                         page_size=ps,
                                     )
                                 )
@@ -1093,11 +1089,7 @@ class TritonAttnBackend(AttentionBackend):
                                             seq_lens=seq_lens[:bs],
                                             req_pool_indices=req_pool_indices[:bs],
                                             free_virtual_ids=None,
-                                            num_virtual=getattr(
-                                                swa,
-                                                "num_virtual_pages",
-                                                swa.virtual_to_physical.numel(),
-                                            ),
+                                            num_virtual=swa.num_pages,
                                             page_size=ps,
                                         )
                                     )

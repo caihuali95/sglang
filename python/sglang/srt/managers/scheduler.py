@@ -1576,6 +1576,22 @@ class Scheduler(
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
+                # Opportunistic flush at the
+                # `disable_overlap_for_batch` sync boundary. After
+                # pop_and_process, the previous iter's forward is fully
+                # drained (sampling's CPU sync) and the next iter's
+                # forward has NOT yet been launched — `forward_stream` is
+                # truly idle, so the conservative non-urgent guard inside
+                # `_flush` finds `event.query()` True and compacts freely.
+                # Sync-free; best-effort.
+                allocator = getattr(self, "token_to_kv_pool_allocator", None)
+                if allocator is not None and hasattr(
+                    allocator, "flush_opportunistic"
+                ):
+                    try:
+                        allocator.flush_opportunistic()
+                    except Exception:
+                        pass
 
             # Launch the current batch
             if batch:
@@ -3029,6 +3045,32 @@ class Scheduler(
                         model_worker_batch
                         # here pp is not compatible with overlap
                     )
+                    # Record a dedicated `forward_done`
+                    # event right after the forward (BEFORE copy_to_cpu).
+                    # This is what lazy-compaction `_flush` uses to gate
+                    # src reuse: when this fires, the in-flight forward's
+                    # KV reads have settled. Distinct from `copy_done`
+                    # (which fires later, after the host-side D2H of the
+                    # output) so compaction is not coupled to copy_to_cpu's
+                    # call site.
+                    forward_done = self.device_module.Event()
+                    forward_done.record(stream=self.forward_stream)
+                    allocator = self.token_to_kv_pool_allocator
+                    if hasattr(allocator, "set_latest_forward_done_event"):
+                        allocator.set_latest_forward_done_event(forward_done)
+                    # Stage 3.7 (§S37) Q3 step 2 — write-set classification.
+                    # Hand the allocator the virtual `out_cache_loc` of this
+                    # forward so its `_flush` can refuse to compact any
+                    # survivor that this forward is about to `set_kv_buffer`
+                    # (case A — write race). The allocator translates
+                    # internally via its own v2p. Cheap: one bs-sized D2H
+                    # per launched batch on schedule_stream.
+                    if hasattr(allocator, "register_inflight_batch"):
+                        allocator.register_inflight_batch(
+                            forward_done,
+                            getattr(model_worker_batch, "out_cache_loc", None),
+                        )
+                    batch_result.forward_done = forward_done
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
