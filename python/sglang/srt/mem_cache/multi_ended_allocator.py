@@ -345,19 +345,47 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         ] = {}
         self.live_page_count = 0
         self._latest_forward_done_event: Optional["torch.cuda.Event"] = None
-        # In-flight forward batches' write-sets at PAGE granularity (§S37
-        # Q3 step 2 case A): each entry is (forward_done_event,
-        # write_pages_set). `write_pages_set` is the set of physical PAGE
-        # ids that the corresponding forward will WRITE via
-        # `set_kv_buffer` on `out_cache_loc`. A compaction `src` that
-        # falls in any active write-set would race the forward's write,
-        # so `_flush` must skip it (non-urgent) or wait the event
-        # (urgent). Settled entries (event already fired) are pruned
-        # lazily on each `_flush` call. The scheduler populates this via
-        # `register_inflight_batch` right after recording `forward_done`.
-        self._inflight_batches: List[
-            Tuple["torch.cuda.Event", Set[int]]
-        ] = []
+        # Most-recently-launched forward's metadata for the write-race
+        # check in `_flush`. Stored as a single
+        # (forward_done_event, out_cache_loc_virtual TENSOR) tuple — NOT
+        # materialized as a Python set. Set by the scheduler via
+        # `set_inflight_forward(...)` right after launching a forward.
+        #
+        # Why a single slot, not a list: at all three `_flush` call sites
+        # the scheduler thread has at most ONE forward in flight at the
+        # moment of the call (both flush_opportunistic
+        # call sites are AFTER pop_and_process drains the previous batch,
+        # before the next launch). The earlier `_inflight_batches: List`
+        # design pre-materialized each batch's write-set via
+        # `phys.tolist()` from inside `forward_stream_ctx` — that sync
+        # was what blocked the scheduler on the forward (eval_115
+        # bottleneck, 31ms/step on SWA × overlap × cg_on). The
+        # simplified design just stores the tensor reference; `_flush`
+        # materializes the write-set LAZILY on schedule_stream only when
+        # a survivor candidate actually needs to be checked.
+        self._inflight_forward: Optional[
+            Tuple["torch.cuda.Event", torch.Tensor]
+        ] = None
+
+        # Per-call move cap on non-urgent
+        # `_flush`. Without this, a single `flush_opportunistic` invoked
+        # against a heavily fragmented band (e.g., Falcon × radix ×
+        # stress *after* prior workloads have populated the radix cache)
+        # can spend ~40 min compacting the entire backlog under a single
+        # `on_idle()` call, blocking ZMQ IPC the whole time (eval_111
+        # post-completion hang). With the cap, each non-urgent call
+        # returns after at most this many moves; the remaining work is
+        # picked up by the next opportunistic flush (typically the next
+        # scheduler iteration), so the scheduler stays responsive and
+        # progress is still made. Default 4096 keeps each call to a few
+        # tens of ms with the O(1) survivor cursor below; tune via env
+        # for benchmarking. The urgent path (`alloc*` shortfall retry)
+        # is NOT capped — it must drain everything to satisfy correctness.
+        self._lazy_max_moves_per_call = int(
+            os.environ.get(
+                "SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL", "4096"
+            )
+        )
 
         self.clear()
 
@@ -432,7 +460,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._free_phys_pages.clear()
         self._pending_reuse.clear()
         self.live_page_count = 0
-        self._inflight_batches.clear()
+        self._inflight_forward = None
         self._latest_forward_done_event = None
 
     def backup_state(self):
@@ -1298,20 +1326,41 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         Immediate disjoint-element scatters on schedule_stream, NO
         `wait_stream(forward_stream)`. Each freed physical page is routed
-        through `_release_phys_page` (boundary-shortcut absorbs at the
-        watermark, else pushes to `_free_phys_pages`). Virtual page ids
-        are recycled to `free_virtual_ids` (id-owner only). The compaction
-        move is deferred to `_flush`.
+        through `_release_phys_pages_batch` (boundary-shortcut absorbs at
+        the watermark, else pushes to `_free_phys_pages`). Virtual page
+        ids are recycled to `free_virtual_ids` (id-owner only). The
+        compaction move is deferred to `_flush`.
+
+        Vectorization: for `page_size == 1`, skip the
+        `torch.unique` call — token-granular `free_index` is already
+        page-unique by construction (each token is its own page). This
+        eliminates `torch.unique`'s implicit sync (output-size is
+        data-dependent → forces a CPU/GPU sync) on the ps=1 hot path.
+        For `page_size > 1`, `torch.unique` is still needed to dedup
+        same-page tokens; the sync there is unavoidable.
+
+        The per-page Python work (boundary shortcut + hole-set updates)
+        is moved into `_release_phys_pages_batch` which caches attribute
+        lookups across iterations and inlines the boundary walk —
+        saving the per-call function-frame overhead of the previous
+        per-page `_release_phys_page` loop.
         """
         with record_function("MultiEndedAlloc._free_lazy"):
             with record_function("MultiEndedAlloc._free_lazy.v2p_lookup"):
-                free_v_pages = torch.unique(
-                    free_index.detach().to(torch.int64) // self.page_size
-                )
+                free_v_pages_raw = free_index.detach().to(torch.int64)
+                if self.page_size == 1:
+                    # Token-granular = page-granular at ps=1, AND
+                    # `free_index` is already unique per caller contract
+                    # (req_to_token rows are non-overlapping). Skip the
+                    # `torch.unique` to avoid its output-size sync.
+                    free_v_pages = free_v_pages_raw
+                else:
+                    free_v_pages = torch.unique(
+                        free_v_pages_raw // self.page_size
+                    )
                 freed_p_pages = self.virtual_to_physical[free_v_pages]
             # Tombstone safety check (debug-gated for perf — the .item() sync
             # would otherwise dominate the lazy path's CPU cost).
-            import os
             if os.environ.get("SGLANG_DEBUG_CHECK_V2P_TOMBSTONES", "0") == "1":
                 if bool((freed_p_pages < 0).any().item()):
                     self._raise_stale_slot_assertion(
@@ -1327,17 +1376,74 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self.free_virtual_ids = torch.cat(
                     [self.free_virtual_ids, free_v_pages]
                 )
-            # Route each freed physical page to the watermark (boundary
-            # shortcut) or the hole set. Tombstoned entries (p<0) were
+            # Single `.tolist()` sync; batch-process the resulting Python
+            # list (cached attribute lookups + inlined boundary walk in
+            # `_release_phys_pages_batch`). Tombstoned entries (p<0) were
             # already freed in a prior call — skip and don't double-count.
             freed_list = freed_p_pages.tolist()
-            n_freed = 0
-            for p in freed_list:
-                if p < 0:
-                    continue
-                self._release_phys_page(int(p))
-                n_freed += 1
+            n_freed = self._release_phys_pages_batch(freed_list)
             self.live_page_count -= n_freed
+
+    def _release_phys_pages_batch(self, pages: List[int]) -> int:
+        """Vectorized release of a list of freed physical PAGE ids.
+        Returns the count of valid (non-tombstone) pages released.
+
+        Equivalent to:
+            for p in pages:
+                if p < 0: continue
+                self._release_phys_page(p)
+            return count
+
+        Optimizations:
+          - Cached `wm`, `fp`, `min_idx`, `num_pages` locals instead of
+            per-iteration attribute lookups
+          - Single boundary-shortcut walk at the end (after all newly-
+            freed pages have been classified into boundary-eligible vs
+            non-boundary), absorbing both newly-freed boundary pages AND
+            previously-existing adjacent holes
+          - One Python frame instead of N (~500 ns/call saving)
+
+        Behavior is byte-identical to the per-page `_release_phys_page`
+        loop modulo the order in which holes get absorbed into the
+        watermark — but the watermark always ends at the same value
+        (the deepest contiguous-from-boundary hole boundary).
+        """
+        if not pages:
+            return 0
+        with record_function("MultiEndedAlloc._release_phys_pages_batch"):
+            n_freed = 0
+            fp = self._free_phys_pages   # local for speed
+            if self.grow_direction == "up":
+                wm = self.watermark_physical
+                min_idx = self.min_page_index
+                # Pass 1: every valid page goes into the hole set. The
+                # boundary-shortcut walk in pass 2 will absorb any pages
+                # contiguous with the watermark (newly-freed or old).
+                for p in pages:
+                    if p < 0:
+                        continue
+                    fp.add(p)
+                    n_freed += 1
+                # Pass 2: walk inward from the watermark, absorbing
+                # contiguous holes. Same final watermark as per-page
+                # processing, but one walk instead of N + (N-1) + ...
+                while wm > min_idx and (wm - 1) in fp:
+                    fp.discard(wm - 1)
+                    wm -= 1
+                self.watermark_physical = wm
+            else:
+                wm = self.watermark_physical
+                num_pages = self.num_pages
+                for p in pages:
+                    if p < 0:
+                        continue
+                    fp.add(p)
+                    n_freed += 1
+                while wm < num_pages - 1 and (wm + 1) in fp:
+                    fp.discard(wm + 1)
+                    wm += 1
+                self.watermark_physical = wm
+            return n_freed
 
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
         """Eager compaction over the freed PHYSICAL pages: move the survivor
@@ -1469,60 +1575,94 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         this to gate src reuse on read-path settling. Pass `None` to
         clear (no in-flight forward).
         """
-        self._latest_forward_done_event = event
+        with record_function("MultiEndedAlloc.set_latest_forward_done_event"):
+            self._latest_forward_done_event = event
 
-    def register_inflight_batch(
+    def set_inflight_forward(
         self,
         forward_done: "torch.cuda.Event",
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
-        """Register the just-launched forward batch's WRITE-set so
-        `_flush`'s case-A classification (§S37 Q3 step 2) can avoid
-        moving a survivor that the forward is about to `set_kv_buffer`.
+        """Scheduler-facing hook: stash the just-launched forward's
+        `forward_done` event AND its virtual `out_cache_loc` tensor so
+        `_flush`'s classification can check
+        whether a survivor candidate is about to be written.
 
-        `out_cache_loc_virtual` is the batch's `out_cache_loc` (virtual
-        token ids). We translate it through THIS allocator's `v2p` to
-        the corresponding physical PAGE ids and store the resulting set.
-        Pass `None` when this allocator's pool is not written by the
-        forward (e.g., the Mamba state pool — forward only READS mamba
-        state; mamba writes happen at alloc time).
+        IMPORTANT — no GPU work here. We only store references. The
+        write-set is materialized LAZILY inside `_flush` on
+        `schedule_stream`, and only when a survivor actually needs to
+        be checked. This avoids the eval_115 bottleneck where the
+        previous `register_inflight_batch` design materialized via
+        `phys.tolist()` from inside `forward_stream_ctx` — that sync
+        waited for the just-launched forward, costing 5–16 ms/forward
+        and dominating the cg_on × overlap × SWA per-step time.
 
-        No-op for eager mode and for empty batches.
+        Pass `out_cache_loc_virtual=None` when this allocator's pool is
+        not written by the forward (e.g., the Mamba state pool — the
+        forward only READS mamba state; mamba writes happen at alloc
+        time). A None tensor means "no in-flight write race possible
+        on this pool."
+
+        No-op for eager mode.
         """
-        if not self.lazy_compaction:
-            return
-        if out_cache_loc_virtual is None or out_cache_loc_virtual.numel() == 0:
-            self._inflight_batches.append((forward_done, set()))
-            return
-        # Translate virtual TOKEN ids → physical TOKEN ids via this
-        # allocator's v2p, then convert to physical PAGE ids on CPU.
-        # `.tolist()` incurs one bs-sized D2H per launched batch — a few
-        # microseconds — and is on schedule_stream (the same stream that
-        # produced v2p), so it does not cross-sync with forward_stream.
-        with record_function("MultiEndedAlloc.register_inflight_batch"):
-            phys_tokens = self.translate_kv_loc(out_cache_loc_virtual)
+        with record_function("MultiEndedAlloc.set_inflight_forward"):
+            if not self.lazy_compaction:
+                return
+            if out_cache_loc_virtual is None or out_cache_loc_virtual.numel() == 0:
+                # "No in-flight write race on this pool" — clear the slot so
+                # any prior stale entry is dropped (lets the prior tensor
+                # reference be GC'd) and `_flush` short-circuits without
+                # materializing. Used for the Mamba state pool, where the
+                # forward writes via mamba kernels not `set_kv_buffer`.
+                self._inflight_forward = None
+                return
+            # Just store references. No GPU work, no D2H, no sync.
+            self._inflight_forward = (forward_done, out_cache_loc_virtual)
+
+    def _materialize_inflight_write_set(self) -> Optional[Set[int]]:
+        """Lazily materialize the write-set of the currently-tracked
+        in-flight forward, called from inside `_flush` on the scheduler
+        thread (current stream = `schedule_stream`).
+
+        Returns the set of physical PAGE ids the in-flight forward is
+        about to write, or `None` if there's no in-flight forward OR
+        the forward has already completed. (Pools with no in-flight
+        write race — e.g., Mamba state pool — have `_inflight_forward
+        is None` directly, via `set_inflight_forward(_, None)`.)
+
+        Cost: ~50 µs in typical case (small `schedule_stream` queue;
+        bs-sized int64 D2H). The fundamental `.tolist()` sync goes on
+        `schedule_stream` which is light at flush-call sites. Materializes ONCE per `_flush` call, only when
+        the call has at least one survivor candidate to classify; most
+        calls early-exit at the empty-set fast-path and never reach
+        here.
+        """
+        inflight = self._inflight_forward
+        if inflight is None:
+            return None
+        event, oclv = inflight
+        # If the forward has already completed, no write race is possible.
+        # Clear the slot so subsequent flushes in the same scheduler
+        # tick don't re-check the same fired event.
+        if event.query():
+            self._inflight_forward = None
+            return None
+        # `oclv` cannot be None here: `set_inflight_forward(_, None)`
+        # explicitly clears `_inflight_forward` instead of storing a
+        # tuple, so a non-None `_inflight_forward` always has a valid
+        # virtual `out_cache_loc` tensor.
+        with record_function("MultiEndedAlloc._materialize_inflight_write_set"):
+            phys_tokens = self.translate_kv_loc(oclv)
             if self.page_size > 1:
                 phys_pages = (phys_tokens // self.page_size).unique()
             else:
                 phys_pages = phys_tokens
-            write_pages: Set[int] = set(phys_pages.tolist())
-        self._inflight_batches.append((forward_done, write_pages))
-
-    def _active_write_set(self) -> Set[int]:
-        """Prune `_inflight_batches` of settled entries (event already
-        fired) and return the UNION of remaining write-sets. CPU-only,
-        O(total pages across in-flight batches). Sync-free — calls
-        `event.query()` only.
-        """
-        kept: List[Tuple["torch.cuda.Event", Set[int]]] = []
-        union: Set[int] = set()
-        for ev, ws in self._inflight_batches:
-            if ev.query():
-                continue
-            kept.append((ev, ws))
-            union |= ws
-        self._inflight_batches = kept
-        return union
+            # .tolist() syncs schedule_stream (current stream). At all
+            # `_flush` call sites schedule_stream has only small allocator
+            # state writes queued (v2p scatters, sub-µs); the big memcpy
+            # (Phase A) or compaction copy (Phase B) is either drained or
+            # not on this stream. Typical wait: tens of µs.
+            return set(phys_pages.tolist())
 
     def _release_phys_page(self, p: int) -> None:
         """Return a single freed physical PAGE id to the available pool.
@@ -1570,25 +1710,52 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
           * urgent: `wait_event` on any unfired event, then release.
 
         Used at the start of `_flush` and inside the alloc-retry path.
-        Pages released this way go back through `_release_phys_page`
-        (boundary-shortcut or `_free_phys_pages`).
+        Pages released this way go back through
+        `_release_phys_pages_batch` (boundary-shortcut or
+        `_free_phys_pages`).
+
+        Batching: pages added by a single
+        `_commit_move_batch` all share the SAME `latest_event` object
+        reference. Grouping the dict by event identity and querying each
+        unique event ONCE — instead of per page — cuts the CUDA driver
+        call rate from O(M) to O(distinct_events), where typical
+        distinct_events is 1-3 per flush. For M=hundreds of pending
+        pages this saves hundreds of µs per drain.
         """
         if not self._pending_reuse:
             return
-        # Iterate over a snapshot of items so we can mutate the dict.
-        to_release: List[int] = []
-        for p, event in self._pending_reuse.items():
-            if event is None or event.query():
-                to_release.append(p)
-            elif urgent:
-                torch.cuda.current_stream().wait_event(event)
-                to_release.append(p)
-        for p in to_release:
-            del self._pending_reuse[p]
-            self._release_phys_page(p)
+        with record_function("MultiEndedAlloc._drain_pending_reuse"):
+            # Group pages by event identity. `torch.cuda.Event` uses
+            # default Python object identity for hashing — entries added
+            # by the same `_commit_move_batch` share the same Event
+            # reference, so they group into one bucket.
+            by_event: Dict[
+                Optional["torch.cuda.Event"], List[int]
+            ] = {}
+            for p, ev in self._pending_reuse.items():
+                by_event.setdefault(ev, []).append(p)
+
+            # Decide which buckets release. event.query() is called
+            # ONCE per unique event regardless of how many pages share
+            # it.
+            to_release: List[int] = []
+            for ev, page_list in by_event.items():
+                if ev is None or ev.query():
+                    to_release.extend(page_list)
+                elif urgent:
+                    torch.cuda.current_stream().wait_event(ev)
+                    to_release.extend(page_list)
+            for p in to_release:
+                del self._pending_reuse[p]
+            # Single batched release — also amortizes the boundary-walk
+            # over the released pages (one walk instead of len(released)
+            # walks).
+            self._release_phys_pages_batch(to_release)
 
     def _topmost_survivor(
-        self, exclude: Optional[Set[int]] = None
+        self,
+        exclude: Optional[Set[int]] = None,
+        start_hint: Optional[int] = None,
     ) -> Optional[int]:
         """Find the topmost live PAGE in the allocated band (direction-
         aware), excluding holes in `_free_phys_pages`, pages held in
@@ -1600,11 +1767,29 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
         For grow-up: largest `p < watermark_physical` satisfying the
         exclusions. For grow-down: smallest `p > watermark_physical`
-        satisfying them. Returns `None` if no candidate exists. CPU-only,
-        O(1) per step.
+        satisfying them. Returns `None` if no candidate exists.
+
+        `start_hint`: if provided, begin the
+        scan at this physical-page index instead of the boundary. Used
+        by `_flush` to thread a cursor across its inner loop so the
+        total survivor walk is O(K) over the whole flush call, NOT
+        O(K²) — the latter is what caused the Falcon × radix ×
+        stress post-completion hang (~40 min spent in `_flush` after
+        prior workloads fragmented the allocator band). Callers MUST maintain the invariant that the
+        hint never points to a position the previous iteration has
+        already cleared. Defensive clamping handles a stale hint that
+        crossed the boundary (e.g., absorbed by a watermark shortcut)
+        by snapping it back to the boundary.
         """
         if self.grow_direction == "up":
-            p = self.watermark_physical - 1
+            # Caller's `start_hint` is the upper bound of the scan. A
+            # stale hint above `watermark_physical - 1` (the watermark
+            # may have shrunk via boundary shortcut) is safely clamped
+            # so we never scan invalid positions.
+            if start_hint is None or start_hint >= self.watermark_physical:
+                p = self.watermark_physical - 1
+            else:
+                p = start_hint
             while p >= self.min_page_index:
                 if (
                     p in self._free_phys_pages
@@ -1616,7 +1801,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return p
             return None
         else:
-            p = self.watermark_physical + 1
+            if start_hint is None or start_hint <= self.watermark_physical:
+                p = self.watermark_physical + 1
+            else:
+                p = start_hint
             while p < self.num_pages:
                 if (
                     p in self._free_phys_pages
@@ -1679,8 +1867,28 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return 0
         with record_function("MultiEndedAlloc._flush"):
             self._drain_pending_reuse(urgent=urgent)
-            write_set = self._active_write_set()
             latest_event = self._latest_forward_done_event
+
+            # Lazy write-set
+            # materialization. `write_set is None` means "not yet
+            # materialized — do it inline on first survivor that needs
+            # the check." An empty `set()` means "no in-flight write
+            # race possible (no in-flight forward / forward already
+            # done / Mamba state pool / urgent-wait just drained
+            # the forward)." Otherwise it's the materialized
+            # physical-page set.
+            #
+            # Most flushes never reach the survivor-pick loop (empty-
+            # set fast-path in `flush_opportunistic`), so the bs-sized
+            # D2H inside `_materialize_inflight_write_set` is paid
+            # ONLY when actually needed.
+            #
+            # The in-flight forward set is FROZEN for the duration of
+            # this `_flush` call (the scheduler thread is the only
+            # writer to `_inflight_forward`, and it's currently in
+            # this function). So a single materialization is valid
+            # for the whole loop.
+            write_set: Optional[Set[int]] = None  # None = not yet materialized
 
             # Accumulated move batch — committed in one shot below.
             srcs: List[int] = []
@@ -1690,14 +1898,49 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # page we've already accepted into this flush's batch.
             in_progress: Set[int] = set()
 
+            # Flush-local survivor cursor.
+            # `_topmost_survivor` uses this as the scan start, then we
+            # advance it strictly past the just-picked src so the next
+            # iteration begins from there. Without it, every call walks
+            # from the boundary inward and pays an O(K) cost in the
+            # holes already encountered, giving O(K²) per flush — the
+            # Falcon × radix × stress hang root cause.
+            # `None` means "use the boundary"; we reset to None after
+            # a write-race urgent-wait splits the loop, since events
+            # may have changed which pages count as survivors.
+            cursor: Optional[int] = None
+
+            # Per-call move cap on non-urgent
+            # flushes. See the `_lazy_max_moves_per_call` initialization
+            # in `__init__` for the rationale. We cap the count of moves
+            # *committed* in this call, NOT the count of iterations of
+            # the loop body, so a flush that finds many holes but few
+            # eligible survivors (everything in write_set) still
+            # terminates promptly via the existing `break` paths.
+            move_cap = (
+                self._lazy_max_moves_per_call
+                if not urgent
+                else None
+            )
+
             n_moves = 0
             while self._free_phys_pages:
-                src = self._topmost_survivor(exclude=in_progress)
+                src = self._topmost_survivor(
+                    exclude=in_progress, start_hint=cursor
+                )
                 if src is None:
                     break
 
                 # Case A: write race.
-                if src in write_set:
+                # Lazy materialization — only on the FIRST survivor that
+                # we might need to classify. After this, `write_set` is
+                # either a populated set or an empty set (if no in-flight
+                # forward / forward already done / forward writes no
+                # slots in this pool).
+                if write_set is None:
+                    materialized = self._materialize_inflight_write_set()
+                    write_set = materialized if materialized is not None else set()
+                if write_set and src in write_set:
                     if urgent:
                         # Commit any moves accumulated so far so the copy
                         # overlaps with what schedule_stream was doing.
@@ -1709,13 +1952,22 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         dsts.clear()
                         v_moveds.clear()
                         in_progress.clear()
-                        # Wait on every in-flight event so subsequent
-                        # compaction (this src or the next) is clear.
-                        for ev, _ in self._inflight_batches:
-                            torch.cuda.current_stream().wait_event(ev)
-                        self._inflight_batches.clear()
-                        write_set = set()
+                        # Wait on the in-flight forward's event so
+                        # subsequent compaction (this src or the next)
+                        # is clear of the write race. With the
+                        # simplified design there's at most ONE
+                        # in-flight forward, so we wait on
+                        # the single event in `_inflight_forward`.
+                        inflight = self._inflight_forward
+                        if inflight is not None:
+                            torch.cuda.current_stream().wait_event(inflight[0])
+                            self._inflight_forward = None
+                        write_set = set()  # forward drained → no race
                         latest_event = None
+                        # Cursor reset: write-set just emptied, so any
+                        # position above is now a fresh candidate; start
+                        # the next scan from the boundary again.
+                        cursor = None
                         continue  # retry this src under empty write-set
                     else:
                         # Non-urgent: top blocker → STOP the walk.
@@ -1748,6 +2000,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 v_moveds.append(v_moved)
                 in_progress.add(src)
                 in_progress.add(dst)
+
+                # Flush-local survivor cursor: advance cursor strictly past the picked
+                # src so the next call's scan starts there. Direction-
+                # aware: grow-up walks toward lower indices, grow-down
+                # toward higher.
+                if self.grow_direction == "up":
+                    cursor = src - 1
+                else:
+                    cursor = src + 1
+
+                # Per-call move cap on non-urgent flushes. The remaining holes are
+                # picked up by the next opportunistic flush; the
+                # scheduler stays responsive in the meantime.
+                if move_cap is not None and len(srcs) >= move_cap:
+                    break
 
             # Commit any final accumulated batch.
             self._commit_move_batch(srcs, dsts, v_moveds, latest_event)
@@ -1831,8 +2098,34 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         points (`on_idle` / `disable_overlap_for_batch` boundary). Drains
         `_pending_reuse` for fired events and compacts where holes exist;
         never blocks `schedule_stream`. No-op if `lazy_compaction=False`.
+
+        Empty-set fast-path: the scheduler triggers this
+        ~1200×/forward (profile counted 243K calls in 200 iters),
+        and 99% hit the empty state where there is no work to do. Without
+        this early exit, every call pays the cost of entering
+        `_flush`'s `record_function` context, calling `_drain_pending_reuse`,
+        and walking `_inflight_batches` via `_active_write_set`.
+
+        Gate refinement: the original gate also
+        required `_inflight_batches` to be empty, but under overlap mode
+        that list is almost always non-empty (1–3 pipelined forwards), so
+        the gate never fired and the residual `sched=overlap × cg=on`
+        ~5.8% regression persisted. The refinement: skip whenever there
+        is no compaction work that could possibly be done — i.e., no
+        holes to compact AND no pending entries to drain. `_inflight_batches`
+        is only consulted INSIDE `_flush` (via `_active_write_set`) to
+        classify survivors against the in-flight write-set during a
+        compaction; if we have no compaction to do, the in-flight list is
+        irrelevant. Proofs 1–5 still hold because the gate is
+        a strict subset of `_flush`'s internal predicates: skipping when
+        there is no work to do can never introduce a correctness bug.
         """
-        return self._flush(urgent=False)
+        with record_function("MultiEndedAlloc.flush_opportunistic"):
+            if not self.lazy_compaction:
+                return 0
+            if not self._free_phys_pages and not self._pending_reuse:
+                return 0
+            return self._flush(urgent=False)
 
     def _raise_stale_slot_assertion(self, *, free_v, freed_p) -> None:
         bad = free_v[freed_p < 0].tolist()
@@ -2131,36 +2424,65 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Scheduler-facing: forwards the per-batch `forward_done` event to
         BOTH sub-allocators so each side's `_flush` can gate src reuse on
         the in-flight reader settling. No-op when `lazy_compaction=False`."""
-        self.full_attn_allocator.set_latest_forward_done_event(event)
-        self.mamba_allocator.set_latest_forward_done_event(event)
+        with record_function("SharedMambaAlloc.set_latest_forward_done_event"):
+            self.full_attn_allocator.set_latest_forward_done_event(event)
+            self.mamba_allocator.set_latest_forward_done_event(event)
 
-    def register_inflight_batch(
+    def set_inflight_forward(
         self,
         forward_done: "torch.cuda.Event",
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
-        """Register the just-launched forward's WRITE-set per sub-pool.
+        """Hand the just-launched forward's metadata to BOTH sub-pools.
+
+        Replaces the earlier `register_inflight_batch` design — see
+        `MultiEndedAllocator.set_inflight_forward` for why
+        we now store the tensor reference instead of materializing the
+        write-set at launch time.
+
         The full-attention sub-pool's write-set is derived from
-        `out_cache_loc` (which holds virtual token ids for new-token KV
-        writes). The Mamba state sub-pool is NOT written by the forward
-        via `out_cache_loc` (mamba state lives in conv/temporal buffers
+        `out_cache_loc` (virtual token ids for new-token KV writes).
+        The Mamba state sub-pool is NOT written by the forward via
+        `out_cache_loc` (mamba state lives in conv/temporal buffers
         and is updated by mamba kernels, not `set_kv_buffer`), so its
-        write-set is empty (`None`)."""
-        self.full_attn_allocator.register_inflight_batch(
-            forward_done, out_cache_loc_virtual
-        )
-        self.mamba_allocator.register_inflight_batch(forward_done, None)
+        in-flight tensor is `None` — `_flush` on the Mamba side will
+        see "no in-flight write race" and skip the check.
+        """
+        with record_function("SharedMambaAlloc.set_inflight_forward"):
+            self.full_attn_allocator.set_inflight_forward(
+                forward_done, out_cache_loc_virtual
+            )
+            self.mamba_allocator.set_inflight_forward(forward_done, None)
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators. Called by the
         scheduler at quiescent points (`on_idle` /
         `disable_overlap_for_batch` boundary). Sync-free on
         `schedule_stream` — only polls events. No-op when
-        `lazy_compaction=False`."""
-        return (
-            self.full_attn_allocator.flush_opportunistic()
-            + self.mamba_allocator.flush_opportunistic()
-        )
+        `lazy_compaction=False`.
+
+        Composite-level empty-set fast-path: when neither
+        sub-allocator has work to do, skip both function calls entirely.
+        The sub-allocator-level fast-path (per `flush_opportunistic`
+        above) already exits cheaply on the empty state; this composite
+        gate just avoids the two function-call frames + Python integer
+        addition when both are empty — a small but per-scheduler-tick
+        saving that compounds with the per-sub-pool gate.
+        """
+        with record_function("SharedMambaAlloc.flush_opportunistic"):
+            # Gate refinement matches the per-sub-pool gate (§Q5/Fix-2 in
+            # eval_110 analysis): `_inflight_batches` is irrelevant when
+            # there is no compaction or drain work to do. Under overlap
+            # mode it is almost always non-empty, so including it in the
+            # gate made the fast-path almost never fire.
+            fa = self.full_attn_allocator
+            ma = self.mamba_allocator
+            if (
+                not fa._free_phys_pages and not fa._pending_reuse
+                and not ma._free_phys_pages and not ma._pending_reuse
+            ):
+                return 0
+            return fa.flush_opportunistic() + ma.flush_opportunistic()
 
 
 class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
@@ -2836,32 +3158,51 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     ) -> None:
         """Forwards the per-batch `forward_done` event to BOTH sub-
         allocators. No-op when `lazy_compaction=False`."""
-        self.full_attn_allocator.set_latest_forward_done_event(event)
-        self.swa_attn_allocator.set_latest_forward_done_event(event)
+        with record_function("SharedSWAAlloc.set_latest_forward_done_event"):
+            self.full_attn_allocator.set_latest_forward_done_event(event)
+            self.swa_attn_allocator.set_latest_forward_done_event(event)
 
-    def register_inflight_batch(
+    def set_inflight_forward(
         self,
         forward_done: "torch.cuda.Event",
         out_cache_loc_virtual: Optional[torch.Tensor],
     ) -> None:
-        """Forwards `out_cache_loc` (virtual token ids) to BOTH sub-
-        allocators. Each sub-allocator translates via its OWN v2p
-        (full ↦ full-physical, swa ↦ swa-physical) so the resulting
-        write-sets are correct per side. The forward writes
-        `set_kv_buffer` on BOTH sides for every new token, so both
-        sub-pools have non-empty write-sets per batch."""
-        self.full_attn_allocator.register_inflight_batch(
-            forward_done, out_cache_loc_virtual
-        )
-        self.swa_attn_allocator.register_inflight_batch(
-            forward_done, out_cache_loc_virtual
-        )
+        """Hand the just-launched forward's metadata to BOTH sub-pools.
+
+        Replaces the earlier `register_inflight_batch` design. Each sub-allocator stores the tensor reference;
+        the actual write-set is materialized lazily inside `_flush`
+        via the sub-allocator's OWN v2p (full ↦ full-physical,
+        swa ↦ swa-physical) so the resulting write-sets are correct
+        per side. The forward writes `set_kv_buffer` on BOTH sides
+        for every new token, so both sub-pools have non-empty
+        in-flight tensors per batch.
+        """
+        with record_function("SharedSWAAlloc.set_inflight_forward"):
+            self.full_attn_allocator.set_inflight_forward(
+                forward_done, out_cache_loc_virtual
+            )
+            self.swa_attn_allocator.set_inflight_forward(
+                forward_done, out_cache_loc_virtual
+            )
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators. Sync-free. Called by
         the scheduler at quiescent points. No-op when
-        `lazy_compaction=False`."""
-        return (
-            self.full_attn_allocator.flush_opportunistic()
-            + self.swa_attn_allocator.flush_opportunistic()
-        )
+        `lazy_compaction=False`.
+
+        Composite-level empty-set fast-path: see the Mamba
+        composite above for the rationale. Closes the dominant per-tick
+        overhead under `sched=overlap × cg=on` where
+        cg_on's ~10× shorter GPU step amplified the CPU bookkeeping cost.
+        """
+        with record_function("SharedSWAAlloc.flush_opportunistic"):
+            # Gate refinement: _inflight_batches is irrelevant
+            # when there's no compaction or drain work to do.
+            fa = self.full_attn_allocator
+            sa = self.swa_attn_allocator
+            if (
+                not fa._free_phys_pages and not fa._pending_reuse
+                and not sa._free_phys_pages and not sa._pending_reuse
+            ):
+                return 0
+            return fa.flush_opportunistic() + sa.flush_opportunistic()
