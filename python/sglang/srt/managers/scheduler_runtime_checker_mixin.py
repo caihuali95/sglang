@@ -559,21 +559,35 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def on_idle(self: Scheduler):
-        """Idle housekeeping: guard, check, metrics, reset, sleep."""
-        if not self.is_fully_idle():
-            return
+        """Idle housekeeping: guard, check, metrics, reset, sleep.
 
-        # Opportunistic flush: reclaim lazy-compaction
-        # holes into the gap while the GPU is idle. Sync-free on
-        # schedule_stream (polls events only). No-op for non-lazy /
-        # non-shared-pool allocators (the method only exists on the
-        # shared-pool composites). Best-effort — wrap defensively.
+        The opportunistic flush
+        runs BEFORE the `is_fully_idle()` gate, not after it. The
+        previous structure gated the flush on full idle, but
+        `_pending_reuse` entries can be reclaimed as soon as their
+        reader event fires — independent of whether other requests are
+        still running. With the gate in place, the workload-tail
+        (`running-req` small but >0) accumulated pending entries that
+        never drained, causing the alloc-shortfall hang on
+        Mamba × radix × stress. Draining unconditionally
+        per scheduler tick eliminates the accumulation. The fast-path
+        in `flush_opportunistic` (see multi_ended_allocator.py:1824)
+        makes this O(1) when the allocator has nothing to do, so the
+        relocation does not add scheduler-hot-path cost.
+        """
+        # ALWAYS drain — _pending_reuse can be released even when there
+        # are running requests; only the leak check / sleep need full idle.
         allocator = getattr(self, "token_to_kv_pool_allocator", None)
         if allocator is not None and hasattr(allocator, "flush_opportunistic"):
             try:
                 allocator.flush_opportunistic()
             except Exception:
                 pass  # idle-path housekeeping; do not fault the scheduler
+
+        # The rest of on_idle's housekeeping (leak check, metrics, sleep)
+        # still requires full idle.
+        if not self.is_fully_idle():
+            return
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

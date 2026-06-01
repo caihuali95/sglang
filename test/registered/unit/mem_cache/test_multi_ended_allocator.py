@@ -2142,12 +2142,16 @@ class TestLazyCompaction(unittest.TestCase):
         # Free a non-boundary slot to create a compactable hole.
         fa.free(a[1:2].clone())
         self.assertEqual(len(fa._free_phys_pages), 1)
-        # Register an in-flight batch whose write-set INCLUDES the
-        # topmost survivor (the physical bound to a[-1]).
+        # Register an in-flight forward whose write-set INCLUDES the
+        # topmost survivor. Under the post-eval_115 Q3 simplification
+        # we pass the virtual `out_cache_loc` TENSOR (not a materialized
+        # physical set) — `_flush` translates it lazily on the
+        # scheduler thread when classifying survivors.
         topmost_phys = int(
             fa.virtual_to_physical[int(a[-1].item())].item()
         )
-        fa._inflight_batches.append((ev, {topmost_phys}))
+        oclv = a[-1:].clone()  # virtual id that translates to topmost_phys
+        fa.set_inflight_forward(ev, oclv)
         # Non-urgent flush → case A blocker at the top → STOP.
         n_moves = fa._flush(urgent=False)
         self.assertEqual(
@@ -2186,9 +2190,13 @@ class TestLazyCompaction(unittest.TestCase):
         fa.set_latest_forward_done_event(ev)
         # Free a non-boundary slot → 1 hole.
         fa.free(a[1:2].clone())
-        # Empty write-set for the in-flight batch → topmost survivor is
-        # NOT in the write-set → compact proceeds, src goes to pending.
-        fa._inflight_batches.append((ev, set()))
+        # Empty in-flight write-set for the in-flight forward → topmost
+        # survivor is NOT in the write-set → compact proceeds, src goes
+        # to pending. Pass `None` (or an empty tensor) for
+        # `out_cache_loc_virtual` to signal "no write race on this pool"
+        # — this is the same path Mamba uses (forward writes mamba state
+        # via its own kernels, not via `out_cache_loc`).
+        fa.set_inflight_forward(ev, None)
         n_moves = fa._flush(urgent=False)
         self.assertGreaterEqual(n_moves, 1)
         # src is in _pending_reuse, gated on the unfired event.

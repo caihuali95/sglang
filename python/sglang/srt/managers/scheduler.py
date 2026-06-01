@@ -3058,15 +3058,19 @@ class Scheduler(
                     allocator = self.token_to_kv_pool_allocator
                     if hasattr(allocator, "set_latest_forward_done_event"):
                         allocator.set_latest_forward_done_event(forward_done)
-                    # Stage 3.7 (§S37) Q3 step 2 — write-set classification.
-                    # Hand the allocator the virtual `out_cache_loc` of this
-                    # forward so its `_flush` can refuse to compact any
-                    # survivor that this forward is about to `set_kv_buffer`
-                    # (case A — write race). The allocator translates
-                    # internally via its own v2p. Cheap: one bs-sized D2H
-                    # per launched batch on schedule_stream.
-                    if hasattr(allocator, "register_inflight_batch"):
-                        allocator.register_inflight_batch(
+                    # Write-set classification.
+                    # Hand the allocator the virtual `out_cache_loc` of
+                    # this forward as a TENSOR REFERENCE (no GPU work
+                    # here — the earlier `register_inflight_batch`
+                    # design materialized via `.tolist()` inside this
+                    # forward_stream_ctx and forced a sync on the
+                    # just-launched forward, costing 5-16 ms/forward
+                    # under SWA × overlap × cg_on).
+                    # The allocator's `_flush` materializes the
+                    # write-set lazily on schedule_stream only when a
+                    # survivor candidate actually needs to be checked.
+                    if hasattr(allocator, "set_inflight_forward"):
+                        allocator.set_inflight_forward(
                             forward_done,
                             getattr(model_worker_batch, "out_cache_loc", None),
                         )
