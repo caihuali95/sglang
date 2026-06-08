@@ -1,7 +1,7 @@
 """Parity tests for Stage 3.6.1 — the `store_cache_4d` Triton kernel.
 
 The new kernel replaces the per-call PyTorch advanced-indexing write
-path in ``SharedMHATokenToKVPool._do_set_kv_buffer``. These tests prove
+path in ``SharedMHATokenToKVPool.set_kv_buffer``. These tests prove
 the kernel produces byte-identical output to the legacy advanced-
 indexing path on representative fixtures:
 
@@ -290,7 +290,7 @@ class TestStoreCache4DAssertions(unittest.TestCase):
 @unittest.skipUnless(_HAS_CUDA, "Triton kernels require CUDA")
 class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
     """Integration parity test — exercises the kernel through the FULL
-    ``SharedMHATokenToKVPool._do_set_kv_buffer`` path, including the
+    ``SharedMHATokenToKVPool.set_kv_buffer`` path, including the
     ``_external_allocator`` v2p translation, the dtype cast, and the
     env-gated dispatch. Confirms the production code path produces
     bit-identical output to the legacy ``SGLANG_DISABLE_STORE_CACHE_4D=1``
@@ -365,7 +365,7 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
         kv_pool = self._build_pool_and_stub_alloc(page_size)
 
         # A fake `layer` object with the minimum interface
-        # `_do_set_kv_buffer` reads: `.layer_id`.
+        # `set_kv_buffer` reads: `.layer_id`.
         class _FakeLayer:
             layer_id = 0
 
@@ -460,7 +460,7 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
         v_slow = kv_pool.v_buffer[0].clone()
 
         # FAST path: precompute the full-physical loc exactly as
-        # `_do_set_kv_buffer`'s page math would, pin it via set_loc, and pass
+        # `set_kv_buffer`'s page math would, pin it via set_loc, and pass
         # it as `loc` so the data-ptr fast path fires (no gather).
         if page_size == 1:
             phys = _t.clamp_min(v2p[loc], 0)
