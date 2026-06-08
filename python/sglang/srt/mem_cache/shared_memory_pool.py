@@ -39,7 +39,9 @@ from sglang.srt.mem_cache.memory_pool import (
     move_kv_cache_native,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.utils import store_cache_4d
+import triton
+
+from sglang.srt.mem_cache.utils import store_cache_4d_kernel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -696,133 +698,140 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
         v_scale=None,
         layer_id_override: Optional[int] = None,
     ):
-        # Profiling: thin wrapper adds a named region around the
-        # body so torch.profiler can attribute time to this method. Costs
-        # nothing when no profiler is active (record_function is a no-op
-        # then). Body is in `_do_set_kv_buffer`.
-        with record_function("SharedMHA.set_kv_buffer"):
-            self._do_set_kv_buffer(
-                layer, loc, cache_k, cache_v, k_scale, v_scale, layer_id_override
-            )
-
-    def _do_set_kv_buffer(
-        self,
-        layer,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale,
-        v_scale,
-        layer_id_override: Optional[int],
-    ):
-        # Stage 3.6: always-bypass-super() write path.
+        # Stage 3.7.1 O1: collapsed wrapper chain. Previously this method
+        # was a thin `record_function` wrapper around `_do_set_kv_buffer`,
+        # which in turn called `store_cache_4d` (the Python launcher) which
+        # finally invoked `store_cache_4d_kernel`. The 5-frame chain added
+        # ~141 µs/call vs baseline's 58 µs (measured in eval_121 profile).
+        # This method now does all the work in ONE frame and calls
+        # `store_cache_4d_kernel` directly, bypassing the Python launcher
+        # for the hot path. The standalone `store_cache_4d` wrapper in
+        # `utils.py` stays for any non-shared-pool callers (and as a
+        # validated reference impl) — we deliberately bypass it here for
+        # latency, since the contract is guaranteed by `_build_mha_views`.
         #
-        # Why bypass `super().set_kv_buffer(...)`?
-        # The parent `MHATokenToKVPool.set_kv_buffer` routes through
+        # Stage 3.6 (still applies): always-bypass-super() write path.
+        # Why bypass `super().set_kv_buffer(...)`? The parent
+        # `MHATokenToKVPool.set_kv_buffer` routes through
         # `_set_kv_buffer_impl` which calls `k_cache.view(-1, row_dim)`
         # before invoking the `store_cache` Triton kernel. PyTorch's
         # `view()` requires `stride[i] == shape[i+1] * stride[i+1]` for the
         # dimensions being merged. Our 4-D layer-major view
         # `(num_pages, page_size, head_num, head_dim)` has
-        # `stride[0] = page_bytes/itemsize = layer_num * page_size *
-        # (k_row + v_row) / itemsize` but `page_size * stride[1] =
-        # page_size * k_row/itemsize` — different by a factor of
-        # `layer_num * (1 + v_row/k_row)`. So `.view(-1, row_dim)` raises
-        # at LAYER_MAJOR (page_size > 1). At page_size == 1 the math
-        # happens to satisfy the merge rule, but we use the same code path
-        # for consistency (one path, predictable behavior).
-        #
-        # Step 1: resolve `loc` to PHYSICAL TOKEN ids.
-        # Step 1a: fast path — if `_precomputed_loc` matches
-        # `loc` (by data_ptr+shape), use the precomputed full-physical
-        # value directly.
-        if (
-            self._precomputed_loc is not None
-            and loc is not None
-            and loc.data_ptr() == self._precomputed_loc.data_ptr()
-            and loc.shape == self._precomputed_loc.shape
-        ):
-            loc = self._precomputed_loc
-        elif self._external_allocator is not None:
-            # Step 1b: `loc` arrives as VIRTUAL TOKEN ids (shared-pool
-            # path); translate to physical TOKEN ids. Page-aware math:
-            #   virt_pages = loc // page_size
-            #   offsets = loc % page_size
-            #   phys_tokens = v2p[virt_pages] * page_size + offsets
-            # At ps=1 this is just `v2p[loc]`. Tombstoned entries (-1 in
-            # v2p, from free / _compact_pending) are clamped to 0 so any
-            # write lands in physical slot 0 (the padding sink —
-            # `min_slot_index` invariant). Safe by the dummy-write
-            # proof.
-            if self._page_size == 1:
-                loc = self._external_allocator.virtual_to_physical[loc]
-                loc = torch.clamp_min(loc, 0)
-            else:
-                ps = self._page_size
-                virt_pages = loc // ps
-                offsets = loc % ps
-                phys_pages = self._external_allocator.virtual_to_physical[
-                    virt_pages
-                ]
-                loc = phys_pages * ps + offsets
-                loc = torch.clamp_min(loc, 0)
+        # `stride[0] = page_bytes/itemsize` which doesn't satisfy that
+        # merge rule at page_size > 1; we use the same code path at
+        # page_size == 1 for consistency.
+        with record_function("SharedMHA.set_kv_buffer"):
+            # Step 1: resolve `loc` to PHYSICAL TOKEN ids.
+            # Step 1a: fast path — if `_precomputed_loc` matches `loc`
+            # (by data_ptr+shape), use the precomputed full-physical value
+            # directly.
+            if (
+                self._precomputed_loc is not None
+                and loc is not None
+                and loc.data_ptr() == self._precomputed_loc.data_ptr()
+                and loc.shape == self._precomputed_loc.shape
+            ):
+                loc = self._precomputed_loc
+            elif self._external_allocator is not None:
+                # Step 1b: `loc` arrives as VIRTUAL TOKEN ids (shared-pool
+                # path); translate to physical TOKEN ids. Page-aware math:
+                #   virt_pages = loc // page_size
+                #   offsets = loc % page_size
+                #   phys_tokens = v2p[virt_pages] * page_size + offsets
+                # At ps=1 this is just `v2p[loc]`. Tombstoned entries (-1 in
+                # v2p, from free / _compact_pending) are clamped to 0 so any
+                # write lands in physical slot 0 (the padding sink —
+                # `min_slot_index` invariant). Safe by the dummy-write proof.
+                if self._page_size == 1:
+                    loc = self._external_allocator.virtual_to_physical[loc]
+                    loc = torch.clamp_min(loc, 0)
+                else:
+                    ps = self._page_size
+                    virt_pages = loc // ps
+                    offsets = loc % ps
+                    phys_pages = self._external_allocator.virtual_to_physical[
+                        virt_pages
+                    ]
+                    loc = phys_pages * ps + offsets
+                    loc = torch.clamp_min(loc, 0)
 
-        # Step 2: replicate the parent's dtype-cast logic inline.
-        if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
-        if self.store_dtype != self.dtype:
-            cache_k = cache_k.view(self.store_dtype)
-            cache_v = cache_v.view(self.store_dtype)
+            # Step 2: replicate the parent's dtype-cast logic inline.
+            if cache_k.dtype != self.dtype:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
+            if self.store_dtype != self.dtype:
+                cache_k = cache_k.view(self.store_dtype)
+                cache_v = cache_v.view(self.store_dtype)
 
-        # Step 3: write into the 4-D layer-major view.
-        # Default: single-launch Triton `store_cache_4d`
-        # kernel. At page_size=1 it constexpr-folds to byte-identical
-        # addresses as the slot-major envelope view; at page_size>1 it
-        # uses the same (page_id, tok_in_p) split the kernel-side
-        # attention reads use.
-        # Fallback (env-gated): legacy PyTorch advanced-indexing path.
-        # Kept behind `SGLANG_DISABLE_STORE_CACHE_4D=1` for production
-        # A/B and quick rollback. See plan-file §S361 (action plan) and
-        # design-doc §19 (the eval journey that motivated this kernel).
-        layer_id = (
-            layer.layer_id if layer_id_override is None else layer_id_override
-        ) - self.start_layer
-        k_view = self.k_buffer[layer_id]
-        v_view = self.v_buffer[layer_id]
-        ps = self._page_size
+            # Step 3: write into the 4-D layer-major view.
+            # Default: single-launch Triton `store_cache_4d_kernel` (called
+            # directly; the Python wrapper `store_cache_4d` in `utils.py`
+            # is bypassed for latency since its validation asserts are
+            # guaranteed by `_build_mha_views`).
+            # Fallback (env-gated): legacy PyTorch advanced-indexing.
+            # See plan-file §S361 (Stage 3.6.1 action plan) and design-doc
+            # §19 for the eval journey that motivated the Triton kernel.
+            layer_id = (
+                layer.layer_id if layer_id_override is None else layer_id_override
+            ) - self.start_layer
+            k_view = self.k_buffer[layer_id]
+            v_view = self.v_buffer[layer_id]
+            ps = self._page_size
 
-        if envs.SGLANG_DISABLE_STORE_CACHE_4D.get():
-            # Legacy PyTorch advanced-indexing write path. PyTorch resolves
-            # each (page, tok) pair to the right byte address via the
-            # view's strides — correct but decomposes into 5-7 small CUDA
-            # kernel launches per call (one `aten::index_put_` per K and V,
-            # plus intermediate `aten::empty`/`_to_copy`/etc.).
-            if ps == 1:
-                k_view[loc, 0] = cache_k
-                v_view[loc, 0] = cache_v
-            else:
-                page_id = loc // ps
-                tok_in_p = loc % ps
-                k_view[page_id, tok_in_p] = cache_k
-                v_view[page_id, tok_in_p] = cache_v
-        else:
-            # Triton single-launch write. Handles both ps=1 (constexpr-
-            # folded) and ps>1 (page split inside the kernel). The kernel
-            # asserts that the trailing (head_num, head_dim) dims of the
-            # view are contiguous — always true for `_build_mha_views`
-            # outputs.
-            store_cache_4d(
+            if envs.SGLANG_DISABLE_STORE_CACHE_4D.get():
+                # Legacy PyTorch advanced-indexing write path. PyTorch resolves
+                # each (page, tok) pair to the right byte address via the
+                # view's strides — correct but decomposes into 5-7 small CUDA
+                # kernel launches per call.
+                if ps == 1:
+                    k_view[loc, 0] = cache_k
+                    v_view[loc, 0] = cache_v
+                else:
+                    page_id = loc // ps
+                    tok_in_p = loc % ps
+                    k_view[page_id, tok_in_p] = cache_k
+                    v_view[page_id, tok_in_p] = cache_v
+                return
+
+            # Hot path: inline store_cache_4d's body (kernel launch only).
+            # The contract — 4-D K/V views with stride(-1)==1 and
+            # stride(-2)==head_dim, 3-D cache_k/cache_v with matching
+            # batch dim — is guaranteed by `_build_mha_views` (K/V) and
+            # the model forward (cache_k/cache_v). Skipping the wrapper's
+            # validation asserts saves ~10-30 µs/call; for a debug build
+            # use the legacy fallback via SGLANG_DISABLE_STORE_CACHE_4D.
+            N = loc.numel()
+            if N == 0:
+                return
+            head_num = k_view.shape[2]
+            head_dim = k_view.shape[3]
+            v_head_dim = v_view.shape[3]
+            K_ROW_DIM = head_num * head_dim
+            V_ROW_DIM = head_num * v_head_dim
+            BLOCK = 128
+            row_dim_max = K_ROW_DIM if K_ROW_DIM > V_ROW_DIM else V_ROW_DIM
+            store_cache_4d_kernel[(N, triton.cdiv(row_dim_max, BLOCK), 2)](
                 k_view,
                 v_view,
                 cache_k,
                 cache_v,
                 loc,
-                page_size=ps,
+                k_view.stride(0),
+                k_view.stride(1),
+                v_view.stride(0),
+                v_view.stride(1),
+                cache_k.stride(0),
+                cache_v.stride(0),
+                K_ROW_DIM=K_ROW_DIM,
+                V_ROW_DIM=V_ROW_DIM,
+                PAGE_SIZE=ps,
+                BLOCK=BLOCK,
+                num_warps=4,
             )
 
 
@@ -1680,7 +1689,7 @@ class SharedSWAKVPool(SWAKVPool):
         # Full layer. When the per-batch full-physical loc is pinned
         # (`set_full_loc` -> `self.full_loc`, also mirrored into
         # `full_kv_pool._precomputed_loc`), pass it so the data-ptr fast path
-        # in `SharedMHATokenToKVPool._do_set_kv_buffer` fires and SKIPS the
+        # in `SharedMHATokenToKVPool.set_kv_buffer` fires and SKIPS the
         # per-call `v2p[loc]` gather + clamp_min on this (and every other)
         # full-attention layer. `self.full_loc` is already full-PHYSICAL and
         # tombstone-clamped (`translate_kv_loc` clamps), so no re-translate is

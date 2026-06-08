@@ -79,7 +79,7 @@ def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
 # memory pool's 4-D envelope-strided K/V views.
 #
 # Replaces the per-call PyTorch advanced-indexing block in
-# `SharedMHATokenToKVPool._do_set_kv_buffer`. At `PAGE_SIZE = 1` the kernel
+# `SharedMHATokenToKVPool.set_kv_buffer`. At `PAGE_SIZE = 1` the kernel
 # constexpr-folds to byte-identical addresses as the slot-major envelope
 # view; at `PAGE_SIZE > 1` it uses the same `(page_id, tok_in_p)` split the
 # attention read kernels (`_fwd_kernel_stage1`, etc.) use.

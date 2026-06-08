@@ -268,7 +268,7 @@ class Envs:
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
     # Disable the Triton `store_cache_4d` kernel and fall back
     # to the legacy PyTorch advanced-indexing write path in
-    # `SharedMHATokenToKVPool._do_set_kv_buffer`. Used for production
+    # `SharedMHATokenToKVPool.set_kv_buffer`. Used for production
     # A/B and quick rollback. Default False (use the Triton kernel).
     SGLANG_DISABLE_STORE_CACHE_4D = EnvBool(False)
     # Disable lazy compaction in the shared memory pool allocator and
