@@ -2250,5 +2250,334 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertGreaterEqual(moves, 1)
 
 
+class TestO3FusedAllocBind(unittest.TestCase):
+    """Stage 3.7.1 §S371 O3 — fused take_physical_pages + bind_pages.
+
+    GPU-only tests (Triton kernel requires CUDA). Exercise the helper
+    `_alloc_bind_fast_or_slow` directly: fast-path correctness, slow-
+    path fallback when holes exist (Invariant B), overflow handling,
+    eager vs lazy modes, grow-up vs grow-down, and page_size > 1.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("O3 fused alloc-bind kernel requires CUDA")
+
+    def _make_full(
+        self,
+        *,
+        lazy: bool = True,
+        n_full_slots: int = 64,
+        n_mamba_slots: int = 16,
+        page_size: int = 1,
+    ):
+        full = _make_mha_spec("full", "up", layer_num=2)
+        mamba = _make_mamba_spec("mamba", "down", layer_num=2)
+        total = (
+            full.entry_bytes() * n_full_slots
+            + mamba.entry_bytes() * n_mamba_slots
+        )
+        pool = SharedMemoryPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device="cuda",
+            enable_memory_saver=False,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        fa = MultiEndedAllocator(
+            kvcache=full_kv,
+            shared_buffer=pool,
+            sub_pool_name="full",
+            device="cuda",
+            is_id_owner=True,
+            page_size=page_size,
+            lazy_compaction=lazy,
+        )
+        ma = MultiEndedAllocator(
+            kvcache=mamba_kv,
+            shared_buffer=pool,
+            sub_pool_name="mamba",
+            device="cuda",
+            is_id_owner=True,
+            page_size=1,  # mamba is per-request, always page=1
+            lazy_compaction=lazy,
+        )
+        fa.bind_peer(ma)
+        ma.bind_peer(fa)
+        return pool, fa, full_kv
+
+    def test_helper_exists_and_returns_tensor(self):
+        """The helper `_alloc_bind_fast_or_slow` is wired and returns a
+        tensor on success."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        v_pages = torch.tensor(
+            [10, 11, 12], dtype=torch.int64, device="cuda"
+        )
+        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
+        self.assertIsNotNone(phys)
+        self.assertEqual(phys.shape, (3,))
+        self.assertEqual(phys.dtype, torch.int64)
+        self.assertEqual(phys.device.type, "cuda")
+
+    def test_fast_path_when_no_holes(self):
+        """When `_free_phys_pages` is empty, the fast path fires.
+        Verifies: watermark advanced, v2p and p2v scattered correctly,
+        return tensor matches the kernel's arange."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        # Sanity: empty holeset.
+        self.assertEqual(len(fa._free_phys_pages), 0)
+        wm_before = fa.watermark_physical
+        # Pick virtual page ids the kernel will bind.
+        v_pages = torch.tensor(
+            [20, 21, 22, 23], dtype=torch.int64, device="cuda"
+        )
+        phys = fa._alloc_bind_fast_or_slow(v_pages, 4)
+        # Watermark advanced by N.
+        self.assertEqual(fa.watermark_physical, wm_before + 4)
+        # Returned phys ids match the grow-up arange [wm_before, wm_before+4).
+        expected_phys = torch.arange(
+            wm_before, wm_before + 4, dtype=torch.int64, device="cuda"
+        )
+        self.assertTrue(torch.equal(phys, expected_phys))
+        # v2p table: each virtual → its physical.
+        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
+            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
+        # p2v table: each physical → its virtual.
+        for v, p in zip(v_pages.tolist(), expected_phys.tolist()):
+            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
+        # live_page_count updated.
+        self.assertEqual(fa.live_page_count, 4)
+
+    def test_slow_path_when_holes_exist(self):
+        """Invariant B (greedy hole reuse): when a hole exists, alloc
+        drains it BEFORE extending the watermark. The fast path MUST
+        NOT fire."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        # Build a hole by alloc-then-free-non-boundary.
+        a = fa.alloc(3)
+        fa.free(a[0:1].clone())  # frees a non-boundary slot → enters holeset
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        hole_pos = next(iter(fa._free_phys_pages._alive))
+        wm_before = fa.watermark_physical
+        # Alloc 1 page via the helper. Slow path should drain the hole.
+        v_pages = torch.tensor([42], dtype=torch.int64, device="cuda")
+        phys = fa._alloc_bind_fast_or_slow(v_pages, 1)
+        # Hole drained, NOT a watermark extension.
+        self.assertEqual(int(phys[0].item()), hole_pos)
+        self.assertEqual(fa.watermark_physical, wm_before)
+        self.assertEqual(len(fa._free_phys_pages), 0)
+        # v2p/p2v updated.
+        self.assertEqual(int(fa.virtual_to_physical[42].item()), hole_pos)
+        self.assertEqual(int(fa.physical_to_virtual[hole_pos].item()), 42)
+
+    def test_fast_path_in_eager_mode(self):
+        """Eager mode (no lazy compaction) ALWAYS uses the fast path —
+        no holes ever accumulate."""
+        _pool, fa, _kv = self._make_full(lazy=False)
+        self.assertFalse(fa.lazy_compaction)
+        wm_before = fa.watermark_physical
+        v_pages = torch.tensor(
+            [30, 31, 32], dtype=torch.int64, device="cuda"
+        )
+        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
+        self.assertEqual(fa.watermark_physical, wm_before + 3)
+        expected_phys = torch.arange(
+            wm_before, wm_before + 3, dtype=torch.int64, device="cuda"
+        )
+        self.assertTrue(torch.equal(phys, expected_phys))
+
+    def test_index_space_overflow_returns_none(self):
+        """When the requested allocation would overflow `num_pages`,
+        the helper returns None and leaves the allocator unchanged."""
+        _pool, fa, _kv = self._make_full(
+            lazy=True, n_full_slots=8, n_mamba_slots=2
+        )
+        # Try to alloc more pages than exist.
+        N = fa.num_pages + 100
+        wm_before = fa.watermark_physical
+        # Note: we need v_pages of size N; but only its NUMEL matters for
+        # the helper. We pass a dummy tensor of the right shape.
+        v_pages = torch.zeros(N, dtype=torch.int64, device="cuda")
+        phys = fa._alloc_bind_fast_or_slow(v_pages, N)
+        self.assertIsNone(phys)
+        # Allocator state unchanged.
+        self.assertEqual(fa.watermark_physical, wm_before)
+        self.assertEqual(fa.live_page_count, 0)
+
+    def test_empty_alloc_returns_empty_tensor(self):
+        """N=0 returns an empty tensor (no kernel launch, no state change)."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        wm_before = fa.watermark_physical
+        v_pages = torch.empty(0, dtype=torch.int64, device="cuda")
+        phys = fa._alloc_bind_fast_or_slow(v_pages, 0)
+        self.assertIsNotNone(phys)
+        self.assertEqual(phys.numel(), 0)
+        self.assertEqual(fa.watermark_physical, wm_before)
+
+    def test_fast_path_equivalent_to_slow_path(self):
+        """For the same input on an empty-holeset allocator, the fast
+        path produces byte-identical v2p / p2v / return-tensor to the
+        slow path (which is the unfused take_physical_pages + bind
+        sequence). Verifies the kernel correctness against the
+        reference implementation."""
+        # Two identical allocators; one takes fast path, one takes slow.
+        _pool_a, fa_a, _kv_a = self._make_full(lazy=True)
+        _pool_b, fa_b, _kv_b = self._make_full(lazy=True)
+        v_pages = torch.tensor(
+            [50, 51, 52, 53, 54], dtype=torch.int64, device="cuda"
+        )
+        # Fast path on fa_a.
+        phys_a = fa_a._alloc_bind_fast_or_slow(v_pages, 5)
+        # Slow path on fa_b: directly call take_physical_pages + bind
+        # (the unfused reference implementation).
+        phys_b = fa_b.take_physical_pages(5)
+        fa_b.bind(v_pages, phys_b)
+        fa_b.live_page_count += 5
+        # Identical return tensors.
+        self.assertTrue(torch.equal(phys_a, phys_b))
+        # Identical v2p / p2v after the operation.
+        self.assertTrue(
+            torch.equal(fa_a.virtual_to_physical, fa_b.virtual_to_physical)
+        )
+        self.assertTrue(
+            torch.equal(fa_a.physical_to_virtual, fa_b.physical_to_virtual)
+        )
+        # Identical watermark + live_page_count.
+        self.assertEqual(fa_a.watermark_physical, fa_b.watermark_physical)
+        self.assertEqual(fa_a.live_page_count, fa_b.live_page_count)
+
+    def test_eager_mode_live_page_count_not_updated(self):
+        """Match `_take_physical_eager` semantics: in eager mode,
+        `live_page_count` is NOT maintained (the leak-checker uses
+        `allocated_count()` based on the watermark span). The helper's
+        fast path must respect this — updating it would break the
+        invariant that eager-mode `live_page_count == 0` always."""
+        _pool, fa, _kv = self._make_full(lazy=False)
+        self.assertFalse(fa.lazy_compaction)
+        self.assertEqual(fa.live_page_count, 0)
+        v_pages = torch.tensor([10, 11, 12], dtype=torch.int64, device="cuda")
+        fa._alloc_bind_fast_or_slow(v_pages, 3)
+        # live_page_count UNCHANGED (eager mode invariant).
+        self.assertEqual(fa.live_page_count, 0)
+
+    def test_lazy_mode_live_page_count_updated_on_fast_path(self):
+        """Lazy mode: the fast path advances `live_page_count` by N
+        (matches `take_physical`'s lazy-path bookkeeping)."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        self.assertEqual(fa.live_page_count, 0)
+        v_pages = torch.tensor([20, 21, 22], dtype=torch.int64, device="cuda")
+        fa._alloc_bind_fast_or_slow(v_pages, 3)
+        self.assertEqual(fa.live_page_count, 3)
+        # Another fast-path call accumulates.
+        v_pages2 = torch.tensor([23, 24], dtype=torch.int64, device="cuda")
+        fa._alloc_bind_fast_or_slow(v_pages2, 2)
+        self.assertEqual(fa.live_page_count, 5)
+
+    def test_lazy_mode_live_page_count_updated_on_slow_path(self):
+        """Lazy mode + holes exist: the slow path advances
+        `live_page_count` via the existing `take_physical_pages` call
+        (which updates it internally). End state must match the fast
+        path's accumulation."""
+        _pool, fa, _kv = self._make_full(lazy=True)
+        a = fa.alloc(3)
+        # alloc(3) used the fast path (no holes at the time).
+        self.assertEqual(fa.live_page_count, 3)
+        # Free one non-boundary → creates a hole; subsequent alloc takes
+        # the slow path.
+        fa.free(a[0:1].clone())
+        self.assertEqual(fa.live_page_count, 2)
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        # Now alloc(1) takes the slow path (holes exist). Should still
+        # update live_page_count back to 3.
+        b = fa.alloc(1)
+        self.assertIsNotNone(b)
+        self.assertEqual(fa.live_page_count, 3)
+        # Verify slow path actually fired: hole drained, watermark unchanged.
+        self.assertEqual(len(fa._free_phys_pages), 0)
+
+    def test_page_size_gt_1(self):
+        """Helper works at page_size > 1: virtual ids and table indices
+        are page-granular. Verifies kernel scatters one v2p entry per
+        PAGE (not per token)."""
+        _pool, fa, _kv = self._make_full(
+            lazy=True, n_full_slots=64, n_mamba_slots=16, page_size=4
+        )
+        self.assertEqual(fa.page_size, 4)
+        v_pages = torch.tensor([3, 4, 5], dtype=torch.int64, device="cuda")
+        wm_before = fa.watermark_physical
+        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
+        self.assertIsNotNone(phys)
+        self.assertEqual(phys.shape, (3,))
+        # Watermark advances by N PAGES (not N tokens).
+        self.assertEqual(fa.watermark_physical, wm_before + 3)
+        # v2p table updated at page granularity.
+        for v, p in zip(v_pages.tolist(), phys.tolist()):
+            self.assertEqual(int(fa.virtual_to_physical[v].item()), p)
+            self.assertEqual(int(fa.physical_to_virtual[p].item()), v)
+
+    def test_grow_down_fast_path(self):
+        """The mamba sub-pool is grow-down. Verifies fast-path arithmetic
+        in the descending direction."""
+        _pool, _fa, _kv = self._make_full(lazy=True)
+        # Build a grow-down allocator standalone for the test.
+        from sglang.srt.mem_cache.shared_memory_pool import (
+            SharedMemoryPool, MHASubPoolSpec,
+        )
+        full = _make_mha_spec("full", "up", layer_num=2)
+        swa = _make_mha_spec("swa", "down", layer_num=2)  # grow-down
+        total = (full.entry_bytes() + swa.entry_bytes()) * 32
+        pool = SharedMemoryPool(
+            total_bytes=total,
+            sub_pool_specs=[full, swa],
+            device="cuda",
+            enable_memory_saver=False,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        swa_kv = _FakeKVCache(pool.max_slots("swa"))
+        fa = MultiEndedAllocator(
+            kvcache=full_kv,
+            shared_buffer=pool,
+            sub_pool_name="full",
+            device="cuda",
+            is_id_owner=True,
+            lazy_compaction=True,
+        )
+        sa = MultiEndedAllocator(
+            kvcache=swa_kv,
+            shared_buffer=pool,
+            sub_pool_name="swa",
+            device="cuda",
+            is_id_owner=False,  # non-owner, grow-down
+            lazy_compaction=True,
+        )
+        fa.bind_peer(sa)
+        sa.bind_peer(fa)
+        # Grow-down: watermark starts at num_pages - 1, decreases.
+        self.assertEqual(sa.grow_direction, "down")
+        wm_before = sa.watermark_physical
+        v_pages = torch.tensor(
+            [5, 6, 7], dtype=torch.int64, device="cuda"
+        )
+        phys = sa._alloc_bind_fast_or_slow(v_pages, 3)
+        # Grow-down: kernel emits ASCENDING (matches `_take_physical_eager`'s
+        # `torch.arange(wm-N+1, wm+1)` output). For wm=wm_before, N=3:
+        # range is [wm_before-2, wm_before-1, wm_before].
+        expected = torch.tensor(
+            [wm_before - 2, wm_before - 1, wm_before],
+            dtype=torch.int64, device="cuda",
+        )
+        self.assertTrue(torch.equal(phys, expected))
+        # Watermark decreased by N.
+        self.assertEqual(sa.watermark_physical, wm_before - 3)
+        # v2p / p2v consistent with the ascending mapping:
+        # v_pages[0] → wm_before - 2 (lowest of the new range)
+        # v_pages[2] → wm_before (highest of the new range)
+        for v, p in zip(v_pages.tolist(), expected.tolist()):
+            self.assertEqual(int(sa.virtual_to_physical[v].item()), p)
+            self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
+
+
 if __name__ == "__main__":
     unittest.main()
