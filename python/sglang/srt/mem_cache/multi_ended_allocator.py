@@ -49,7 +49,10 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.shared_memory_pool import SharedMemoryPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.utils import translate_kv_indices_inplace
+from sglang.srt.mem_cache.utils import (
+    alloc_bind_inplace,
+    translate_kv_indices_inplace,
+)
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 
 logger = logging.getLogger(__name__)
@@ -867,6 +870,116 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.bind_pages"):
             self.bind(virtual_pages, physical_pages)
 
+    # -- Stage 3.7.1 §S371 O3: fused take_physical_pages + bind_pages --
+
+    def _alloc_bind_fast_or_slow(
+        self, v_pages: torch.Tensor, N: int
+    ) -> Optional[torch.Tensor]:
+        """O3 fast path: fuse the `take_physical_pages` + `bind` pair into
+        ONE Triton kernel when no holes need draining. Falls through to
+        the existing slow path when holes exist.
+
+        Replaces the 3-GPU-op pattern (`torch.arange` + 2x `index_put_`,
+        ~30-60 µs dispatch overhead) with one fused Triton kernel
+        launch (~15-25 µs) — saving ~20-40 µs per alloc. Eager mode
+        (no holes ever accumulate) and lazy-mode allocs with empty
+        holeset (>95% of standard-matrix allocs) take the fast path.
+
+        Invariant B (greedy hole reuse) is preserved by the GATE on
+        `not self._free_phys_pages`: when ANY hole exists, control
+        flows to the slow path which calls `take_physical_pages` —
+        that path's `_pop_hole_directional` loop drains holes FIRST,
+        then extends the watermark for any remainder. Holes are
+        NEVER bypassed in favor of watermark extension.
+
+        Invariant D (`take_physical_pages` ↔ `bind` atomicity) is
+        preserved because the helper performs both operations
+        internally on EVERY call: the fast path's kernel fuses them
+        into one launch; the slow path runs them as the existing
+        adjacent pair. Callers see a single atomic primitive.
+
+        Args:
+            v_pages: virtual PAGE ids to bind, int64 [N].
+            N: page count (matches `v_pages.numel()`).
+
+        Returns:
+            Physical page ids tensor [N] on success; None on shortfall
+            (either the watermark extension would overflow the
+            index-space cap or the peer byte-frontier in lazy mode).
+            On None, allocator state is unchanged — callers can roll
+            back their own bookkeeping safely.
+        """
+        with record_function("MultiEndedAlloc._alloc_bind_fast_or_slow"):
+            if N == 0:
+                return torch.empty(
+                    0, dtype=torch.int64, device=self.device
+                )
+
+            # FAST PATH: eager mode (no holes ever accumulate) OR
+            # lazy mode with no current holes. One fused kernel.
+            if not self.lazy_compaction or not self._free_phys_pages:
+                # Capture watermark BEFORE advancing so we can compute
+                # the kernel's `start_phys` from the pre-extension value.
+                start_wm = self.watermark_physical
+
+                # Pre-check + advance watermark. Lazy mode uses
+                # `_extend_watermark` (does both the index-space and
+                # peer byte-frontier checks). Eager mode inlines the
+                # index-space-only check to exactly match the existing
+                # `_take_physical_eager` semantics.
+                if self.lazy_compaction:
+                    if not self._extend_watermark(N):
+                        return None
+                else:
+                    if self.grow_direction == "up":
+                        new_wm = start_wm + N
+                        if new_wm > self.num_pages:
+                            return None
+                        self.watermark_physical = new_wm
+                    else:
+                        new_wm = start_wm - N
+                        if new_wm < self.min_page_index - 1:
+                            return None
+                        self.watermark_physical = new_wm
+
+                # Compute the lowest physical id in the new range. Both
+                # directions yield ascending `[start_phys, start_phys + N)`
+                # — byte-identical to `_take_physical_eager`'s
+                # `torch.arange(start, end)` output.
+                if self.grow_direction == "up":
+                    start_phys = start_wm
+                else:
+                    start_phys = start_wm - N + 1
+
+                # Launch the fused kernel: arange + v2p scatter +
+                # p2v scatter + write phys_pages output.
+                phys_pages = alloc_bind_inplace(
+                    v_pages,
+                    self.virtual_to_physical,
+                    self.physical_to_virtual,
+                    start_phys,
+                )
+
+                # `live_page_count` is tracked ONLY in lazy mode (the
+                # eager-mode `_take_physical_eager` does not maintain
+                # it — see `take_physical` for the gate). Match that
+                # invariant here to keep the leak-checker view of
+                # `allocated_count()` accurate in both modes.
+                if self.lazy_compaction:
+                    self.live_page_count += N
+                return phys_pages
+
+            # SLOW PATH: holes exist — preserve greedy reuse via the
+            # existing path. `take_physical_pages` drains holes via
+            # the directional pop loop FIRST, then extends only for
+            # the remainder. We then bind via the unfused 2-scatter
+            # pair (same as today).
+            phys_pages = self.take_physical_pages(N)
+            if phys_pages is None:
+                return None
+            self.bind(v_pages, phys_pages)
+            return phys_pages
+
     # -- translate (virtual TOKEN ids -> physical TOKEN ids) --
 
     def translate_kv_loc(
@@ -1024,14 +1137,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             num_pages = need_size // self.page_size
             v_pages = self.free_virtual_ids[:num_pages]
             self.free_virtual_ids = self.free_virtual_ids[num_pages:]
-            phys_pages = self.take_physical_pages(num_pages)
+            # O3: fused take_physical_pages + bind_pages on the fast path
+            # (no holes); falls through to the slow path with greedy
+            # hole drain when holes exist.
+            phys_pages = self._alloc_bind_fast_or_slow(v_pages, num_pages)
             if phys_pages is None:
                 # Undo the virtual pop.
                 self.free_virtual_ids = torch.cat(
                     [v_pages, self.free_virtual_ids]
                 )
                 return None
-            self.bind_pages(v_pages, phys_pages)
             if self.page_size == 1:
                 # Avoid the extra reshape — v_pages already IS the token id list.
                 return v_pages
@@ -1055,12 +1170,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.alloc_with_virtual"):
             if virtual_pages.numel() == 0:
                 return
-            phys_pages = self.take_physical_pages(int(virtual_pages.numel()))
+            # O3: fused take_physical_pages + bind_pages.
+            phys_pages = self._alloc_bind_fast_or_slow(
+                virtual_pages, int(virtual_pages.numel())
+            )
             assert phys_pages is not None, (
                 f"MultiEndedAllocator({self.sub_pool_name!r}).alloc_with_virtual: out of "
                 "physical room (the composite's byte-budget check should have caught this)"
             )
-            self.bind_pages(virtual_pages, phys_pages)
 
     # -- paged alloc surface (Stage 3) --
 
@@ -1159,13 +1276,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # Bind the consumed virtual pages to fresh physical pages on this
             # sub-allocator. Advances the watermark + sets v2p / p2v. The peer
             # (swa side, if any) does its own binding via `alloc_with_virtual`.
+            # O3: fused take_physical_pages + bind_pages.
             if new_virtual_pages is not None:
-                phys_pages = self.take_physical_pages(num_new_pages)
+                phys_pages = self._alloc_bind_fast_or_slow(
+                    new_virtual_pages, num_new_pages
+                )
                 if phys_pages is None:
                     # Defensive — the pre-check should have prevented this. Return
                     # None so the composite can decide whether to roll back.
                     return None
-                self.bind_pages(new_virtual_pages, phys_pages)
 
             # Consume the new virtual pages from the free-list.
             self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
@@ -1239,11 +1358,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             # Bind the consumed virtual pages to fresh physical pages on this
             # sub-allocator. Advances the watermark + sets v2p / p2v.
+            # O3: fused take_physical_pages + bind_pages.
             if new_virtual_pages is not None:
-                phys_pages = self.take_physical_pages(num_new_pages)
+                phys_pages = self._alloc_bind_fast_or_slow(
+                    new_virtual_pages, num_new_pages
+                )
                 if phys_pages is None:
                     return None
-                self.bind_pages(new_virtual_pages, phys_pages)
 
             self.free_virtual_ids = self.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual token ids
