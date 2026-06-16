@@ -2779,6 +2779,20 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        # Snapshot the CONTINUING chunked-req state BEFORE this iteration
+        # mutates it (add_chunked_req below reassigns self.chunked_req —
+        # returning None on the final chunk — and is_chunked is bumped at the
+        # bottom). The graceful-refusal path restores this snapshot verbatim
+        # so a refused iteration is a true no-op on the in-progress chunked
+        # prefill: it resumes cleanly next iter WITHOUT being double-tracked
+        # (waiting_queue + self.chunked_req) and WITHOUT leaking/dropping its
+        # already-allocated chunk KV. `add_chunked_req` takes no lock_ref and
+        # the req is tracked via self.chunked_req (never the waiting queue).
+        _prev_chunked_req = self.chunked_req
+        _prev_is_chunked = (
+            self.chunked_req.is_chunked if self.chunked_req is not None else None
+        )
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -2912,7 +2926,89 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        if not new_batch.prepare_for_extend():
+            # Planner refused to admit the batch (shared-pool
+            # byte-coordinated mamba shortfall with no evict path —
+            # see `common.alloc_req_slots`). No KV/req-pool mutations
+            # have been committed at this point. Restore the
+            # admission state so the reqs get retried next iter
+            # rather than dropped (or the scheduler crashing with the
+            # opaque per-req `HybridReqToTokenPool.alloc` assert
+            # observed in eval_131 Bug #2).
+            #
+            # CRITICAL — undo tree-cache lock refs first. PrefillAdder.
+            # add_one_req calls `_req_inc_lock_ref(req)` for every req
+            # it appends to `can_run_list` (schedule_policy.py:904/909/
+            # 950). Each lock pins `req.last_node.full_lock_ref` until
+            # `cache_finished_req` releases it. If we re-queue without
+            # releasing here, each refusal cycle leaks ONE lock per
+            # req — the MambaRadixCache sanity check eventually trips
+            # with `x_lru should not be locked when idle, full_lock_ref
+            # =N` once the scheduler goes idle (eval_132 regression
+            # observed at Falcon mfs=0.45 radix). For chunk_cache this
+            # is a no-op (dec_lock_ref returns delta=0). For SWA pass
+            # the saved `swa_uuid_for_lock` back as params.
+            #
+            # EXCLUDE the CONTINUING chunked_req (snapshotted as
+            # `_prev_chunked_req` BEFORE add_chunked_req ran — using the live
+            # `self.chunked_req` here is WRONG because add_chunked_req resets
+            # it to None on the final chunk). The continuing chunked prefill
+            # is added to `can_run_list` via `add_chunked_req`
+            # (schedule_policy.py:687) — which takes NO lock_ref and is tracked
+            # across iters via `self.chunked_req`, NOT the waiting queue. It
+            # must NOT be (a) dec_lock_ref'd here (never took a lock this iter
+            # → under-count) nor (b) re-queued to waiting (already tracked as
+            # the chunked_req; re-queuing double-tracks it → next iter it is
+            # admitted via BOTH add_chunked_req AND the waiting queue →
+            # re-allocated → its already-allocated chunk KV is leaked = the
+            # Mode-2 orphan). A NEW chunked req (adder.new_chunked_req) WAS
+            # added via add_one_req (lock taken, popped from waiting), so it IS
+            # released + re-queued like any normal req.
+            continuing_chunked = (
+                _prev_chunked_req
+                if (_prev_chunked_req is not None and _prev_chunked_req in can_run_list)
+                else None
+            )
+            for req in can_run_list:
+                if req is continuing_chunked:
+                    continue
+                if self.is_hybrid_swa:
+                    params = getattr(req, "swa_uuid_for_lock", None)
+                    self.tree_cache.dec_lock_ref(req.last_node, params)
+                    req.swa_uuid_for_lock = None
+                else:
+                    self.tree_cache.dec_lock_ref(req.last_node)
+            self.waiting_queue = [
+                r for r in can_run_list if r is not continuing_chunked
+            ] + self.waiting_queue
+            # A NEW chunked req goes back to waiting as a normal req; undo the
+            # is_chunked bump it received below.
+            if adder.new_chunked_req is not None:
+                adder.new_chunked_req.is_chunked -= 1
+            # Restore the CONTINUING chunked-req so it resumes next iter
+            # (covers BOTH the more-chunks case — self.chunked_req already ==
+            # _prev — and the last-chunk case where add_chunked_req reset it to
+            # None). For the new-chunked / no-chunked cases _prev_chunked_req
+            # is None, so self.chunked_req is correctly cleared.
+            self.chunked_req = _prev_chunked_req
+            # CRITICAL: this iteration's chunk was REFUSED — it did NOT commit
+            # any KV. So next iter must NOT stash it. `_chunked_req_scheduled_
+            # last_iter` gates the `stash_chunked_request` →
+            # `cache_unfinished_req` call at the top of the next
+            # get_next_batch_to_run; stashing here would set
+            # `prefix_indices = req_to_token[:len(fill_ids)]`, marking the
+            # un-run chunk as already-prefilled. For a LAST chunk that makes
+            # `prefix_indices == fill_ids` → `extend_num_tokens == 0` → an
+            # empty `forward_extend` that crashes in rotary_emb
+            # (`reshape tensor of 0 elements`). Forcing False keeps
+            # prefix_indices at the last COMMITTED chunk, so the extend
+            # recomputes to the remaining (>0) tokens.
+            self._chunked_req_scheduled_last_iter = False
+            if _prev_chunked_req is not None:
+                _prev_chunked_req.is_chunked = _prev_is_chunked
+            # Signal back-off for this iter; the next iter will retry.
+            self.running_batch.batch_is_full = True
+            return None
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(

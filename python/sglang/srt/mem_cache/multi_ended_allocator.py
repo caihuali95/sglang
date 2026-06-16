@@ -33,7 +33,6 @@ Concurrency: the scheduler runs alloc/free serially; no mutex is taken here.
 
 from __future__ import annotations
 
-import heapq
 import inspect
 import logging
 import os
@@ -63,128 +62,92 @@ from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 logger = logging.getLogger(__name__)
 
 
-class _HoleSet:
-    """Bidirectional sorted set of physical PAGE ids for lazy-compaction
-    holes. Backs `MultiEndedAllocator._free_phys_pages`.
+# §S373 — env knob for optional sort-after-merge on the hot path. Default
+# OFF: `_free_lazy` and `_drain_pending_reuse` just `torch.cat` and leave the
+# list unsorted; the cold-path `_flush` sorts once before the survivor walk.
+# When set to "1", every cat is followed by a sort, keeping the list
+# always-sorted and letting `_flush` skip its sort step. For A/B testing
+# the "layout quality vs hot-path cost" trade.
+_SORT_FREE_LIST_AFTER_MERGE = (
+    os.environ.get("SGLANG_SORT_FREE_LIST_AFTER_MERGE", "0") == "1"
+)
 
-    Supports popping the SMALLEST or LARGEST element at any time — the
-    direction is chosen by the caller per call, not fixed in the
-    constructor. Today: grow-up sub-pools drain smallest-first; grow-down
-    sub-pools drain largest-first. Future Stage 4: a sub-pool sandwiched
-    between two others may need to drain from either end at runtime
-    depending on which neighbor is closer to running out of bytes.
 
-    Implementation: TWO heaps (min + max) + a parallel `alive` set, with
-    lazy deletion. Both heaps store every member; the `alive` set is the
-    source of truth for membership. `discard(p)` removes `p` from the
-    `alive` set ONLY — the stale heap entries are pruned the next time
-    they would be popped or peeked.
+# §S373 — periodic per-allocator stats logging for memory-pressure /
+# compaction-frequency observability. When `SGLANG_LOG_LAZY_COMPACTION_STATS=1`,
+# every `_flush` checks an elapsed-wall-time gate and emits a one-line summary
+# of cumulative counters at INFO level (printed at most once per
+# `_LAZY_COMPACTION_STATS_INTERVAL_SEC` seconds). Counters track:
+#   - _free_lazy / _drain_pending_reuse / _flush call counts
+#   - flushes that actually moved any survivor
+#   - total compaction moves committed
+#   - total pages absorbed into the watermark by `_flush`'s step-4 CPU walk
+#   - peak `_free_phys_pages.numel()` and `_pending_reuse_pages_cpu` size
+# Sub-pool-tagged ("full"/"swa"/"mamba") so SWA / Mamba composites can be
+# distinguished in the output.
+import atexit
+import signal
+import time as _time_mod  # local alias so tests can patch
+import weakref
+_LAZY_COMPACTION_STATS_ENABLED = (
+    os.environ.get("SGLANG_LOG_LAZY_COMPACTION_STATS", "0") == "1"
+)
+_LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
+    os.environ.get("SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC", "30")
+)
+# Module-level WeakSet of every MultiEndedAllocator instance with stats
+# enabled. The signal handler below iterates this on SIGTERM/SIGINT and
+# emits each instance's final counters before re-raising the default
+# behavior. WeakSet so a dropped allocator doesn't leak.
+_STATS_INSTANCES: "weakref.WeakSet[MultiEndedAllocator]" = weakref.WeakSet()
+_SIGNAL_HANDLERS_INSTALLED = False
 
-    Complexities (n = number of alive entries; m = heap-entry count
-    bounded by 2·peak(n)):
-      * `add(p)`         — O(log m)  : push to both heaps
-      * `discard(p)`     — O(1)      : remove from set; heap entries lazy-pruned
-      * `__contains__`   — O(1)
-      * `__len__`        — O(1)
-      * `peek_min/max()` — O(log m) amortized over many ops (prunes stale heads)
-      * `pop_min/max()`  — O(log m) amortized
-      * memory           — 2·m ints + n ints (small, single allocator-thread)
-
-    Cycle-stale-heap risk: heap-entry count m can exceed n by stale
-    entries created by `discard`. Across many alloc/free cycles, m grows
-    monotonically until a peek/pop prunes a head entry. To bound m
-    indefinitely we rebuild both heaps from `alive` when m > 2·max(n, 64)
-    (a `clear` + re-`heapify` is O(n)). This caps amortized memory at
-    O(n) and worst-case peek/pop at O(log m).
-
-    Scheduler-thread only; never touched by a GPU stream.
+def _emit_all_final_stats(reason: str) -> None:
+    """Emit the FINAL line for every live MultiEndedAllocator. Tagged
+    with `reason` (e.g. "atexit", "SIGTERM") so the log shows what
+    triggered the snapshot.
     """
+    for inst in list(_STATS_INSTANCES):
+        try:
+            inst._emit_stats_final(reason=reason)
+        except Exception:
+            pass
 
-    __slots__ = ("_min_heap", "_max_heap", "_alive")
 
-    def __init__(self) -> None:
-        self._min_heap: List[int] = []
-        self._max_heap: List[int] = []  # stores -p (Python's heapq is min-only)
-        self._alive: Set[int] = set()
+def _signal_handler(signum, frame):
+    """Catch SIGTERM/SIGINT, emit stats, then re-raise the default
+    behavior. This covers the harness-teardown path that atexit misses
+    (Python's atexit does not fire on signal-triggered exits).
+    """
+    try:
+        sig_name = signal.Signals(signum).name
+    except (ValueError, AttributeError):
+        sig_name = str(signum)
+    _emit_all_final_stats(reason=sig_name)
+    # Restore default handler and re-raise so normal shutdown proceeds.
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
 
-    def __len__(self) -> int:
-        return len(self._alive)
 
-    def __contains__(self, p: int) -> bool:
-        return p in self._alive
-
-    def __bool__(self) -> bool:
-        return bool(self._alive)
-
-    def __iter__(self):
-        return iter(self._alive)
-
-    def add(self, p: int) -> None:
-        """Insert `p`. Idempotent — no-op if already present. O(log m)."""
-        if p in self._alive:
-            return
-        self._alive.add(p)
-        heapq.heappush(self._min_heap, p)
-        heapq.heappush(self._max_heap, -p)
-        self._maybe_rebuild()
-
-    def discard(self, p: int) -> None:
-        """Remove `p` if present. No-op if absent. O(1) — heap entries
-        are pruned lazily on next pop/peek."""
-        self._alive.discard(p)
-
-    def _prune_min(self) -> None:
-        while self._min_heap and self._min_heap[0] not in self._alive:
-            heapq.heappop(self._min_heap)
-
-    def _prune_max(self) -> None:
-        while self._max_heap and (-self._max_heap[0]) not in self._alive:
-            heapq.heappop(self._max_heap)
-
-    def peek_min(self) -> Optional[int]:
-        """Smallest element, or None if empty. O(log m) amortized."""
-        self._prune_min()
-        return self._min_heap[0] if self._min_heap else None
-
-    def peek_max(self) -> Optional[int]:
-        """Largest element, or None if empty. O(log m) amortized."""
-        self._prune_max()
-        return -self._max_heap[0] if self._max_heap else None
-
-    def pop_min(self) -> Optional[int]:
-        """Remove and return the smallest element. O(log m) amortized."""
-        self._prune_min()
-        if not self._min_heap:
-            return None
-        p = heapq.heappop(self._min_heap)
-        self._alive.discard(p)
-        return p
-
-    def pop_max(self) -> Optional[int]:
-        """Remove and return the largest element. O(log m) amortized."""
-        self._prune_max()
-        if not self._max_heap:
-            return None
-        p = -heapq.heappop(self._max_heap)
-        self._alive.discard(p)
-        return p
-
-    def _maybe_rebuild(self) -> None:
-        """If stale heap entries dominate (m > 2·max(n, 64)), drop them
-        all in one O(n) pass to keep amortized memory O(n).
-        """
-        threshold = max(len(self._alive) * 2, 64)
-        if len(self._min_heap) <= threshold:
-            return
-        self._min_heap = list(self._alive)
-        heapq.heapify(self._min_heap)
-        self._max_heap = [-p for p in self._alive]
-        heapq.heapify(self._max_heap)
-
-    def clear(self) -> None:
-        self._min_heap.clear()
-        self._max_heap.clear()
-        self._alive.clear()
+def _install_signal_handlers_once() -> None:
+    global _SIGNAL_HANDLERS_INSTALLED
+    if _SIGNAL_HANDLERS_INSTALLED:
+        return
+    _SIGNAL_HANDLERS_INSTALLED = True
+    # Install SIGTERM + SIGINT handlers. Skip if a prior handler exists
+    # AND it isn't the default — the host process (sglang's scheduler
+    # subprocess) doesn't install custom handlers for these by default,
+    # so this should usually win.
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            prev = signal.getsignal(sig)
+            if prev in (signal.SIG_DFL, signal.SIG_IGN, None):
+                signal.signal(sig, _signal_handler)
+        except (ValueError, OSError):
+            # signal.signal raises if not called from the main thread of
+            # the main interpreter — silently skip (atexit still fires
+            # on clean exits).
+            pass
 
 
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
@@ -301,12 +264,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # behavior — `free` runs the per-call boundary move with
         # `wait_stream(forward_stream)`. All new state below is unused.
         #
-        # When `lazy_compaction=True`:
-        # - `_free_phys_pages` (`_HoleSet`): O(log n) push/pop-directional,
-        #   O(1) contains. Holes are physical PAGE ids in the allocated
-        #   band; alloc drains from the deepest first (smallest for
-        #   grow-up, largest for grow-down) so near-boundary holes stay
-        #   cheap to absorb at compaction time. Scheduler-thread only.
+        # When `lazy_compaction=True` (§S373):
+        # - `_free_phys_pages` (`torch.Tensor`, GPU int64): the GPU free
+        #   list. Holds physical PAGE ids freed by `_free_lazy` AND src
+        #   pages released by `_drain_pending_reuse` /
+        #   `_commit_move_batch`. Possibly unsorted (depending on
+        #   `SGLANG_SORT_FREE_LIST_AFTER_MERGE` env knob); ALWAYS sorted
+        #   ascending at `_flush` step 3. Boundary absorption is deferred
+        #   entirely to `_flush` — the hot-path `_free_lazy` does ONE
+        #   `torch.cat` and is otherwise sync-free.
         # - `_pending_reuse` holds `(p, reader_forward_done_event)` for
         #   compaction src pages whose remap completed but whose in-flight
         #   reader's event hasn't fired — `p` cannot re-enter
@@ -336,16 +302,66 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # when the remap would otherwise run). We intentionally skip it
         # here; the design carries it forward for Phase B.
         self.lazy_compaction = lazy_compaction
-        self._free_phys_pages: _HoleSet = _HoleSet()
-        # `_pending_reuse` is a dict (physical PAGE id → reader event)
-        # so membership is O(1). This lets `_topmost_survivor` exclude
-        # pending pages efficiently (a survivor with v2p/p2v already
-        # cleared by a prior remap must NOT be picked again).
-        # Dict insertion order is preserved (Python 3.7+), so drain order
-        # is the same as the append order.
+        # §S373 — GPU free-list. Holds physical PAGE ids freed by
+        # `_free_lazy` (and compaction-src pages released at `_flush` end —
+        # event-fired srcs via the `released_fired` merge, event-pending
+        # srcs via `_drain_pending_reuse`). May be sorted or unsorted
+        # depending on `_SORT_FREE_LIST_AFTER_MERGE`; ALWAYS sorted at
+        # `_flush` step 3.
+        # Hot-path `_free_lazy` does ONE `torch.cat` onto this. Hot-path
+        # `take_physical` drains via slice (no `.item()` syncs).
+        self._free_phys_pages: torch.Tensor = torch.empty(
+            0, dtype=torch.int64, device=device
+        )
+        # §S373 — `_pending_reuse` is now keyed by Event with ONE entry per
+        # batch (NOT one per src). The value is `(cpu_list, gpu_tensor)`:
+        # `cpu_list` is the Python list of src page ids built at
+        # survivor-walk time (used for parallel-Set updates without a
+        # `.tolist()` sync at drain time); `gpu_tensor` is the SAME GPU
+        # tensor used by `_commit_move_batch`'s v2p/p2v remap, kept alive
+        # by the dict reference so drain can `torch.cat` it onto
+        # `_free_phys_pages` without an H2D copy.
         self._pending_reuse: Dict[
-            int, Optional["torch.cuda.Event"]
+            "torch.cuda.Event",
+            Tuple[List[int], torch.Tensor],
         ] = {}
+        # §S373 — parallel CPU mirror of all pages currently in
+        # `_pending_reuse`. O(1) membership check for `_topmost_survivor`
+        # so the survivor walk never picks an in-flight src as a survivor.
+        # Updated alongside `_pending_reuse` in `_commit_move_batch` /
+        # `_drain_pending_reuse`.
+        self._pending_reuse_pages_cpu: Set[int] = set()
+        # §S373 — cumulative observability counters (env-gated periodic
+        # emit). Updated in the hot/cold path entry points; reset is
+        # NOT done at clear() so that the totals reflect the whole
+        # server lifetime.
+        self._stats_n_free_lazy: int = 0
+        self._stats_n_release_batch: int = 0
+        self._stats_n_drain_calls: int = 0
+        self._stats_n_drain_did_work: int = 0
+        self._stats_n_drained_pages_total: int = 0
+        self._stats_n_flush_calls: int = 0
+        self._stats_n_flush_did_work: int = 0
+        self._stats_n_flush_moves: int = 0
+        self._stats_n_pages_absorbed: int = 0
+        self._stats_peak_free_list_len: int = 0
+        self._stats_peak_pending_pages: int = 0
+        self._stats_n_emits: int = 0
+        self._stats_last_emit_ts: float = _time_mod.monotonic()
+        # Force a final stats emit at process exit so the workload-end
+        # state is captured even when the last `_flush` happened more
+        # than `_LAZY_COMPACTION_STATS_INTERVAL_SEC` before shutdown.
+        # Bypasses the time gate; gated by the same `_ENABLED` env var.
+        # Registration paths:
+        #   1. `atexit.register`  — fires on clean Python interpreter exit.
+        #   2. `_STATS_INSTANCES` WeakSet + a process-wide SIGTERM/SIGINT
+        #      handler — fires on signal-triggered shutdown (eval_131
+        #      showed 70/96 cells had no FINAL line because the harness
+        #      kills the container with SIGTERM before atexit runs).
+        if _LAZY_COMPACTION_STATS_ENABLED:
+            atexit.register(self._emit_stats_final, reason="atexit")
+            _STATS_INSTANCES.add(self)
+            _install_signal_handlers_once()
         self.live_page_count = 0
         self._latest_forward_done_event: Optional["torch.cuda.Event"] = None
         # Most-recently-launched forward's metadata for the write-race
@@ -460,8 +476,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.free_group: List[torch.Tensor] = []
         self._inverse_history.clear()
         # Lazy compaction state — no-op when lazy_compaction=False.
-        self._free_phys_pages.clear()
+        self._free_phys_pages = torch.empty(
+            0, dtype=torch.int64, device=self.device
+        )
         self._pending_reuse.clear()
+        self._pending_reuse_pages_cpu.clear()
         self.live_page_count = 0
         self._inflight_forward = None
         self._latest_forward_done_event = None
@@ -644,23 +663,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- physical-slot / physical-page primitives --
 
-    def _pop_hole_directional(self) -> Optional[int]:
-        """Pop one hole from `_free_phys_pages` according to the
-        allocator's current grow direction:
-          * grow-up   → smallest id (deepest in band)
-          * grow-down → largest id (deepest in band)
-
-        Centralized so the `_HoleSet`'s bidirectional structure is
-        navigated identically by `take_physical` (alloc draining) and
-        `_flush` (compaction `dst` selection). Returns `None` if empty.
-
-        Stage-4-ready: a future sub-pool that flips `grow_direction` at
-        runtime needs only re-call this method to get the new "deepest"
-        end.
-        """
-        if self.grow_direction == "up":
-            return self._free_phys_pages.pop_min()
-        return self._free_phys_pages.pop_max()
+    # §S373: `_pop_hole_directional` deleted — `take_physical` slices the
+    # free list directly (sort-aware when `_SORT_FREE_LIST_AFTER_MERGE`),
+    # and `_flush`'s compaction-dst pick reads from `holes_cpu` (the
+    # post-tolist snapshot) without touching the GPU tensor.
 
     def take_physical(self, need_size: int) -> Optional[torch.Tensor]:
         """Reserve `need_size` TOKENS of physical capacity and return the
@@ -711,9 +717,17 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if not self.lazy_compaction:
                 return self._take_physical_eager(num_pages)
 
-            # Lazy path — pre-check what we need from holes vs extension,
-            # then commit only after both reservations succeed.
-            n_drain = min(num_pages, len(self._free_phys_pages))
+            # §S373 §L3 lazy path — slice the GPU free list. Order of
+            # the drained slice depends on the sort flag:
+            #   - sort ON: sorted ASCENDING. "Deepest in band" = smallest
+            #     for grow-up (slice [:n_drain]), largest for grow-down
+            #     (slice [-n_drain:].flip(0)). Preserves Invariant C
+            #     greedy clustering.
+            #   - sort OFF: order is arbitrary; take from the front for
+            #     both directions. Layout quality is recovered by
+            #     `_flush`'s sort + complete absorb.
+            # Zero D2H syncs (slicing is CPU shape metadata only).
+            n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
             need_more = num_pages - n_drain
 
             # Try extending the watermark first. If this fails, state is
@@ -724,36 +738,59 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             # Extension succeeded (or wasn't needed). Now drain holes —
             # guaranteed to succeed since n_drain ≤ len(holes).
-            drained: List[int] = []
-            for _ in range(n_drain):
-                p = self._pop_hole_directional()
-                assert p is not None, (
-                    "_HoleSet.pop returned None mid-drain — concurrent "
-                    "modification or invariant violation"
-                )
-                drained.append(p)
+            if n_drain > 0:
+                if _SORT_FREE_LIST_AFTER_MERGE:
+                    if self.grow_direction == "up":
+                        drained_t = self._free_phys_pages[:n_drain]
+                        self._free_phys_pages = self._free_phys_pages[n_drain:]
+                    else:
+                        drained_t = (
+                            self._free_phys_pages[-n_drain:].flip(0)
+                        )
+                        self._free_phys_pages = (
+                            self._free_phys_pages[:-n_drain]
+                        )
+                else:
+                    # Unsorted — take from front regardless of direction.
+                    drained_t = self._free_phys_pages[:n_drain]
+                    self._free_phys_pages = self._free_phys_pages[n_drain:]
+            else:
+                drained_t = None
 
             self.live_page_count += num_pages
 
             # Fast path: pure extension (no drained) — return arange tensor.
-            if not drained:
+            if drained_t is None:
                 return self._take_physical_arange(num_pages)
 
-            # Mixed path: combine drained holes (in directional-pop order)
-            # with extended-watermark pages (adjacent to new watermark).
-            # `bind` is order-agnostic; the layout is documented for
-            # readability of debug dumps.
+            # Fast path: pure drain (no extension) — return the drained
+            # slice. Detach from the `_free_phys_pages` view so subsequent
+            # `torch.cat` rebindings of `_free_phys_pages` (in `_free_lazy`,
+            # etc.) don't keep this view alive.
+            if need_more == 0:
+                return drained_t.clone()
+
+            # Mixed path: combine drained holes with extended-watermark
+            # pages (adjacent to new watermark). `bind` is order-agnostic;
+            # the layout is documented for readability of debug dumps.
             if self.grow_direction == "up":
                 new_wm = self.watermark_physical
-                extended = list(range(new_wm - need_more, new_wm))  # ascending
+                extended_t = torch.arange(
+                    new_wm - need_more,
+                    new_wm,
+                    dtype=torch.int64,
+                    device=self.device,
+                )  # ascending
             else:
                 new_wm = self.watermark_physical
-                extended = list(
-                    range(new_wm + need_more, new_wm, -1)
+                extended_t = torch.arange(
+                    new_wm + need_more,
+                    new_wm,
+                    -1,
+                    dtype=torch.int64,
+                    device=self.device,
                 )  # descending
-            return torch.tensor(
-                drained + extended, dtype=torch.int64, device=self.device
-            )
+            return torch.cat([drained_t, extended_t])
 
     def _take_physical_eager(self, num_pages: int) -> Optional[torch.Tensor]:
         """Original eager-mode take_physical — contiguous range."""
@@ -922,7 +959,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
             # FAST PATH: eager mode (no holes ever accumulate) OR
             # lazy mode with no current holes. One fused kernel.
-            if not self.lazy_compaction or not self._free_phys_pages:
+            if (
+                not self.lazy_compaction
+                or self._free_phys_pages.numel() == 0
+            ):
                 # Capture watermark BEFORE advancing so we can compute
                 # the kernel's `start_phys` from the pre-extension value.
                 start_wm = self.watermark_physical
@@ -1443,29 +1483,30 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._compact_pending(freed_p_pages)
 
     def _free_lazy(self, free_index: torch.Tensor) -> None:
-        """Lazy free path.
+        """Lazy free path (§S373).
 
         Immediate disjoint-element scatters on schedule_stream, NO
-        `wait_stream(forward_stream)`. Each freed physical page is routed
-        through `_release_phys_pages_batch` (boundary-shortcut absorbs at
-        the watermark, else pushes to `_free_phys_pages`). Virtual page
-        ids are recycled to `free_virtual_ids` (id-owner only). The
-        compaction move is deferred to `_flush`.
+        `wait_stream(forward_stream)`. The freed physical pages are
+        appended to `_free_phys_pages` via ONE `torch.cat` — NO sort, NO
+        boundary absorb, NO watermark mutation, ZERO D2H syncs (the
+        debug-gated tombstone check pays a sync only when the env var is
+        on). Boundary absorption is deferred entirely to `_flush`. This
+        matches the baseline allocator's `free_pages = torch.cat((...))`
+        cost profile.
 
-        Vectorization: for `page_size == 1`, skip the
-        `torch.unique` call — token-granular `free_index` is already
-        page-unique by construction (each token is its own page). This
-        eliminates `torch.unique`'s implicit sync (output-size is
-        data-dependent → forces a CPU/GPU sync) on the ps=1 hot path.
-        For `page_size > 1`, `torch.unique` is still needed to dedup
-        same-page tokens; the sync there is unavoidable.
+        Vectorization: for `page_size == 1`, skip the `torch.unique`
+        call — token-granular `free_index` is already page-unique by
+        construction. For `page_size > 1`, `torch.unique` is needed to
+        dedup same-page tokens; its output-size sync is unavoidable.
 
-        The per-page Python work (boundary shortcut + hole-set updates)
-        is moved into `_release_phys_pages_batch` which caches attribute
-        lookups across iterations and inlines the boundary walk —
-        saving the per-call function-frame overhead of the previous
-        per-page `_release_phys_page` loop.
+        `live_page_count` is updated from CPU shape metadata
+        (`freed_p_pages.shape[0]`) — no sync. Tombstones in `freed_p_pages`
+        (which mean a virtual was already freed — a caller bug caught by
+        the debug check) would be cat'd onto the free list as `-1`; the
+        existing `SGLANG_DEBUG_CHECK_V2P_TOMBSTONES` debug gate catches
+        this loud rather than silently corrupting the free list.
         """
+        self._stats_n_free_lazy += 1
         with record_function("MultiEndedAlloc._free_lazy"):
             with record_function("MultiEndedAlloc._free_lazy.v2p_lookup"):
                 free_v_pages_raw = free_index.detach().to(torch.int64)
@@ -1497,74 +1538,44 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self.free_virtual_ids = torch.cat(
                     [self.free_virtual_ids, free_v_pages]
                 )
-            # Single `.tolist()` sync; batch-process the resulting Python
-            # list (cached attribute lookups + inlined boundary walk in
-            # `_release_phys_pages_batch`). Tombstoned entries (p<0) were
-            # already freed in a prior call — skip and don't double-count.
-            freed_list = freed_p_pages.tolist()
-            n_freed = self._release_phys_pages_batch(freed_list)
-            self.live_page_count -= n_freed
+            # §S373 §L2: ONE torch.cat. THAT IS ALL. No sort, no absorb,
+            # no watermark mutation. Pure GPU op.
+            self._free_phys_pages = torch.cat(
+                [self._free_phys_pages, freed_p_pages]
+            )
+            if _SORT_FREE_LIST_AFTER_MERGE:
+                # Optional sort — keeps the list always-sorted so `_flush`
+                # can skip its sort step, at the cost of one extra GPU
+                # sort per `_free_lazy` call. Default OFF.
+                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
+            # CPU-only bookkeeping (shape metadata — no sync).
+            self.live_page_count -= int(freed_p_pages.shape[0])
 
-    def _release_phys_pages_batch(self, pages: List[int]) -> int:
-        """Vectorized release of a list of freed physical PAGE ids.
-        Returns the count of valid (non-tombstone) pages released.
+    def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
+        """§S373 thin wrapper for the compaction-src release path. Just cats
+        `pages` (a GPU int64 tensor) onto `_free_phys_pages` and applies the
+        optional sort. Called by `_flush` at flush END to merge the
+        event-fired compaction-src pages accumulated in `released_fired`,
+        AFTER the trailing dst-slice (solution-(4): this ordering keeps
+        `_free_phys_pages` == `holes_cpu` during the survivor walk, so the
+        slice targets the consumed dsts correctly in both grow directions).
 
-        Equivalent to:
-            for p in pages:
-                if p < 0: continue
-                self._release_phys_page(p)
-            return count
-
-        Optimizations:
-          - Cached `wm`, `fp`, `min_idx`, `num_pages` locals instead of
-            per-iteration attribute lookups
-          - Single boundary-shortcut walk at the end (after all newly-
-            freed pages have been classified into boundary-eligible vs
-            non-boundary), absorbing both newly-freed boundary pages AND
-            previously-existing adjacent holes
-          - One Python frame instead of N (~500 ns/call saving)
-
-        Behavior is byte-identical to the per-page `_release_phys_page`
-        loop modulo the order in which holes get absorbed into the
-        watermark — but the watermark always ends at the same value
-        (the deepest contiguous-from-boundary hole boundary).
+        No watermark mutation, no `live_page_count` update — these pages
+        are vacated compaction-src positions (or pages whose owning
+        request just finished and `_free_lazy` already debited
+        `live_page_count`); they re-enter the free list as PURE storage,
+        not as freshly-freed live pages. Boundary absorption happens at
+        `_flush` time.
         """
-        if not pages:
-            return 0
+        if pages.numel() == 0:
+            return
+        self._stats_n_release_batch += 1
         with record_function("MultiEndedAlloc._release_phys_pages_batch"):
-            n_freed = 0
-            fp = self._free_phys_pages   # local for speed
-            if self.grow_direction == "up":
-                wm = self.watermark_physical
-                min_idx = self.min_page_index
-                # Pass 1: every valid page goes into the hole set. The
-                # boundary-shortcut walk in pass 2 will absorb any pages
-                # contiguous with the watermark (newly-freed or old).
-                for p in pages:
-                    if p < 0:
-                        continue
-                    fp.add(p)
-                    n_freed += 1
-                # Pass 2: walk inward from the watermark, absorbing
-                # contiguous holes. Same final watermark as per-page
-                # processing, but one walk instead of N + (N-1) + ...
-                while wm > min_idx and (wm - 1) in fp:
-                    fp.discard(wm - 1)
-                    wm -= 1
-                self.watermark_physical = wm
-            else:
-                wm = self.watermark_physical
-                num_pages = self.num_pages
-                for p in pages:
-                    if p < 0:
-                        continue
-                    fp.add(p)
-                    n_freed += 1
-                while wm < num_pages - 1 and (wm + 1) in fp:
-                    fp.discard(wm + 1)
-                    wm += 1
-                self.watermark_physical = wm
-            return n_freed
+            self._free_phys_pages = torch.cat(
+                [self._free_phys_pages, pages]
+            )
+            if _SORT_FREE_LIST_AFTER_MERGE:
+                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
         """Eager compaction over the freed PHYSICAL pages: move the survivor
@@ -1785,157 +1796,259 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # not on this stream. Typical wait: tens of µs.
             return set(phys_pages.tolist())
 
-    def _release_phys_page(self, p: int) -> None:
-        """Return a single freed physical PAGE id to the available pool.
+    # §S373: `_release_phys_page` (single-page CPU boundary walk) is
+    # DELETED. All release paths route through `_release_phys_pages_batch`
+    # which is now a thin `torch.cat` wrapper; boundary absorption is
+    # deferred entirely to `_flush`.
 
-        Boundary shortcut (§S37 Q3 step 1): if `p` is at the current
-        boundary, shrink the watermark and walk inward through contiguous
-        holes already at the new boundary, absorbing them too. Otherwise
-        insert `p` into `_free_phys_pages`.
+    def _maybe_emit_stats(self) -> None:
+        """§S373 — env-gated periodic stats emit. Called at the end of
+        `_flush`. Logs a one-line cumulative summary of memory-pressure
+        and lazy-compaction activity at most once every
+        `SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC` seconds (default
+        30s). Disabled unless `SGLANG_LOG_LAZY_COMPACTION_STATS=1`.
 
-        CPU-only, scheduler-thread only. Caller must have already cleared
-        v2p/p2v for this page.
+        Output (single line, INFO):
+          [lazy-stats sub=full] free_lazy=N flush=M (work=K moves=P abs=Q)
+          drain=R/S sort=ON peak_holes=H peak_pending=I live=L wm=W
         """
-        if self.grow_direction == "up":
-            # Boundary slot for grow-up is `watermark_physical - 1`.
-            if p == self.watermark_physical - 1:
-                self.watermark_physical -= 1
-                # Walk inward, absorbing contiguous boundary holes.
-                while (
-                    self.watermark_physical > self.min_page_index
-                    and (self.watermark_physical - 1) in self._free_phys_pages
-                ):
-                    self._free_phys_pages.discard(self.watermark_physical - 1)
-                    self.watermark_physical -= 1
-            else:
-                self._free_phys_pages.add(p)
-        else:
-            # Boundary slot for grow-down is `watermark_physical + 1`.
-            if p == self.watermark_physical + 1:
-                self.watermark_physical += 1
-                while (
-                    self.watermark_physical < self.num_pages - 1
-                    and (self.watermark_physical + 1) in self._free_phys_pages
-                ):
-                    self._free_phys_pages.discard(self.watermark_physical + 1)
-                    self.watermark_physical += 1
-            else:
-                self._free_phys_pages.add(p)
+        if not _LAZY_COMPACTION_STATS_ENABLED:
+            return
+        now = _time_mod.monotonic()
+        if now - self._stats_last_emit_ts < _LAZY_COMPACTION_STATS_INTERVAL_SEC:
+            return
+        self._stats_last_emit_ts = now
+        self._stats_n_emits += 1
+        # Read current snapshot of pressure indicators (cheap CPU metadata).
+        cur_holes = int(self._free_phys_pages.shape[0])
+        cur_pending = len(self._pending_reuse_pages_cpu)
+        self._stats_peak_free_list_len = max(
+            self._stats_peak_free_list_len, cur_holes
+        )
+        self._stats_peak_pending_pages = max(
+            self._stats_peak_pending_pages, cur_pending
+        )
+        sort_tag = "ON" if _SORT_FREE_LIST_AFTER_MERGE else "OFF"
+        logger.info(
+            f"[lazy-stats sub={self.sub_pool_name!r}] "
+            f"free_lazy={self._stats_n_free_lazy} "
+            f"flush={self._stats_n_flush_calls} "
+            f"(work={self._stats_n_flush_did_work} "
+            f"moves={self._stats_n_flush_moves} "
+            f"abs={self._stats_n_pages_absorbed}) "
+            f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
+            f"sort={sort_tag} "
+            f"peak_holes={self._stats_peak_free_list_len} "
+            f"peak_pending={self._stats_peak_pending_pages} "
+            f"cur_holes={cur_holes} cur_pending={cur_pending} "
+            f"live={self.live_page_count} wm={self.watermark_physical}"
+        )
+
+    def _emit_stats_final(self, reason: str = "exit") -> None:
+        """§S373 — force-emit the final counters at process shutdown,
+        bypassing the time-interval gate of `_maybe_emit_stats`. Tagged
+        `FINAL` in the log line so it's easy to grep out the workload-end
+        snapshot; `reason` distinguishes atexit vs SIGTERM vs SIGINT.
+        Idempotent (guards against double-emit when both the signal
+        handler and atexit fire). Best-effort: any error is swallowed
+        (we're at shutdown; raising would be worse).
+        """
+        if not _LAZY_COMPACTION_STATS_ENABLED:
+            return
+        if getattr(self, "_stats_final_emitted", False):
+            return
+        try:
+            cur_holes = int(self._free_phys_pages.shape[0])
+            cur_pending = len(self._pending_reuse_pages_cpu)
+            self._stats_peak_free_list_len = max(
+                self._stats_peak_free_list_len, cur_holes
+            )
+            self._stats_peak_pending_pages = max(
+                self._stats_peak_pending_pages, cur_pending
+            )
+            sort_tag = "ON" if _SORT_FREE_LIST_AFTER_MERGE else "OFF"
+            self._stats_final_emitted = True
+            logger.info(
+                f"[lazy-stats FINAL sub={self.sub_pool_name!r} reason={reason}] "
+                f"free_lazy={self._stats_n_free_lazy} "
+                f"flush={self._stats_n_flush_calls} "
+                f"(work={self._stats_n_flush_did_work} "
+                f"moves={self._stats_n_flush_moves} "
+                f"abs={self._stats_n_pages_absorbed}) "
+                f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
+                f"sort={sort_tag} "
+                f"peak_holes={self._stats_peak_free_list_len} "
+                f"peak_pending={self._stats_peak_pending_pages} "
+                f"cur_holes={cur_holes} cur_pending={cur_pending} "
+                f"live={self.live_page_count} wm={self.watermark_physical} "
+                f"n_emits={self._stats_n_emits}"
+            )
+        except Exception:
+            pass
 
     def _drain_pending_reuse(self, *, urgent: bool) -> None:
-        """Move ready `_pending_reuse` entries back to the available pool.
+        """§S373 — move ready `_pending_reuse` entries back into
+        `_free_phys_pages` via pure-GPU `torch.cat`.
 
-        Each entry is `p → reader_forward_done_event`:
+        Each entry is `Event → (cpu_list, gpu_tensor)`:
           * non-urgent: release only entries whose event is `None` or has
             already fired (`event.query()` True). Sync-free.
-          * urgent: `wait_event` on any unfired event, then release.
+          * urgent: `stream.wait_event` on any unfired event (stream-side
+            dependency, not host block), then release.
 
-        Used at the start of `_flush` and inside the alloc-retry path.
-        Pages released this way go back through
-        `_release_phys_pages_batch` (boundary-shortcut or
-        `_free_phys_pages`).
+        Used at `_flush` entry, by the per-step `maybe_drain_pending_reuse`
+        scheduler hook, and inside the alloc-retry path. Pages released
+        this way go back to `_free_phys_pages` via ONE batched cat (plus
+        an optional sort if the env knob is on); NO watermark mutation,
+        NO `live_page_count` change (these are vacated compaction-src
+        positions, not freshly freed pages).
 
-        Batching: pages added by a single
-        `_commit_move_batch` all share the SAME `latest_event` object
-        reference. Grouping the dict by event identity and querying each
-        unique event ONCE — instead of per page — cuts the CUDA driver
-        call rate from O(M) to O(distinct_events), where typical
-        distinct_events is 1-3 per flush. For M=hundreds of pending
-        pages this saves hundreds of µs per drain.
+        Batching (vs eval_122): the new design has ONE dict entry per
+        BATCH (keyed by Event), not one per src. The CPU list is used
+        for the parallel-Set `difference_update`; the GPU tensor is
+        cat'd directly without a second H2D copy.
         """
+        self._stats_n_drain_calls += 1
         if not self._pending_reuse:
             return
         with record_function("MultiEndedAlloc._drain_pending_reuse"):
-            # Group pages by event identity. `torch.cuda.Event` uses
-            # default Python object identity for hashing — entries added
-            # by the same `_commit_move_batch` share the same Event
-            # reference, so they group into one bucket.
-            by_event: Dict[
-                Optional["torch.cuda.Event"], List[int]
-            ] = {}
-            for p, ev in self._pending_reuse.items():
-                by_event.setdefault(ev, []).append(p)
-
-            # Decide which buckets release. event.query() is called
-            # ONCE per unique event regardless of how many pages share
-            # it.
-            to_release: List[int] = []
-            for ev, page_list in by_event.items():
-                if ev is None or ev.query():
-                    to_release.extend(page_list)
+            ready_tensors: List[torch.Tensor] = []
+            ready_entries: List[
+                Tuple["torch.cuda.Event", List[int]]
+            ] = []
+            for event, (cpu_list, gpu_tensor) in self._pending_reuse.items():
+                if event is None or event.query():
+                    # Sync-free — event.query() is non-blocking.
+                    ready_tensors.append(gpu_tensor)
+                    ready_entries.append((event, cpu_list))
                 elif urgent:
-                    torch.cuda.current_stream().wait_event(ev)
-                    to_release.extend(page_list)
-            for p in to_release:
-                del self._pending_reuse[p]
-            # Single batched release — also amortizes the boundary-walk
-            # over the released pages (one walk instead of len(released)
-            # walks).
-            self._release_phys_pages_batch(to_release)
+                    # Stream-side dependency, not host block.
+                    torch.cuda.current_stream().wait_event(event)
+                    ready_tensors.append(gpu_tensor)
+                    ready_entries.append((event, cpu_list))
+
+            for event, cpu_list in ready_entries:
+                del self._pending_reuse[event]
+                self._pending_reuse_pages_cpu.difference_update(cpu_list)
+
+            if ready_tensors:
+                # ONE torch.cat on GPU; no sync.
+                self._free_phys_pages = torch.cat(
+                    [self._free_phys_pages] + ready_tensors
+                )
+                # §S373 stats: count batches drained and total pages
+                # returned to the free list.
+                self._stats_n_drain_did_work += 1
+                self._stats_n_drained_pages_total += sum(
+                    t.numel() for t in ready_tensors
+                )
+                if _SORT_FREE_LIST_AFTER_MERGE:
+                    # Keep the sort-invariant on the post-cat tensor so
+                    # subsequent `take_physical` calls (and the next
+                    # `_flush`) can skip sorting.
+                    self._free_phys_pages, _ = torch.sort(
+                        self._free_phys_pages
+                    )
+
+    def maybe_drain_pending_reuse(self) -> None:
+        """§S373 — public scheduler hook. Called once per scheduler step
+        (gated on non-empty `_pending_reuse`). Keeps the pending-reuse
+        queue short: as soon as a prior compaction batch's event fires,
+        its src pages flow back into `_free_phys_pages` for immediate
+        alloc reuse — without waiting for the next `_flush`.
+
+        Cost when queue empty: a dict-empty check (~ns). When draining:
+        a few `event.query()` calls + one `torch.cat` (~10-20µs). No
+        D2H sync either way.
+        """
+        if not self.lazy_compaction:
+            return
+        if not self._pending_reuse:
+            return
+        self._drain_pending_reuse(urgent=False)
 
     def _topmost_survivor(
         self,
-        exclude: Optional[Set[int]] = None,
         start_hint: Optional[int] = None,
-    ) -> Optional[int]:
-        """Find the topmost live PAGE in the allocated band (direction-
-        aware), excluding holes in `_free_phys_pages`, pages held in
-        `_pending_reuse` (whose `p2v` has already been cleared by a prior
-        remap — they would otherwise look like "alive" candidates because
-        they're not in `_free_phys_pages`), and any additional pages
-        passed via `exclude` (used by `_flush` to skip in-progress moves
-        within the same flush call).
+        *,
+        holes_cpu: Optional[List[int]] = None,
+        j_in: Optional[int] = None,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """§S373 two-pointer survivor walk.
+
+        Find the topmost live PAGE in the allocated band (direction-
+        aware), excluding holes (positions in `holes_cpu`, the post-sort
+        CPU snapshot of `_free_phys_pages` taken at `_flush` entry) and
+        pages in `_pending_reuse_pages_cpu` (whose `p2v` has already
+        been cleared by a prior compaction remap).
 
         For grow-up: largest `p < watermark_physical` satisfying the
         exclusions. For grow-down: smallest `p > watermark_physical`
-        satisfying them. Returns `None` if no candidate exists.
+        satisfying them.
 
-        `start_hint`: if provided, begin the
-        scan at this physical-page index instead of the boundary. Used
-        by `_flush` to thread a cursor across its inner loop so the
-        total survivor walk is O(K) over the whole flush call, NOT
-        O(K²) — the latter is what caused the Falcon × radix ×
-        stress post-completion hang (~40 min spent in `_flush` after
-        prior workloads fragmented the allocator band). Callers MUST maintain the invariant that the
-        hint never points to a position the previous iteration has
-        already cleared. Defensive clamping handles a stale hint that
-        crossed the boundary (e.g., absorbed by a watermark shortcut)
-        by snapping it back to the boundary.
+        Two-pointer membership check (the user's no-set, no-mutation
+        insight). The survivor cursor `p` is monotonic (decreasing for
+        grow-up, increasing for grow-down). `holes_cpu` is a sorted-
+        ASCENDING Python list — a READ-ONLY snapshot. We thread a
+        cursor `j` alongside `p`; both move monotonically through their
+        domains, so membership is O(1) per check.
+
+        No `exclude` set needed (the §S372 simplification): once `p`
+        walks below the last picked dst, either the outer
+        `_free_phys_pages.numel() > 0` gate has already exited (no more
+        holes to dst into) OR `p`'s position was originally a hole (the
+        snapshot correctly reports it). Either way, popped-but-
+        uncommitted dsts have `p2v == -1` and treating them as "skip"
+        via the original sorted snapshot is exactly correct — picking
+        one as a survivor would corrupt the in-flight copy.
+
+        Returns `(p, j)` so the caller can thread `j` into the next
+        call (alongside `start_hint = p ± 1`). Returns `(None, j)`
+        when no candidate exists.
+
+        Callers SHOULD pass `holes_cpu` and `j_in` from `_flush`.
+        They're optional so test fixtures can call without snapshot
+        (the snapshot is lazily materialized via `.tolist()` — pays a
+        sync, only OK for tests).
         """
+        if holes_cpu is None:
+            holes_cpu = self._free_phys_pages.tolist()
         if self.grow_direction == "up":
-            # Caller's `start_hint` is the upper bound of the scan. A
-            # stale hint above `watermark_physical - 1` (the watermark
-            # may have shrunk via boundary shortcut) is safely clamped
-            # so we never scan invalid positions.
             if start_hint is None or start_hint >= self.watermark_physical:
                 p = self.watermark_physical - 1
             else:
                 p = start_hint
+            j = j_in if j_in is not None else len(holes_cpu) - 1
             while p >= self.min_page_index:
-                if (
-                    p in self._free_phys_pages
-                    or p in self._pending_reuse
-                    or (exclude is not None and p in exclude)
-                ):
+                # Advance `j` past holes strictly above `p` (already
+                # behind the cursor; we'll never revisit them).
+                while j >= 0 and holes_cpu[j] > p:
+                    j -= 1
+                is_hole = (j >= 0 and holes_cpu[j] == p)
+                if is_hole or p in self._pending_reuse_pages_cpu:
+                    if is_hole:
+                        j -= 1  # consume the hole entry
                     p -= 1
                     continue
-                return p
-            return None
+                return p, j
+            return None, j
         else:
             if start_hint is None or start_hint <= self.watermark_physical:
                 p = self.watermark_physical + 1
             else:
                 p = start_hint
+            j = j_in if j_in is not None else 0
             while p < self.num_pages:
-                if (
-                    p in self._free_phys_pages
-                    or p in self._pending_reuse
-                    or (exclude is not None and p in exclude)
-                ):
+                while j < len(holes_cpu) and holes_cpu[j] < p:
+                    j += 1
+                is_hole = (j < len(holes_cpu) and holes_cpu[j] == p)
+                if is_hole or p in self._pending_reuse_pages_cpu:
+                    if is_hole:
+                        j += 1
                     p += 1
                     continue
-                return p
-            return None
+                return p, j
+            return None, j
 
     def _flush(self, *, urgent: bool) -> int:
         """Run a batched compaction pass (Phase A: single-stream) with
@@ -1986,58 +2099,122 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         """
         if not self.lazy_compaction:
             return 0
+        self._stats_n_flush_calls += 1
         with record_function("MultiEndedAlloc._flush"):
+            # §S373 step 1: drain pending_reuse — pure GPU cat, no sync.
             self._drain_pending_reuse(urgent=urgent)
+
+            # §S373 step 2: sort on GPU — SKIP if env knob is set (then
+            # the list is already sorted because `_free_lazy` and
+            # `_drain_pending_reuse` sort after every cat). Either way,
+            # `_free_phys_pages` is sorted ASCENDING after this step.
+            if (
+                not _SORT_FREE_LIST_AFTER_MERGE
+                and self._free_phys_pages.numel() > 1
+            ):
+                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
+
+            # §S373 step 3: ONE D2H sync — `.tolist()` of the sorted
+            # tensor. This is the ONE sync per `_flush` call.
+            all_cpu = self._free_phys_pages.tolist()
+            M = len(all_cpu)
+
+            # §S373 step 4: CPU-side COMPLETE boundary absorb (no
+            # SCAN_BLOCK cap — there may be many free slots; we want
+            # all contiguous-from-watermark ones).
+            wm = self.watermark_physical
+            if self.grow_direction == "up":
+                n_absorbed = 0
+                while (
+                    n_absorbed < M
+                    and all_cpu[M - 1 - n_absorbed] == wm - 1 - n_absorbed
+                ):
+                    n_absorbed += 1
+                new_wm = wm - n_absorbed
+                holes_cpu = all_cpu[: M - n_absorbed]
+            else:
+                n_absorbed = 0
+                while (
+                    n_absorbed < M
+                    and all_cpu[n_absorbed] == wm + 1 + n_absorbed
+                ):
+                    n_absorbed += 1
+                new_wm = wm + n_absorbed
+                holes_cpu = all_cpu[n_absorbed:]
+
+            # §S373 step 5: update watermark + slice GPU tensor using
+            # CPU int (no sync). After this slice, the GPU
+            # `_free_phys_pages` exactly matches `holes_cpu`.
+            self.watermark_physical = new_wm
+            new_len = M - n_absorbed
+            if self.grow_direction == "up":
+                self._free_phys_pages = self._free_phys_pages[:new_len]
+            else:
+                self._free_phys_pages = self._free_phys_pages[n_absorbed:]
+            # §S373 stats: count pages absorbed into watermark this flush
+            # (an indicator of boundary-shortcut activity).
+            self._stats_n_pages_absorbed += n_absorbed
+
             latest_event = self._latest_forward_done_event
 
-            # Lazy write-set
-            # materialization. `write_set is None` means "not yet
+            # Lazy write-set materialization.
+            # `write_set is None` means "not yet
             # materialized — do it inline on first survivor that needs
             # the check." An empty `set()` means "no in-flight write
-            # race possible (no in-flight forward / forward already
-            # done / Mamba state pool / urgent-wait just drained
-            # the forward)." Otherwise it's the materialized
-            # physical-page set.
+            # race possible." Otherwise it's the materialized set.
             #
-            # Most flushes never reach the survivor-pick loop (empty-
-            # set fast-path in `flush_opportunistic`), so the bs-sized
-            # D2H inside `_materialize_inflight_write_set` is paid
-            # ONLY when actually needed.
-            #
-            # The in-flight forward set is FROZEN for the duration of
-            # this `_flush` call (the scheduler thread is the only
-            # writer to `_inflight_forward`, and it's currently in
-            # this function). So a single materialization is valid
-            # for the whole loop.
-            write_set: Optional[Set[int]] = None  # None = not yet materialized
+            # Most flushes never reach the survivor-pick loop (the
+            # empty-list fast path in `flush_opportunistic` short-
+            # circuits), so the bs-sized D2H inside
+            # `_materialize_inflight_write_set` is paid ONLY when needed.
+            write_set: Optional[Set[int]] = None
 
             # Accumulated move batch — committed in one shot below.
             srcs: List[int] = []
             dsts: List[int] = []
             v_moveds: List[int] = []
-            # CPU-only exclusion so `_topmost_survivor` won't re-pick a
-            # page we've already accepted into this flush's batch.
-            in_progress: Set[int] = set()
 
-            # Flush-local survivor cursor.
-            # `_topmost_survivor` uses this as the scan start, then we
-            # advance it strictly past the just-picked src so the next
-            # iteration begins from there. Without it, every call walks
-            # from the boundary inward and pays an O(K) cost in the
-            # holes already encountered, giving O(K²) per flush — the
-            # Falcon × radix × stress hang root cause.
-            # `None` means "use the boundary"; we reset to None after
-            # a write-race urgent-wait splits the loop, since events
-            # may have changed which pages count as survivors.
+            # §S373 solution-(4) — flush-scoped accumulator for the
+            # event-FIRED compaction-src pages. `_commit_move_batch` appends
+            # each fired batch's `src_pages_t` here INSTEAD of catting it
+            # straight onto `_free_phys_pages`. The merge is deferred to
+            # AFTER the trailing dst-slice below, so `_free_phys_pages` stays
+            # byte-identical to `holes_cpu` (the post-absorb snapshot) for
+            # the entire survivor walk. That pristine-snapshot invariant is
+            # what makes the directional dst-slice correct in BOTH grow
+            # directions: with srcs appended mid-flush (the old behavior),
+            # the grow-down `[:-n_dst_consumed]` slice would chop the
+            # just-appended srcs instead of the consumed dsts, and a sort=ON
+            # re-sort (inside `_release_phys_pages_batch`) would scramble the
+            # grow-up slice too — both leaving ghost (`p2v=-1`, untracked)
+            # pages that trip the survivor-walk assertion on a later flush,
+            # plus double-bound dsts that silently corrupt KV. Event-PENDING
+            # srcs still route to `_pending_reuse` (read-race gating MUST be
+            # preserved — a src whose reader event has not fired cannot
+            # re-enter the alloc-able free list yet).
+            released_fired: List[torch.Tensor] = []
+
+            # §S373 survivor cursor — passed to `_topmost_survivor` as
+            # `start_hint`. The two-pointer hole cursor `j_cursor` is
+            # threaded alongside.
             cursor: Optional[int] = None
+            j_cursor: Optional[int] = None
 
-            # Per-call move cap on non-urgent
-            # flushes. See the `_lazy_max_moves_per_call` initialization
-            # in `__init__` for the rationale. We cap the count of moves
-            # *committed* in this call, NOT the count of iterations of
-            # the loop body, so a flush that finds many holes but few
-            # eligible survivors (everything in write_set) still
-            # terminates promptly via the existing `break` paths.
+            # §S373 dst cursor — reads dst values from `holes_cpu`
+            # directly (NO per-dst `.item()` sync). For grow-up: dsts
+            # come from the front (smallest first), `dst_cursor`
+            # advances forward; for grow-down: dsts come from the back
+            # (largest first), `dst_cursor` advances backward.
+            #
+            # At flush exit we slice the consumed prefix/suffix off
+            # `_free_phys_pages` in ONE GPU op (no per-iter slicing).
+            if self.grow_direction == "up":
+                dst_cursor = 0
+            else:
+                dst_cursor = len(holes_cpu) - 1
+            n_dst_consumed = 0
+
+            # Per-call move cap on non-urgent flushes.
             move_cap = (
                 self._lazy_max_moves_per_call
                 if not urgent
@@ -2045,101 +2222,153 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             )
 
             n_moves = 0
-            while self._free_phys_pages:
-                src = self._topmost_survivor(
-                    exclude=in_progress, start_hint=cursor
+            # Outer loop: stop when no more dsts available.
+            while n_dst_consumed < len(holes_cpu):
+                src, j_cursor = self._topmost_survivor(
+                    start_hint=cursor,
+                    holes_cpu=holes_cpu,
+                    j_in=j_cursor,
                 )
                 if src is None:
                     break
 
                 # Case A: write race.
-                # Lazy materialization — only on the FIRST survivor that
-                # we might need to classify. After this, `write_set` is
-                # either a populated set or an empty set (if no in-flight
-                # forward / forward already done / forward writes no
-                # slots in this pool).
                 if write_set is None:
                     materialized = self._materialize_inflight_write_set()
-                    write_set = materialized if materialized is not None else set()
+                    write_set = (
+                        materialized if materialized is not None else set()
+                    )
                 if write_set and src in write_set:
                     if urgent:
-                        # Commit any moves accumulated so far so the copy
-                        # overlaps with what schedule_stream was doing.
+                        # Commit any moves accumulated so far so the
+                        # copy overlaps with what schedule_stream was
+                        # doing.
                         self._commit_move_batch(
-                            srcs, dsts, v_moveds, latest_event
+                            srcs, dsts, v_moveds, latest_event, released_fired
                         )
                         n_moves += len(srcs)
                         srcs.clear()
                         dsts.clear()
                         v_moveds.clear()
-                        in_progress.clear()
                         # Wait on the in-flight forward's event so
-                        # subsequent compaction (this src or the next)
-                        # is clear of the write race. With the
-                        # simplified design there's at most ONE
-                        # in-flight forward, so we wait on
-                        # the single event in `_inflight_forward`.
+                        # subsequent compaction is clear of the write
+                        # race. With the simplified design there's at
+                        # most ONE in-flight forward.
                         inflight = self._inflight_forward
                         if inflight is not None:
-                            torch.cuda.current_stream().wait_event(inflight[0])
+                            torch.cuda.current_stream().wait_event(
+                                inflight[0]
+                            )
                             self._inflight_forward = None
                         write_set = set()  # forward drained → no race
                         latest_event = None
-                        # Cursor reset: write-set just emptied, so any
-                        # position above is now a fresh candidate; start
-                        # the next scan from the boundary again.
-                        cursor = None
+                        # DO NOT reset `cursor` / `j_cursor`. Resetting
+                        # them would rewind the walk to wm-1, where the
+                        # just-committed src positions live. Those
+                        # positions now have p2v=-1 (cleared inside
+                        # `_commit_move_batch`) but are NOT in
+                        # `holes_cpu` (stale snapshot from flush entry)
+                        # and not in `_pending_reuse_pages_cpu` when the
+                        # commit took the immediate-release path
+                        # (event_fired=True). Re-walking would return
+                        # one of them as a survivor and trip the
+                        # `p2v=-1` assertion. By preserving `cursor` —
+                        # which already points strictly past the
+                        # previously-picked survivors — the next iter
+                        # resumes at the write-race blocker itself
+                        # (which now passes the race check under the
+                        # empty `write_set`).
                         continue  # retry this src under empty write-set
                     else:
                         # Non-urgent: top blocker → STOP the walk.
                         break
 
-                # Case B/C: no write race. Pick dst and accumulate.
-                dst = self._pop_hole_directional()
-                if dst is None:
-                    break
+                # Case B/C: no write race. Pick dst from holes_cpu by
+                # cursor (NO `.item()` sync).
+                dst = holes_cpu[dst_cursor]
+                if self.grow_direction == "up":
+                    dst_cursor += 1
+                else:
+                    dst_cursor -= 1
+                n_dst_consumed += 1
+
                 v_moved = int(self.physical_to_virtual[src].item())
                 if v_moved < 0:
                     # `_topmost_survivor` is supposed to exclude every
                     # page whose `p2v` is `-1` (holes + pending reuse).
                     # Reaching this branch means the allocator is in a
-                    # corrupt state — fail loudly rather than silently
-                    # masking the bug (user point 3).
+                    # corrupt state — fail loudly.
                     raise AssertionError(
                         f"MultiEndedAllocator({self.sub_pool_name!r})."
                         f"_flush: topmost survivor p={src} has p2v=-1; "
                         "this should be impossible (`_topmost_survivor` "
-                        "excludes `_free_phys_pages` and `_pending_reuse`). "
-                        f"State: {self.allocator_state_str()}, "
-                        f"#holes={len(self._free_phys_pages)}, "
-                        f"#pending_reuse={len(self._pending_reuse)}, "
-                        f"#in_progress_this_flush={len(in_progress)}"
+                        "excludes `holes_cpu` and `_pending_reuse_pages_cpu`)."
+                        f" State: {self.allocator_state_str()}, "
+                        f"#holes={len(holes_cpu)}, "
+                        f"#pending_reuse={len(self._pending_reuse_pages_cpu)}"
                     )
 
                 srcs.append(src)
                 dsts.append(dst)
                 v_moveds.append(v_moved)
-                in_progress.add(src)
-                in_progress.add(dst)
 
-                # Flush-local survivor cursor: advance cursor strictly past the picked
-                # src so the next call's scan starts there. Direction-
-                # aware: grow-up walks toward lower indices, grow-down
-                # toward higher.
+                # Advance cursor strictly past the picked src.
                 if self.grow_direction == "up":
                     cursor = src - 1
                 else:
                     cursor = src + 1
 
-                # Per-call move cap on non-urgent flushes. The remaining holes are
-                # picked up by the next opportunistic flush; the
-                # scheduler stays responsive in the meantime.
+                # Per-call move cap on non-urgent flushes.
                 if move_cap is not None and len(srcs) >= move_cap:
                     break
 
             # Commit any final accumulated batch.
-            self._commit_move_batch(srcs, dsts, v_moveds, latest_event)
+            self._commit_move_batch(
+                srcs, dsts, v_moveds, latest_event, released_fired
+            )
             n_moves += len(srcs)
+
+            # §S373: slice off consumed dsts from `_free_phys_pages` in
+            # ONE GPU op (replaces the eval_122 per-iter pop loop).
+            #
+            # solution-(4) invariant: at this point `_free_phys_pages` is
+            # still byte-identical to `holes_cpu` (the post-absorb snapshot)
+            # — `_commit_move_batch` accumulated fired srcs into
+            # `released_fired` rather than mutating the free list, so NO
+            # produce/re-sort happened between the snapshot and this slice.
+            # The consumed dsts therefore occupy exactly the front
+            # `n_dst_consumed` entries (grow-up) / back `n_dst_consumed`
+            # entries (grow-down) of `_free_phys_pages`, so the directional
+            # slice removes precisely them in both directions.
+            if n_dst_consumed > 0:
+                if self.grow_direction == "up":
+                    self._free_phys_pages = (
+                        self._free_phys_pages[n_dst_consumed:]
+                    )
+                else:
+                    self._free_phys_pages = (
+                        self._free_phys_pages[:-n_dst_consumed]
+                    )
+
+            # solution-(4): NOW merge the event-fired compaction-src pages
+            # back into the (just-sliced) free list, in ONE cat. Routing
+            # through `_release_phys_pages_batch` also re-applies the
+            # sort=ON invariant once, so the next flush's step-2 sort-skip
+            # stays valid. For sort=OFF the list is left front-sorted +
+            # srcs-appended, which the next flush's step-2 sort normalizes —
+            # exactly the pre-existing sort=OFF behavior.
+            if released_fired:
+                self._release_phys_pages_batch(
+                    released_fired[0]
+                    if len(released_fired) == 1
+                    else torch.cat(released_fired)
+                )
+            # §S373 stats: count flushes that did real survivor work and
+            # the total moves, then maybe emit the periodic summary.
+            if n_moves > 0:
+                self._stats_n_flush_did_work += 1
+                self._stats_n_flush_moves += n_moves
+            self._maybe_emit_stats()
             return n_moves
 
     def _commit_move_batch(
@@ -2148,12 +2377,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         dsts: List[int],
         v_moveds: List[int],
         latest_event: Optional["torch.cuda.Event"],
+        released_fired: List[torch.Tensor],
     ) -> None:
         """Issue ONE `move_kv_cache` + ONE bulk v2p/p2v remap for the
-        accumulated `(src, dst, v_moved)` triples. Releases each `src`
-        either immediately (event fired) or via `_pending_reuse` (event
-        pending). User point 4 — batched issuance keeps GPU kernel-launch
-        cost amortized.
+        accumulated `(src, dst, v_moved)` triples. Disposes each `src`
+        either by APPENDING to the flush-scoped `released_fired` list (event
+        fired) or via `_pending_reuse` (event pending). User point 4 —
+        batched issuance keeps GPU kernel-launch cost amortized.
+
+        solution-(4): fired srcs are NOT catted onto `_free_phys_pages` here.
+        They accumulate in `released_fired` and `_flush` merges them AFTER
+        its trailing dst-slice, so the free list stays equal to the
+        `holes_cpu` snapshot throughout the survivor walk (see the slice
+        comment in `_flush`). Event-PENDING srcs still route to
+        `_pending_reuse` — read-race gating is unchanged: a src whose reader
+        event has not fired must not become alloc-able yet.
         """
         if not srcs:
             return
@@ -2203,16 +2441,25 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._inverse_history.append(
                 (src_pages_t, dst_pages_t, v_moveds_t)
             )
-            # Decide src disposition once per survivor.
+            # §S373 §L4: src disposition — ONE entry per batch (NOT one
+            # per src). When the event has fired, accumulate the src pages
+            # in the flush-scoped `released_fired` list (merged into
+            # `_free_phys_pages` by `_flush` AFTER its dst-slice — see
+            # solution-(4) note above). When the event is still pending,
+            # store ONE `_pending_reuse` entry keyed by the event; the
+            # value is the (cpu_list, gpu_tensor) tuple, and the GPU tensor
+            # is the SAME `src_pages_t` we already built above (no second
+            # H2D copy at drain time).
             event_fired = (
                 latest_event is None or latest_event.query()
             )
             if event_fired:
-                for src in srcs:
-                    self._release_phys_page(src)
+                released_fired.append(src_pages_t)
             else:
-                for src in srcs:
-                    self._pending_reuse[src] = latest_event
+                # Use a copy of the srcs list (the caller mutates it).
+                srcs_copy: List[int] = list(srcs)
+                self._pending_reuse[latest_event] = (srcs_copy, src_pages_t)
+                self._pending_reuse_pages_cpu.update(srcs_copy)
 
     def flush_opportunistic(self) -> int:
         """Public, non-urgent flush — called by the scheduler at quiescent
@@ -2244,7 +2491,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc.flush_opportunistic"):
             if not self.lazy_compaction:
                 return 0
-            if not self._free_phys_pages and not self._pending_reuse:
+            if (
+                self._free_phys_pages.numel() == 0
+                and not self._pending_reuse
+            ):
                 return 0
             return self._flush(urgent=False)
 
@@ -2599,8 +2849,8 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             fa = self.full_attn_allocator
             ma = self.mamba_allocator
             if (
-                not fa._free_phys_pages and not fa._pending_reuse
-                and not ma._free_phys_pages and not ma._pending_reuse
+                fa._free_phys_pages.numel() == 0 and not fa._pending_reuse
+                and ma._free_phys_pages.numel() == 0 and not ma._pending_reuse
             ):
                 return 0
             return fa.flush_opportunistic() + ma.flush_opportunistic()
@@ -3322,8 +3572,8 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             fa = self.full_attn_allocator
             sa = self.swa_attn_allocator
             if (
-                not fa._free_phys_pages and not fa._pending_reuse
-                and not sa._free_phys_pages and not sa._pending_reuse
+                fa._free_phys_pages.numel() == 0 and not fa._pending_reuse
+                and sa._free_phys_pages.numel() == 0 and not sa._pending_reuse
             ):
                 return 0
             return fa.flush_opportunistic() + sa.flush_opportunistic()
