@@ -634,7 +634,15 @@ class SchedulerPPMixin:
                 device_module.synchronize()
 
                 start = time.perf_counter()
-                batch.prepare_for_extend()
+                if not batch.prepare_for_extend():
+                    # PP-mixin's benchmark scaffold doesn't have retry
+                    # plumbing. Preserve crash semantics (matches the
+                    # pre-refactor deep-assert behavior).
+                    raise RuntimeError(
+                        "scheduler_pp_mixin.prepare_for_extend: "
+                        "planner refused the batch (out of mamba slots "
+                        "or shared-pool byte budget)."
+                    )
                 model_worker_batch = batch.get_model_worker_batch()
 
                 forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)

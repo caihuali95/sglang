@@ -1922,8 +1922,10 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(len(fa._free_phys_pages), 0)
 
     def test_lazy_free_boundary_shortcut(self):
-        """Freeing the topmost (boundary) page shrinks the watermark in-line.
-        Free-list stays empty for boundary frees.
+        """§S373: boundary absorption is DEFERRED to `_flush` (the hot
+        path `_free_lazy` does only a `torch.cat`, no watermark mutation).
+        After `_flush`, the freed boundary page is absorbed into the
+        watermark.
         """
         _pool, fa, _kv = self._make_full(lazy=True)
         a = fa.alloc(3)  # virtual tokens
@@ -1931,9 +1933,16 @@ class TestLazyCompaction(unittest.TestCase):
         # Free the last-alloced virtual id (its physical IS the boundary).
         last = a[-1:].clone()
         fa.free(last)
-        # Watermark should have shrunk by exactly 1 page.
+        # §S373: watermark is NOT shrunk inline; freed page is in the
+        # free list.
+        self.assertEqual(fa.watermark_physical, before_wm)
+        self.assertEqual(len(fa._free_phys_pages), 1)
+        # `live_page_count` is decremented at free time (CPU-side metadata).
+        self.assertEqual(fa.live_page_count, 2)
+        # `_flush` runs the complete boundary absorb → watermark shrinks
+        # by 1, free list emptied.
+        fa._flush(urgent=True)
         self.assertEqual(fa.watermark_physical, before_wm - 1)
-        # No hole pushed into the list — absorbed into watermark.
         self.assertEqual(len(fa._free_phys_pages), 0)
         self.assertEqual(fa.live_page_count, 2)
 
@@ -1953,22 +1962,28 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(fa.live_page_count, 4)
 
     def test_lazy_free_inward_walk(self):
-        """Freeing 1 hole + 1 boundary causes the inward walk to absorb both."""
+        """§S373: the inward walk (multiple contiguous holes absorbed
+        into the watermark in one pass) is DEFERRED to `_flush`. After
+        flush, the watermark shrinks past all contiguous-from-boundary
+        holes, regardless of the order they were freed.
+        """
         _pool, fa, _kv = self._make_full(lazy=True)
         a = fa.alloc(5)
-        # Free a middle slot first → hole appears.
+        wm_before = fa.watermark_physical
+        # Free a middle slot first → hole.
         fa.free(a[2:3].clone())
-        self.assertEqual(len(fa._free_phys_pages), 1)
-        wm_after_mid_free = fa.watermark_physical
-        # Now free the topmost ids one at a time. After freeing all topmost
-        # adjacent to the (formerly non-boundary) hole, the inward walk
-        # should reach the hole and absorb it.
-        fa.free(a[4:5].clone())  # topmost — absorb 1.
-        fa.free(a[3:4].clone())  # now-topmost — absorb 1, which exposes
-                                  # the original hole at the new boundary.
-        # After three frees, watermark should have shrunk past all three.
-        self.assertEqual(fa.watermark_physical, wm_after_mid_free - 3)
-        # The hole should now be absorbed.
+        # Free the topmost ids — under eval_122 these would absorb in
+        # line, under §S373 they cat onto the free list.
+        fa.free(a[4:5].clone())
+        fa.free(a[3:4].clone())
+        # §S373: 3 entries in the free list now; watermark still at the
+        # pre-free position.
+        self.assertEqual(fa.watermark_physical, wm_before)
+        self.assertEqual(len(fa._free_phys_pages), 3)
+        # `_flush` runs the complete CPU-side boundary absorb. All 3
+        # contiguous holes near the boundary get absorbed in one pass.
+        fa._flush(urgent=True)
+        self.assertEqual(fa.watermark_physical, wm_before - 3)
         self.assertEqual(len(fa._free_phys_pages), 0)
         self.assertEqual(fa.live_page_count, 2)
 
@@ -2115,13 +2130,17 @@ class TestLazyCompaction(unittest.TestCase):
         fa.free(a[1:2].clone())  # frees physical at index v2p[a[1]]
         fa.free(a[3:4].clone())
         # Capture which physical pages are now in the hole set.
-        holes_before = sorted(list(fa._free_phys_pages))
+        # §S373: `_free_phys_pages` is a torch.Tensor; `.tolist()` returns
+        # Python ints so `sorted` produces ints (not 0-dim tensors).
+        holes_before = sorted(fa._free_phys_pages.tolist())
         self.assertEqual(len(holes_before), 2)
-        # Alloc 1 — should drain the SMALLEST hole (grow-up).
+        # Alloc 1 — should drain a hole (grow-up).
+        # §S373: with sort-after-merge OFF (default), the drain order
+        # is FIFO over the free-list tensor — NOT "smallest first".
+        # We only assert that the bound physical is ONE OF the holes.
         a2 = fa.alloc(1)
-        # The newly-bound physical for a2 must equal min(holes_before).
         bound_phys = int(fa.virtual_to_physical[int(a2.item())].item())
-        self.assertEqual(bound_phys, holes_before[0])
+        self.assertIn(bound_phys, holes_before)
 
     def test_lazy_non_urgent_stops_at_write_set_blocker(self):
         """§S37 Q3 step 2 case A: when the topmost survivor IS in an
@@ -2199,12 +2218,16 @@ class TestLazyCompaction(unittest.TestCase):
         fa.set_inflight_forward(ev, None)
         n_moves = fa._flush(urgent=False)
         self.assertGreaterEqual(n_moves, 1)
-        # src is in _pending_reuse, gated on the unfired event.
-        self.assertEqual(len(fa._pending_reuse), n_moves)
-        # Fire the event and drain — src returns to availability.
+        # §S373: `_pending_reuse` has ONE entry per BATCH (keyed by
+        # event), not per src. So len(_pending_reuse) == 1 here. The
+        # total pages held is tracked in `_pending_reuse_pages_cpu`.
+        self.assertEqual(len(fa._pending_reuse), 1)
+        self.assertEqual(len(fa._pending_reuse_pages_cpu), n_moves)
+        # Fire the event and drain — srcs return to availability.
         ev.fired = True
         fa._drain_pending_reuse(urgent=False)
         self.assertEqual(len(fa._pending_reuse), 0)
+        self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
 
     def test_lazy_pending_reuse_urgent_wait(self):
         """Under urgent drain, an unfired event triggers wait_event; we
@@ -2219,14 +2242,18 @@ class TestLazyCompaction(unittest.TestCase):
                 self.waited = False
             def query(self):
                 return False  # never fires
-        # Inject into _pending_reuse directly to isolate the drain logic.
-        # (Simulates a prior compaction whose event still hasn't fired.)
-        # Pick a physical page from a; pretend it's now in pending.
+        # §S373: inject ONE batch entry into _pending_reuse keyed by
+        # Event. Value is `(cpu_list, gpu_tensor)`. The parallel CPU
+        # set must also be updated.
+        # (Simulates a prior compaction whose event hasn't fired.)
         p = int(fa.virtual_to_physical[int(a[2].item())].item())
-        # Hack: clear its v2p/p2v so _release_phys_page can route it.
+        # Clear v2p/p2v so post-drain re-use is safe.
         fa.virtual_to_physical[int(a[2].item())] = -1
         fa.physical_to_virtual[p] = -1
-        fa._pending_reuse[p] = _FakeEvent()
+        ev = _FakeEvent()
+        gpu_t = torch.tensor([p], dtype=torch.int64, device=fa.device)
+        fa._pending_reuse[ev] = ([p], gpu_t)
+        fa._pending_reuse_pages_cpu.add(p)
         # Urgent drain — should release p despite event.query()=False.
         # (CPU shim: torch.cuda.current_stream() may not exist; wrap try.)
         try:
@@ -2235,6 +2262,7 @@ class TestLazyCompaction(unittest.TestCase):
             # CPU: wait_event may not work; this test is GPU-only.
             self.skipTest("wait_event requires CUDA")
         self.assertEqual(len(fa._pending_reuse), 0)
+        self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
 
     def test_lazy_flush_opportunistic_hook(self):
         """The public flush_opportunistic method runs the non-urgent path
@@ -2359,7 +2387,9 @@ class TestO3FusedAllocBind(unittest.TestCase):
         a = fa.alloc(3)
         fa.free(a[0:1].clone())  # frees a non-boundary slot → enters holeset
         self.assertEqual(len(fa._free_phys_pages), 1)
-        hole_pos = next(iter(fa._free_phys_pages._alive))
+        # §S373: `_free_phys_pages` is a torch.Tensor; read the single
+        # hole position via `.tolist()` (`._alive` no longer exists).
+        hole_pos = int(fa._free_phys_pages.tolist()[0])
         wm_before = fa.watermark_physical
         # Alloc 1 page via the helper. Slow path should drain the hole.
         v_pages = torch.tensor([42], dtype=torch.int64, device="cuda")
