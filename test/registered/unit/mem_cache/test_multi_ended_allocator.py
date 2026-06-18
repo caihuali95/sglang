@@ -285,6 +285,76 @@ class TestMultiEndedAllocator(unittest.TestCase):
             self._check_invariants(alloc, kv)
             self.assertEqual(alloc.allocated_count(), 0)
 
+    def _build_lazy_full(self, n_full_slots=64, n_mamba_slots=16, move_cap=2):
+        """A LAZY-compaction 'full' (grow-up) allocator + its peer, with a
+        small per-call move cap so flushes are partial (the retract-pressure
+        regime where the ghost bug appears)."""
+        full = _make_mha_spec("full", "up", layer_num=2)
+        mamba = _make_mamba_spec("mamba", "down", layer_num=2)
+        total = full.entry_bytes() * n_full_slots + mamba.entry_bytes() * n_mamba_slots
+        pool = SharedMemoryPool(
+            total_bytes=total, sub_pool_specs=[full, mamba],
+            device=_DEV, enable_memory_saver=False,
+        )
+        full_kv = _FakeKVCache(pool.max_slots("full"))
+        mamba_kv = _FakeKVCache(pool.max_slots("mamba"))
+        full_alloc = MultiEndedAllocator(
+            kvcache=full_kv, shared_buffer=pool, sub_pool_name="full",
+            device=_DEV, is_id_owner=True, lazy_compaction=True,
+        )
+        mamba_alloc = MultiEndedAllocator(
+            kvcache=mamba_kv, shared_buffer=pool, sub_pool_name="mamba",
+            device=_DEV, is_id_owner=True, lazy_compaction=True,
+        )
+        full_alloc.bind_peer(mamba_alloc)
+        mamba_alloc.bind_peer(full_alloc)
+        full_alloc._lazy_max_moves_per_call = move_cap
+        return pool, full_alloc, full_kv
+
+    def test_lazy_retract_churn_no_ghost(self):
+        """§S373 regression: heavy free/flush churn in LAZY mode must never
+        leave a 'ghost' page (p2v<0 not registered in _free_phys_pages or
+        _pending_reuse). This reproduces the retract×lazy-compaction pattern
+        that crashed gpt-oss chunk+overlap mfs0.30 post-rebase. The fail-fast
+        ghost invariant is enabled so any ghost trips at the CREATING op
+        (free_lazy / flush_exit), not at a later survivor walk.
+
+        CPU scope: the GPU write-race *urgent* path (unfired CUDA events ->
+        _pending_reuse) needs a real device; this covers the no-event
+        move/absorb/free/released_fired bookkeeping. Run the actual failing
+        eval cell with SGLANG_DEBUG_CHECK_GHOST_PAGES=1 for the full path.
+        """
+        import sglang.srt.mem_cache.multi_ended_allocator as mea
+
+        prev = mea._GHOST_CHECK_ENABLED
+        mea._GHOST_CHECK_ENABLED = True
+        try:
+            rng = random.Random(0x5373)
+            _, alloc, kv = self._build_lazy_full(n_full_slots=64, move_cap=2)
+            live = []
+            # Bias toward near-capacity occupancy (watermark high, holes pile
+            # up) then churn free/flush — the conditions that surface the bug.
+            for _ in range(3000):
+                avail = alloc.available_size()
+                if (rng.random() < 0.55 and avail > 0) or not live:
+                    n = rng.randint(1, min(5, max(1, avail)))
+                    v = self._alloc(alloc, kv, n)
+                    if v is not None:
+                        live.append(v)
+                else:
+                    v = live.pop(rng.randrange(len(live)))
+                    self._free(alloc, kv, v)  # often non-boundary -> a hole
+                if rng.random() < 0.5:
+                    alloc.flush_opportunistic()  # partial flush (move_cap)
+            # Drain to quiescence; must end empty AND ghost-free.
+            for v in live:
+                self._free(alloc, kv, v)
+            for _ in range(64):
+                alloc.flush_opportunistic()
+            self.assertEqual(alloc.allocated_count(), 0)
+        finally:
+            mea._GHOST_CHECK_ENABLED = prev
+
     def test_double_free_raises(self):
         _, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
         v = self._alloc(full_alloc, full_kv, 3)

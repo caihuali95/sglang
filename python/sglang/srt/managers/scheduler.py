@@ -2790,7 +2790,7 @@ class Scheduler(
         # the req is tracked via self.chunked_req (never the waiting queue).
         _prev_chunked_req = self.chunked_req
         _prev_is_chunked = (
-            self.chunked_req.is_chunked if self.chunked_req is not None else None
+            self.chunked_req.inflight_middle_chunks if self.chunked_req is not None else None
         )
 
         if self.chunked_req is not None:
@@ -2984,7 +2984,7 @@ class Scheduler(
             # A NEW chunked req goes back to waiting as a normal req; undo the
             # is_chunked bump it received below.
             if adder.new_chunked_req is not None:
-                adder.new_chunked_req.is_chunked -= 1
+                adder.new_chunked_req.inflight_middle_chunks -= 1
             # Restore the CONTINUING chunked-req so it resumes next iter
             # (covers BOTH the more-chunks case — self.chunked_req already ==
             # _prev — and the last-chunk case where add_chunked_req reset it to
@@ -3005,7 +3005,7 @@ class Scheduler(
             # recomputes to the remaining (>0) tokens.
             self._chunked_req_scheduled_last_iter = False
             if _prev_chunked_req is not None:
-                _prev_chunked_req.is_chunked = _prev_is_chunked
+                _prev_chunked_req.inflight_middle_chunks = _prev_is_chunked
             # Signal back-off for this iter; the next iter will retry.
             self.running_batch.batch_is_full = True
             return None
@@ -3325,7 +3325,7 @@ class Scheduler(
                         if hasattr(allocator, "set_inflight_forward"):
                             allocator.set_inflight_forward(
                                 forward_done,
-                                getattr(model_worker_batch, "out_cache_loc", None),
+                                getattr(batch, "out_cache_loc", None),
                             )
                         batch_result.forward_done = forward_done
                         # FIXME(lsyin): maybe move this to forward_batch_generation
@@ -3570,6 +3570,13 @@ class Scheduler(
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
             return
+
+        allocator = getattr(self, "token_to_kv_pool_allocator", None)
+        if allocator is not None and hasattr(allocator, "flush_opportunistic"):
+            try:
+                allocator.flush_opportunistic()
+            except Exception:
+                pass
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

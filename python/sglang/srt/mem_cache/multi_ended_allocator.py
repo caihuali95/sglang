@@ -95,6 +95,18 @@ _LAZY_COMPACTION_STATS_ENABLED = (
 _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     os.environ.get("SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC", "30")
 )
+# §S373 debug — fail-fast "ghost page" invariant. When enabled,
+# `_assert_no_ghost(where)` is called at the free / flush BOUNDARIES and
+# asserts that every physical page inside the allocated range whose `p2v < 0`
+# is registered as free (in `_free_phys_pages` or `_pending_reuse_pages_cpu`).
+# A page that was cleared (by a retract/free or a compaction move) but never
+# registered is a "ghost": a later `_flush` survivor walk picks it and trips
+# the `p2v=-1` assertion at the DETECTION site, far from the CREATION site.
+# This check fails fast at the creating op so the first fire localizes the bug.
+# Off by default (one D2H + a set-build per call); enable for debugging only.
+_GHOST_CHECK_ENABLED = (
+    os.environ.get("SGLANG_DEBUG_CHECK_GHOST_PAGES", "0") == "1"
+)
 # Module-level WeakSet of every MultiEndedAllocator instance with stats
 # enabled. The signal handler below iterates this on SIGTERM/SIGINT and
 # emits each instance's final counters before re-raising the default
@@ -1449,6 +1461,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return
             if self.lazy_compaction:
                 self._free_lazy(free_index)
+                self._assert_no_ghost("free_lazy")
                 return
             # --- EAGER path (unchanged from Stages 1–3.6.2) ---
             # Overlap-mode barrier (single, at the start). In normal mode this is
@@ -1481,6 +1494,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     [self.free_virtual_ids, free_v_pages]
                 )
             self._compact_pending(freed_p_pages)
+            self._assert_no_ghost("free_eager")
 
     def _free_lazy(self, free_index: torch.Tensor) -> None:
         """Lazy free path (§S373).
@@ -2050,6 +2064,51 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return p, j
             return None, j
 
+    def _assert_no_ghost(self, where: str) -> None:
+        """§S373 debug invariant (gated by SGLANG_DEBUG_CHECK_GHOST_PAGES).
+
+        Assert that NO physical page inside the allocated range has `p2v < 0`
+        while being absent from BOTH `_free_phys_pages` and
+        `_pending_reuse_pages_cpu`. Such a page is a "ghost": its `p2v` was
+        cleared (retract/free, or a compaction move) but it was never
+        registered as free, so a later `_flush` survivor walk picks it and
+        trips the `p2v=-1` assertion — at the DETECTION site, not the CREATION
+        site. Call this at the free / flush BOUNDARIES (outside the flush
+        move-loop, where the flush-scoped `released_fired` accumulator is
+        legitimately untracked-but-pending) so the FIRST fire pins the
+        creating op via `where`.
+
+        Allocated range is page-granular: `[min_page_index, watermark)` for
+        grow-up, `(watermark, num_pages-1]` for grow-down.
+        """
+        if not _GHOST_CHECK_ENABLED:
+            return
+        if self.grow_direction == "up":
+            lo, hi = self.min_page_index, self.watermark_physical
+        else:
+            lo, hi = self.watermark_physical + 1, self.num_pages
+        if hi <= lo:
+            return
+        p2v = self.physical_to_virtual[lo:hi].tolist()
+        holes = set(self._free_phys_pages.tolist())
+        pend = self._pending_reuse_pages_cpu
+        ghosts = [
+            lo + i
+            for i, v in enumerate(p2v)
+            if v < 0 and (lo + i) not in holes and (lo + i) not in pend
+        ]
+        if ghosts:
+            shown = ghosts[:8]
+            raise AssertionError(
+                f"GHOST page(s) detected at '{where}' in "
+                f"MultiEndedAllocator({self.sub_pool_name!r}): pages {shown}"
+                f"{'...' if len(ghosts) > 8 else ''} have p2v<0 inside the "
+                f"allocated range but are in NEITHER _free_phys_pages NOR "
+                f"_pending_reuse — cleared without being registered as free. "
+                f"n_ghost={len(ghosts)}. State: {self.allocator_state_str()}, "
+                f"#holes={len(holes)}, #pending_reuse={len(pend)}"
+            )
+
     def _flush(self, *, urgent: bool) -> int:
         """Run a batched compaction pass (Phase A: single-stream) with
         per-survivor write-set classification (§S37 Q3 step 2).
@@ -2369,6 +2428,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._stats_n_flush_did_work += 1
                 self._stats_n_flush_moves += n_moves
             self._maybe_emit_stats()
+            self._assert_no_ghost("flush_exit")
             return n_moves
 
     def _commit_move_batch(
