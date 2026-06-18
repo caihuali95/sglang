@@ -1279,6 +1279,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
+            page_size=self.page_size,
         )
         return o
 
@@ -1415,6 +1416,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_start_pos=window_start_pos,
             xai_temperature_len=layer.xai_temperature_len,
+            page_size=self.page_size,
         )
 
         return o
@@ -1509,6 +1511,7 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
             has_mla=self.use_mla,
             use_pdl=self.use_pdl,
+            page_size=self.page_size,
         )
         return o
 
