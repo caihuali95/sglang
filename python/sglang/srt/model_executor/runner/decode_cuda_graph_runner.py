@@ -891,7 +891,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Python branch (if self.swa_loc is not None) takes the fast path,
             # and the graph records GPU ops using this buffer instead of the
             # per-layer translate_loc_from_full_to_swa fallback.
-            if self.buffers.out_cache_loc_swa is not None:
+            # `out_cache_loc_swa` is allocated for ANY hybrid-SWA model (shared
+            # or baseline), but `set_swa_loc` exists only on the shared SWA pool
+            # (`SharedSWAKVPool`); the baseline `SWAKVPool` lacks it. Guard with
+            # `hasattr` — same as the `set_full_loc` pin below — so this is a
+            # no-op on baseline. (Without the guard, baseline hybrid-SWA crashes
+            # at capture: `'SWAKVPool' object has no attribute 'set_swa_loc'`.)
+            if self.buffers.out_cache_loc_swa is not None and hasattr(
+                self.model_runner.token_to_kv_pool, "set_swa_loc"
+            ):
                 self.model_runner.token_to_kv_pool.set_swa_loc(
                     self.buffers.out_cache_loc_swa[:num_tokens]
                 )

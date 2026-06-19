@@ -289,3 +289,4 @@ shared_memory_pool_design.md
 sglang.tar.gz
 sglang-source.tar.gz
 eval_results*
+.dockerignore
