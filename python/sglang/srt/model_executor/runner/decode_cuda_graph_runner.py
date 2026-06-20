@@ -848,6 +848,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 # capture starts clean.
                 attn_backend.init_forward_metadata_in_graph(forward_batch)
 
+                # NB: the old warmup `token_to_kv_pool.invalidate_loc_cache()`
+                # call is intentionally gone. It targeted upstream SWAKVPool's
+                # per-batch loc-translation cache (added by #25824), which
+                # upstream #27091 REMOVED (06-03, "drop pool caches" — unified
+                # the full->SWA translate into init_forward_metadata). The
+                # phase-4 base (06-08) includes #27091, so the method no longer
+                # exists on baseline SWAKVPool or (by inheritance) the shared
+                # SWA pool. The shared pool's capture instead records the
+                # translate explicitly via `_capture_shared_pool_write_translate`
+                # + `init_forward_metadata_in_graph` above, so no cache
+                # invalidation is needed. Matches rebase-orig (which dropped
+                # this call too).
+
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
                 )

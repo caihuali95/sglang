@@ -52,8 +52,8 @@ from sglang.srt.mem_cache.allocator.paged import (
     alloc_extend_kernel,
 )
 from sglang.srt.mem_cache.shared_memory_pool import SharedMemoryPool
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.utils import (
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.triton_ops.virtual_slot import (
     alloc_bind_inplace,
     translate_kv_indices_inplace,
 )
@@ -2592,8 +2592,9 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     The token-slot surface (the slot allocator the scheduler uses for the
     `out_cache_loc` path) delegates to the full-attn side — `alloc(N)` allocates
     MHA token slots (virtual per-token ids). The Mamba sub-pool's per-request
-    `alloc(1)` is driven by `SharedHybridReqToTokenPool.alloc` -> `mamba_pool.alloc(1)`
-    -> `mamba_allocator.alloc(1)`. Both sub-allocators are id-owners of their own
+    `alloc(1)` is driven by `SharedHybridReqToTokenPool.alloc` ->
+    `mamba_allocator.alloc(1)` (the `SharedMambaSlotAllocator`, which owns slots;
+    the `mamba_pool` is storage-only). Both sub-allocators are id-owners of their own
     granularity's virtual-id space (the spaces are independent).
     """
 
@@ -2650,9 +2651,15 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.bind_peer(self.mamba_allocator)
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
 
-        # Wire the pools to translate slot ids via their allocators.
+        # Wire the full-attn pool to translate slot ids via its allocator (the
+        # MEA exposes the v2p table the KV pool reads directly). The mamba pool is
+        # NOT wired here: it borrows `translate` from a `SharedMambaSlotAllocator`
+        # (the physical view) that does not exist yet — it wraps this very
+        # `self.mamba_allocator`. `init_shared_mamba_pools` builds that wrapper and
+        # calls `mamba_pool.attach_allocator(slot_allocator)` once this composite
+        # returns. (Attaching the raw MEA here would be dead wiring — overwritten
+        # immediately, and the MEA has no `.translate` the pool could use.)
         kvcache.full_kv_pool.attach_allocator(self.full_attn_allocator)
-        kvcache.mamba_pool.attach_allocator(self.mamba_allocator)
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []

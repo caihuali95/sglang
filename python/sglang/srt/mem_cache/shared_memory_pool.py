@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 import triton
 
-from sglang.srt.mem_cache.utils import store_cache_4d_kernel
+from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d_kernel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -841,15 +841,25 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
 
 
 class SharedMambaPool(MambaPool):
-    """Mamba pool whose `conv_state` / `temporal_state` are strided views into a
-    `SharedMemoryPool`. alloc / free / clear / available_size delegate to an
-    external `MultiEndedAllocator` (the id-owner of the per-request virtual-id
-    space) attached via `attach_allocator`.
+    """Mamba state pool for the shared buffer — the VIRTUAL view.
+
+    `conv_state` / `temporal_state` are strided views into a `SharedMemoryPool`,
+    but this pool's public surface is virtual: every index-bearing method
+    (`clear_slots`, `copy_from`, `get_cpu_copy`, `load_cpu_copy`) receives
+    **virtual** slot ids (the upstream `req.mamba_pool_idx` contract). It does not
+    own slot lifecycle and does not know the virtual<->physical mapping — it
+    borrows the allocator's `translate` to resolve a virtual id the moment before
+    touching the buffer, holding no v2p logic of its own.
+
+    The PHYSICAL view — real slot alloc/free, the free-list/sizing, and the
+    bidirectional virtual<->physical mapping — lives in the attached
+    `SharedMambaSlotAllocator`. Mirrors upstream's `MambaPool` (state) /
+    `MambaSlotAllocator` (slots) split, and the shared KV pool/allocator split
+    where the allocator owns `translate_kv_loc`.
 
     Does NOT call `super().__init__()` (that allocates fresh tensors). Replicates
     the minimal `MambaPool` state against the shared buffer so inherited methods
-    work. Slot-id-bearing public methods (`copy_from`, `fork_from`, `get_cpu_copy`,
-    `load_cpu_copy`, `is_slot_allocated`) take **virtual** ids and translate.
+    work.
     """
 
     def __init__(
@@ -943,147 +953,167 @@ class SharedMambaPool(MambaPool):
             self.num_mamba_layers,
         )
 
-    # -- allocator delegation --
+    # -- allocator wiring (the allocator is the PHYSICAL view) --
+    #
+    # This pool is the VIRTUAL view: its public surface is virtual-id indexed and
+    # it knows nothing of the v<->physical mapping. Slot lifecycle (alloc/free/
+    # clear/sizing/free-list) and that mapping (the `translate`) live in its
+    # allocator (`SharedMambaSlotAllocator`, the PHYSICAL view) — mirroring how
+    # `SharedMHATokenToKVPool` defers slot ownership + `translate_kv_loc` to its
+    # KV allocator. The public state ops below receive VIRTUAL ids (the upstream
+    # `req.mamba_pool_idx` contract) and borrow the allocator's `translate` the
+    # moment before touching the buffer; they hold no v2p logic themselves.
 
     def attach_allocator(self, allocator) -> None:
+        """Wire the `SharedMambaSlotAllocator` this pool translates through."""
         self._external_allocator = allocator
-
-    @property
-    def free_slots(self) -> torch.Tensor:
-        """Physical-slot-space free list, derived from the allocator's watermark —
-        consulted by the scheduler's leak checker. Falls back to the pre-shared
-        convention before `attach_allocator` runs.
-
-        Bounds are PAGE indices (matching the Stage-3 watermark convention).
-        The Mamba sub-allocator is always ``page_size == 1``, so pages and
-        slots coincide; we use the page-named attributes
-        (``num_pages``, ``min_page_index``) for self-consistency
-        with the rest of the page-aware code, and assert ``page_size == 1``
-        so a future change accidentally introducing a paged Mamba allocator
-        is caught here instead of producing a silent unit mismatch.
-        """
-        if self._external_allocator is None:
-            return torch.arange(
-                1, self._max_size + 1, dtype=torch.int64, device=self.device
-            )
-        alloc = self._external_allocator
-        assert alloc.page_size == 1, (
-            "SharedMambaPool.free_slots assumes the mamba allocator is "
-            f"page_size=1; got {alloc.page_size}. Mamba state is per-request "
-            "and orthogonal to per-token paging."
-        )
-        if alloc.grow_direction == "up":
-            start, end = alloc.watermark_physical, alloc.num_pages
-        else:
-            start, end = alloc.min_page_index, alloc.watermark_physical + 1
-        if start >= end:
-            return torch.empty((0,), dtype=torch.int64, device=self.device)
-        return torch.arange(start, end, dtype=torch.int64, device=self.device)
-
-    def available_size(self) -> int:
-        """Slot-conservation free count: `size - allocated_count`.
-
-        This is the view the scheduler's leak check expects — it composes into
-        the invariant `available + evictable + protected + session_held == size`
-        (`scheduler_runtime_checker_mixin._check_mamba_pool` /
-        `_check_pool_invariant`), where `num_used = size - available - evictable`
-        must reduce to `allocated_count - evictable`. The watchdog `dump_info`
-        path can exercise this during an active workload, not just on idle, so
-        returning anything byte-coordinated here would surface false leaks.
-
-        It is deliberately NOT the right value for the alloc planner — when the
-        peer pool has consumed the byte buffer, slot-wise availability overstates
-        what `alloc(N)` will accept. Use `schedulable_available_size()` for that.
-        """
-        if self._external_allocator is None:
-            return self._max_size
-        return self._max_size - self._external_allocator.allocated_count()
-
-    def schedulable_available_size(self) -> int:
-        """Byte-coordinated free count — the contract is
-        `schedulable_available_size() >= N  =>  alloc(N) succeeds`.
-
-        Used by `common.alloc_req_slots` to decide whether to trigger mamba
-        eviction before calling `req_to_token_pool.alloc(reqs)`. May be smaller
-        than `available_size()` when the peer pool's byte usage tightens this
-        side's effective capacity (in which case the planner needs to evict
-        even though slot-wise there's room).
-        """
-        if self._external_allocator is None:
-            return self._max_size
-        return self._external_allocator.available_size()
-
-    def alloc(self, need_size: int):
-        if self._external_allocator is None:
-            raise RuntimeError("SharedMambaPool.alloc called before attach_allocator")
-        v = self._external_allocator.alloc(need_size)  # VIRTUAL ids
-        if v is None:
-            return None
-        # Clear newly-allocated conv/temporal rows AT THE PHYSICAL SLOTS. The
-        # allocator's `alloc` ran on the current stream (schedule_stream); the
-        # bind's v2p write is on the same stream as this gather, so single-
-        # stream ordering makes it visible.
-        p = self._external_allocator.virtual_to_physical[v]
-        for i in range(len(self.mamba_cache.conv)):
-            t = self.mamba_cache.conv[i]
-            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-                t.shape[0], int(p.numel()), *t.shape[2:]
-            )
-            t[:, p] = z
-        t = self.mamba_cache.temporal
-        z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-            t.shape[0], int(p.numel()), *t.shape[2:]
-        )
-        t[:, p] = z
-        return v
-
-    def free(self, free_index: torch.Tensor):
-        if self._external_allocator is None:
-            raise RuntimeError("SharedMambaPool.free called before attach_allocator")
-        self._external_allocator.free(free_index)  # VIRTUAL ids
-
-    def clear(self):
-        if self._external_allocator is None:
-            raise RuntimeError("SharedMambaPool.clear called before attach_allocator")
-        self._external_allocator.clear()
-
-    # -- slot-id-bearing methods: translate virtual -> physical --
 
     def _copy_from_physical(self, src_index: torch.Tensor, dst_index: torch.Tensor):
         """Un-translated copy on PHYSICAL slot ids — used by the allocator's
-        `_compact_pending` (which already has physical ids)."""
+        `_compact_pending` (which already holds physical ids)."""
         MambaPool.copy_from(self, src_index, dst_index)
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
         # Public: callers (radix-cache COW) pass VIRTUAL ids.
-        v2p = self._external_allocator.virtual_to_physical
-        return MambaPool.copy_from(self, v2p[src_index], v2p[dst_index])
+        tr = self._external_allocator.translate
+        return MambaPool.copy_from(self, tr(src_index), tr(dst_index))
 
-    def fork_from(self, src_index: torch.Tensor):
-        dst_v = self.alloc(1)  # VIRTUAL
-        if dst_v is None:
-            return None
-        self.copy_from(src_index, dst_v)  # translates both
-        return dst_v
+    def clear_slots(self, indices: torch.Tensor):
+        # Public: the deferred-clear path (`_execute_deferred_mamba_cow_and_clear`)
+        # feeds `req.mamba_pool_idx` — VIRTUAL ids. Translate to PHYSICAL via the
+        # allocator before zeroing, else the inherited `MambaPool.clear_slots`
+        # would index the physical state buffer with virtual ids and zero the
+        # WRONG slots (stale state -> divergent decode; clobbers a peer slot).
+        return MambaPool.clear_slots(self, self._external_allocator.translate(indices))
 
     def get_cpu_copy(self, indices):
-        v2p = self._external_allocator.virtual_to_physical
-        return MambaPool.get_cpu_copy(self, v2p[indices])
+        return MambaPool.get_cpu_copy(self, self._external_allocator.translate(indices))
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        v2p = self._external_allocator.virtual_to_physical
-        return MambaPool.load_cpu_copy(self, mamba_cache_cpu, v2p[indices])
+        return MambaPool.load_cpu_copy(
+            self, mamba_cache_cpu, self._external_allocator.translate(indices)
+        )
+
+
+# ---------------------------------------------------------------------------
+# SharedMambaSlotAllocator — the PHYSICAL view (slot lifecycle + v<->p mapping)
+# ---------------------------------------------------------------------------
+
+
+class SharedMambaSlotAllocator:
+    """Mamba slot allocator for the shared pool — the PHYSICAL view.
+
+    Owns the physical side: real slot alloc/free, the free-list/sizing, and the
+    bidirectional virtual<->physical mapping (the ``translate``). Presents the
+    upstream ``MambaSlotAllocator`` interface that ``HybridReqToTokenPool``
+    (``alloc``/``free``/``clear``/``available_size``/``alloc_group_*``) and the
+    scheduler's invariant checker (``free_slots``/``size``) drive, backed by the
+    ``MultiEndedAllocator`` that id-owns the shared mamba sub-pool's slot space.
+    Because it owns ``translate`` (mirroring the KV allocator's
+    ``translate_kv_loc``), ``SharedMambaPool`` (the VIRTUAL view) needs no v2p
+    logic and just borrows it. Same pool(state)/allocator(slots) split upstream
+    made when it separated ``MambaPool`` from ``MambaSlotAllocator``.
+
+    ``alloc()`` returns VIRTUAL ids and does NOT clear state: clearing is
+    deferred to ``SharedMambaPool.clear_slots`` via the upstream
+    ``req.mamba_needs_clear`` path (``_execute_deferred_mamba_cow_and_clear``),
+    exactly as the non-shared ``MambaSlotAllocator`` + ``MambaPool.clear_slots``
+    pair works.
+    """
+
+    def __init__(self, mea, max_size: int, device: str):
+        self._mea = mea  # MultiEndedAllocator — id-owner + v2p table
+        self._max_size = max_size  # slot capacity (excludes reserved slot 0)
+        self._device = device
+        self._alloc_iter = None  # active alloc_group batch iterator
+
+    # -- translation (owns the v<->p mapping; mirror of allocator.translate_kv_loc) --
+
+    def translate(self, virtual_ids: torch.Tensor) -> torch.Tensor:
+        """VIRTUAL mamba slot ids -> PHYSICAL slot ids. The mamba sub-allocator
+        is page_size==1 (1 slot == 1 page == 1 token), so this is a direct v2p
+        gather (no page math)."""
+        return self._mea.virtual_to_physical[virtual_ids]
+
+    @property
+    def virtual_to_physical(self) -> torch.Tensor:
+        return self._mea.virtual_to_physical
+
+    # -- sizing / free-list (leak/invariant checker + alloc planner) --
+
+    @property
+    def size(self) -> int:
+        return self._max_size
+
+    def available_size(self) -> int:
+        """Slot-conservation free count (``max - allocated``) — the leak-check
+        view (``available + evictable + protected + session_held == size``).
+        NOT the planner value; use ``schedulable_available_size`` for that."""
+        return self._max_size - self._mea.allocated_count()
+
+    def schedulable_available_size(self) -> int:
+        """Byte-coordinated free count — the ``>= N => alloc(N) succeeds``
+        contract used by ``common.alloc_req_slots`` (smaller than
+        ``available_size`` when the peer pool's bytes tighten this side)."""
+        return self._mea.available_size()
+
+    @property
+    def free_slots(self) -> torch.Tensor:
+        """Physical free-list (watermark-derived) read by the scheduler's
+        invariant checker. Mamba sub-allocator is page_size==1, so pages==slots;
+        assert it so a future paged-mamba change is caught, not silently wrong."""
+        a = self._mea
+        assert a.page_size == 1, (
+            "SharedMambaSlotAllocator.free_slots assumes page_size==1; got "
+            f"{a.page_size}. Mamba state is per-request, orthogonal to paging."
+        )
+        if a.grow_direction == "up":
+            start, end = a.watermark_physical, a.num_pages
+        else:
+            start, end = a.min_page_index, a.watermark_physical + 1
+        if start >= end:
+            return torch.empty((0,), dtype=torch.int64, device=self._device)
+        return torch.arange(start, end, dtype=torch.int64, device=self._device)
+
+    # -- slot management (delegates to the MultiEndedAllocator) --
+
+    def alloc(self, need_size: int):
+        # alloc_group fast path: single-slot draws from the prefetched batch.
+        if self._alloc_iter is not None and need_size == 1:
+            slot = next(self._alloc_iter, None)
+            if slot is not None:
+                return slot
+        return self._mea.alloc(need_size)  # VIRTUAL ids; clearing deferred
+
+    def free(self, free_index: torch.Tensor):
+        return self._mea.free(free_index)
+
+    def clear(self):
+        self._alloc_iter = None
+        return self._mea.clear()
+
+    def alloc_group_begin(self, num_reqs: int):
+        """Pre-allocate a batch (match_prefix amortization); ``alloc(1)`` then
+        draws from it. Mirror of ``MambaSlotAllocator.alloc_group_begin``."""
+        self._alloc_iter = None
+        if num_reqs > 0:
+            result = self._mea.alloc(num_reqs)
+            if result is not None:
+                self._alloc_iter = iter(result.split(1))
+
+    def alloc_group_end(self):
+        """Return any unused pre-allocated slots from the current group."""
+        if self._alloc_iter is not None:
+            remaining = list(self._alloc_iter)
+            if remaining:
+                self._mea.free(torch.cat(remaining))
+        self._alloc_iter = None
 
     def is_slot_allocated(self, slot) -> bool:
-        """Whether VIRTUAL id `slot` is currently in use."""
-        if self._external_allocator is None:
-            return False
-        return self._external_allocator.is_slot_allocated(int(slot))
+        return self._mea.is_slot_allocated(int(slot))
 
     def allocator_state_str(self) -> str:
-        if self._external_allocator is None:
-            return "<no external allocator attached>"
-        return self._external_allocator.allocator_state_str()
+        return self._mea.allocator_state_str()
 
 
 # ---------------------------------------------------------------------------
@@ -1173,6 +1203,13 @@ class SharedHybridReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
+        # `mamba_allocator` (the PHYSICAL view — a `SharedMambaSlotAllocator`
+        # wrapping the mamba `MultiEndedAllocator`) is wired in by the factory
+        # `init_shared_mamba_pools` AFTER the composite allocator has created and
+        # bound that MultiEndedAllocator (it does not exist yet at pool-init
+        # time). Set to None here so the attribute exists; nothing reads it
+        # before the factory wiring completes.
+        self.mamba_allocator = None
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
         self.device = device
         # Mirror the parent's sizing: indexed by req_pool_idx, so by the
@@ -1195,9 +1232,9 @@ class SharedHybridReqToTokenPool(HybridReqToTokenPool):
 
     def translate_mamba_indices(self, virtual_ids: torch.Tensor) -> torch.Tensor:
         """Virtual per-request mamba ids -> physical slot ids. Called once per
-        batch by the linear-attention backend's metadata build."""
-        v2p = self.mamba_pool._external_allocator.virtual_to_physical
-        return v2p[virtual_ids].to(torch.int32)
+        batch by the linear-attention backend's metadata build. The v<->p mapping
+        lives in the allocator (the physical view) — delegate to it."""
+        return self.mamba_allocator.translate(virtual_ids).to(torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -1341,6 +1378,24 @@ def init_shared_mamba_pools(
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
     )
+
+    # Wire the mamba slot allocator (PHYSICAL view). The composite above created
+    # the mamba `MultiEndedAllocator` (`allocator.mamba_allocator`); it drives
+    # compaction directly via the pool's `_copy_from_physical` (a kvcache ref, not
+    # an attach). Wrap that MEA in a `SharedMambaSlotAllocator` that presents the
+    # `MambaSlotAllocator` interface (alloc/free/clear/sizing/group) the inherited
+    # `HybridReqToTokenPool` + scheduler drive, and owns the virtual->physical
+    # `translate`. This is the SOLE `attach_allocator` for the mamba pool (the
+    # composite deliberately does not attach the raw MEA — it has no `.translate`):
+    # the pool, the VIRTUAL view, borrows `translate` from this wrapper and holds
+    # no v2p logic. `_shared_mamba_size` excludes the reserved slot 0.
+    mamba_slot_allocator = SharedMambaSlotAllocator(
+        allocator.mamba_allocator,
+        max_size=req_to_token_pool._shared_mamba_size,
+        device=device,
+    )
+    req_to_token_pool.mamba_allocator = mamba_slot_allocator
+    req_to_token_pool.mamba_pool.attach_allocator(mamba_slot_allocator)
 
     logger.info(
         "[shared-pool] ============================================================"

@@ -3254,8 +3254,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     forward_batch.out_cache_loc
                 )
 
-        # Use precomputed SWA cache location
-        if forward_batch.out_cache_loc_swa is not None:
+        # Use precomputed SWA cache location. `hasattr`-guarded for symmetry
+        # with the `set_full_loc` pin below and the `set_swa_loc(None)` clear
+        # later: `set_swa_loc` lives only on the shared `SharedSWAKVPool`, so a
+        # baseline `SWAKVPool` (which lacks it) is a no-op here instead of
+        # raising (same class as the eval_157 cuda-graph capture-pin fix).
+        if forward_batch.out_cache_loc_swa is not None and hasattr(
+            self.token_to_kv_pool, "set_swa_loc"
+        ):
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
         # Pin the precomputed full-physical loc so the shared-pool
