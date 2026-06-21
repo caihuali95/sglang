@@ -637,18 +637,9 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return self.min_page_index * self.entry_bytes_per_page
         return (self.watermark_physical + 1) * self.entry_bytes_per_page
 
-    def available_size(self) -> int:
-        """Tokens (NOT pages) allocatable on this side.
-
-        Matches `BaseTokenToKVPoolAllocator.available_size()`'s
-        `len(free_pages) * page_size` contract. Used by the scheduler's
-        `available_size() >= num_tokens` checks (`schedule_batch.py:2157`,
-        etc.).
-
-        Lazy compaction: holes in `_free_phys_pages` are drainable
-        without consuming new bytes (they're already in the allocated band),
-        so they add to capacity over and above the watermark-extension room.
-        """
+    def _current_gap_bytes(self) -> int:
+        """Free byte band between this side's frontier and the peer's CURRENT
+        frontier (no peer compaction assumed). Direction-agnostic."""
         if self.grow_direction == "up":
             my_high = self._byte_high_frontier()
             peer_low = (
@@ -656,11 +647,20 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 if self._peer is not None
                 else self.shared_buffer.total_bytes
             )
-            gap_bytes = max(0, peer_low - my_high)
-        else:
-            my_low = self._byte_low_frontier()
-            peer_high = self._peer._byte_high_frontier() if self._peer is not None else 0
-            gap_bytes = max(0, my_low - peer_high)
+            return max(0, peer_low - my_high)
+        my_low = self._byte_low_frontier()
+        peer_high = self._peer._byte_high_frontier() if self._peer is not None else 0
+        return max(0, my_low - peer_high)
+
+    def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
+        """Tokens allocatable on this side given `extra_gap_bytes` of ADDED
+        gap room (0 == current realizable; >0 == post-peer-compaction).
+
+        `pages_by_index_space` is this side's OWN index headroom and is
+        unaffected by `extra_gap_bytes` — crediting peer bytes can never give
+        us more page indices than our own table has.
+        """
+        gap_bytes = self._current_gap_bytes() + extra_gap_bytes
         pages_by_bytes = gap_bytes // self.entry_bytes_per_page
         # `_allocated_pages()` (page-granular) — the index-space headroom
         # is a page-count, NOT a token-count. (We multiply by page_size at
@@ -672,6 +672,67 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         # Lazy: drainable holes don't consume new bytes.
         pages_drain = len(self._free_phys_pages) if self.lazy_compaction else 0
         return (pages_extend + pages_drain) * self.page_size
+
+    def available_size(self) -> int:
+        """Tokens (NOT pages) allocatable on this side RIGHT NOW, with no
+        peer compaction.
+
+        Matches `BaseTokenToKVPoolAllocator.available_size()`'s
+        `len(free_pages) * page_size` contract. This is the value the
+        alloc/alloc_extend shortfall gates consult to decide whether to issue
+        a peer urgent-flush (see `alloc`), so it MUST stay current-realizable
+        — do NOT fold peer drainable holes in here (use
+        `schedulable_available_size()` for the scheduler-facing, post-flush
+        view).
+
+        Lazy compaction: holes in `_free_phys_pages` are drainable
+        without consuming new bytes (they're already in the allocated band),
+        so they add to capacity over and above the watermark-extension room.
+        """
+        return self._available_tokens()
+
+    def _peer_drainable_hole_bytes(self) -> int:
+        """Bytes the peer's urgent flush would release into the shared gap:
+        each drainable peer hole, once compacted, retreats the peer watermark
+        by one peer-page == `peer.entry_bytes_per_page` bytes of gap.
+
+        Only `_free_phys_pages` (already-free, synchronously drainable) count
+        — NOT `_pending_reuse` (awaiting a forward event), so the credit is
+        realizable by `alloc`'s `self._peer._flush(urgent=True)` retry.
+        """
+        peer = self._peer
+        if peer is None or not peer.lazy_compaction:
+            return 0
+        return len(peer._free_phys_pages) * peer.entry_bytes_per_page
+
+    def schedulable_available_size(self) -> int:
+        """Tokens allocatable on this side AFTER a peer urgent-flush — the
+        scheduler-facing, realizable-with-compaction capacity.
+
+        Equals `available_size()` plus the room a peer compaction would open
+        in the shared gap. Realizable: `alloc`'s shortfall path issues
+        `self._peer._flush(urgent=True)` before extending, so any capacity
+        credited here is actually obtainable at alloc time. Used by the
+        composite size views the scheduler reads (retract gate, evict,
+        schedule_policy); the alloc gates themselves use `available_size()`.
+        """
+        return self._available_tokens(extra_gap_bytes=self._peer_drainable_hole_bytes())
+
+    def _flush_peer_for_alloc(self, need_tokens: int) -> bool:
+        """One urgent peer-flush on alloc shortfall; returns whether enough is
+        now allocatable on THIS side.
+
+        Only the PEER's compaction releases bytes into the shared gap (own
+        compaction trades a hole for gap room, net 0). A SINGLE urgent flush
+        suffices: its full-pass compaction (see `_flush`) retreats the peer watermark past
+        ALL reclaimable holes in one urgent flush, so
+        interior peer holes open gap immediately — no loop, one D2H.
+        Standalone (no peer) → nothing useful to flush.
+        """
+        if not (self.lazy_compaction and self._peer is not None):
+            return False
+        self._peer._flush(urgent=True)
+        return need_tokens <= self.available_size()
 
     # -- physical-slot / physical-page primitives --
 
@@ -1184,12 +1245,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # change own_available_size (each move trades 1 hole for +1
                 # gap byte room, net 0). Only the PEER's compaction releases
                 # bytes into the shared gap that own extension can consume.
-                # Standalone (no peer) → nothing helpful to flush; return None.
-                if self.lazy_compaction and self._peer is not None:
-                    self._peer._flush(urgent=True)
-                    if need_size > self.available_size():
-                        return None
-                else:
+                # One urgent peer-flush: a single flush retreats the peer watermark
+                # in one pass (its crossing-checked full-pack compaction), so interior peer
+                # holes open gap immediately. Standalone → helper returns False.
+                if not self._flush_peer_for_alloc(need_size):
                     return None
             num_pages = need_size // self.page_size
             v_pages = self.free_virtual_ids[:num_pages]
@@ -1288,16 +1347,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # does not change `len(free_virtual_ids)`, so don't re-check
             # it after the retry.
             need_tokens = num_new_pages * self.page_size
-            if (
-                self.lazy_compaction
-                and self._peer is not None
-                and need_tokens > self.available_size()
-            ):
-                self._peer._flush(urgent=True)
-                if need_tokens > self.available_size():
+            if need_tokens > self.available_size():
+                # One urgent peer-flush — retreats the peer watermark in one pass
+                # via full-pack compaction in `_flush` (see `_flush_peer_for_alloc`).
+                if not self._flush_peer_for_alloc(need_tokens):
                     return None
-            elif need_tokens > self.available_size():
-                return None
             bs = len(prefix_lens)
             if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
                 self.free_virtual_ids
@@ -1380,16 +1434,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # (own compaction does not increase own_available_size).
             # Standalone (no peer) → no useful flush.
             need_tokens = num_new_pages * self.page_size
-            if (
-                self.lazy_compaction
-                and self._peer is not None
-                and need_tokens > self.available_size()
-            ):
-                self._peer._flush(urgent=True)
-                if need_tokens > self.available_size():
+            if need_tokens > self.available_size():
+                # One urgent peer-flush — retreats the peer watermark in one pass
+                # via full-pack compaction in `_flush` (see `_flush_peer_for_alloc`).
+                if not self._flush_peer_for_alloc(need_tokens):
                     return None
-            elif need_tokens > self.available_size():
-                return None
             if self.need_sort and bs > len(self.free_virtual_ids):
                 self.merge_and_sort_free()
 
@@ -2109,52 +2158,85 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"#holes={len(holes)}, #pending_reuse={len(pend)}"
             )
 
+    def _absorb_boundary_holes(self, all_cpu: List[int]) -> Tuple[int, List[int]]:
+        """Retreat the watermark past free slots ALREADY contiguous with it,
+        slice them off `_free_phys_pages`, and return
+        ``(new_watermark, interior_holes_cpu)``. `all_cpu` is the sorted-ascending
+        free-list snapshot. Pure CPU + one directional GPU slice; no sync.
+
+        The returned `interior_holes_cpu` are the holes the watermark could NOT
+        reach directly — the survivor walk compacts those.
+        """
+        M = len(all_cpu)
+        wm = self.watermark_physical
+        n = 0
+        if self.grow_direction == "up":
+            while n < M and all_cpu[M - 1 - n] == wm - 1 - n:
+                n += 1
+            new_wm = wm - n
+            holes_cpu = all_cpu[: M - n]
+            self._free_phys_pages = self._free_phys_pages[: M - n]
+        else:
+            while n < M and all_cpu[n] == wm + 1 + n:
+                n += 1
+            new_wm = wm + n
+            holes_cpu = all_cpu[n:]
+            self._free_phys_pages = self._free_phys_pages[n:]
+        self.watermark_physical = new_wm
+        self._stats_n_pages_absorbed += n
+        return new_wm, holes_cpu
+
+    def _settle_inflight_forward(self) -> None:
+        """Stream-wait the in-flight forward's done event so the slots a
+        compaction is about to free are safe to MOVE (its write settled) and
+        to REUSE (its read settled). `_latest_forward_done_event` is recorded
+        after the WHOLE forward (the scheduler stamps the same event into
+        `_inflight_forward`), so one wait covers both hazards; drop the now-moot
+        write-set. No host block; a no-op when the event has already fired.
+        """
+        ev = self._latest_forward_done_event
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+            self._inflight_forward = None
+
     def _flush(self, *, urgent: bool) -> int:
-        """Run a batched compaction pass (Phase A: single-stream) with
-        per-survivor write-set classification (§S37 Q3 step 2).
+        """One batched compaction pass; returns the number of survivor moves.
 
-        Two distinct hazards govern each survivor:
+        Pipeline (one D2H total, at step 3):
+          1. `_drain_pending_reuse` — return read-settled prior srcs to the list.
+          2. sort the free list (or skip via env knob).
+          3. `.tolist()` snapshot → `all_cpu`  *(the one sync)*.
+          4-5. `_absorb_boundary_holes` — retreat past free slots already
+               contiguous with the watermark; `holes_cpu` = interior holes.
+          6. (urgent + interior holes) `_settle_inflight_forward` — wait the
+             forward once so freed srcs are move- AND reuse-safe → race-free walk.
+          7. survivor walk — TWO-POINTER compaction: move the topmost live slot
+             (`_topmost_survivor`) into the next hole, STOPPING when the two
+             pointers cross (the band is packed); batches `(src,dst,v_moved)`
+             into ONE `move_kv_cache` + ONE v2p/p2v scatter at
+             `_commit_move_batch`.
+          8-9. flush exit:
+             - urgent → FULL-PACK reclaim: the crossing-checked walk packed all
+               live below the frontier, so retreat the watermark past ALL
+               `len(holes_cpu)` interior holes and empty the free list.
+             - non-urgent → slice consumed dsts off the free list and merge the
+               freed srcs back (watermark unchanged; a later flush absorbs the
+               now-top holes).
 
-        * **Write race (case A)** — if `src` lies in any in-flight batch's
-          `out_cache_loc` write-set, that batch's `set_kv_buffer` is about
-          to overwrite `KV[src]`. A concurrent compaction `KV[src] → KV[dst]`
-          would read partial data and corrupt `KV[dst]`. Action:
-            - non-urgent → STOP the boundary walk at this src.
-            - urgent → `wait_event` on ALL in-flight events so the write
-              completes, then proceed.
-        * **Read race (case B/C)** — `src` is being READ by an in-flight
-          forward (or not referenced at all). The compaction copy reads
-          `src` concurrently with the forward's attention — read+read is
-          benign. Src REUSE (the next alloc's write to `KV[src]`) must
-          still wait for the reader's event; `_pending_reuse` tracks this.
+        Two hazards govern each survivor (both keyed on the single
+        `forward_done` event — see `_settle_inflight_forward`):
+          * WRITE race — the forward is about to overwrite `KV[src]`; a
+            compaction read of `KV[src]` would corrupt `KV[dst]`. Non-urgent
+            STOPS the walk at such a src (lazy write-set check); urgent settles
+            up front (step 6) so the walk is race-free.
+          * READ race — the forward READS `KV[src]` (attention); src REUSE must
+            wait the reader event. `_commit_move_batch` routes such srcs to
+            `_pending_reuse`; urgent's step-6 settle makes them immediately
+            reusable instead.
 
-        **Batching (user point 4)**. The KV copy and the v2p/p2v remap
-        are GPU ops; one kernel launch per survivor would be expensive at
-        scale. We accumulate `(src, dst, v_moved)` tuples in a Python
-        list and commit the WHOLE batch in ONE `move_kv_cache` call plus
-        ONE bulk v2p / p2v scatter. We also batch even when a write-race
-        wait_event splits the loop: the accumulated batch is committed
-        BEFORE the wait so the move overlaps with whatever else
-        `schedule_stream` was doing, then a fresh batch starts after the
-        wait.
-
-        **`_topmost_survivor` exclusions.** Holes (`_free_phys_pages`)
-        and pages already moved this flush (`exclude` set) must both be
-        skipped. Pages held in `_pending_reuse` are ALSO skipped (their
-        `p2v` is `-1` from a prior remap) — so by the time we reach the
-        loop body, `physical_to_virtual[src]` is guaranteed non-negative.
-        A `v_moved < 0` observation here means the allocator's internal
-        state is corrupt and we raise (user point 3).
-
-        **Phase A vs Phase B event timing (user point 5).** Phase A
-        captures `latest_event` ONCE at flush entry and stamps the same
-        event on every `_pending_reuse` insertion in this flush — correct
-        because the inline remap commits during the SAME `_flush` call,
-        so the reader-event-at-remap-time IS the reader-event-at-
-        flush-time. Phase B's lazy remap completes ASYNCHRONOUSLY (after
-        `compaction_copy_done` fires), so Phase B must re-read
-        `_latest_forward_done_event` at the time the deferred remap
-        runs, not at flush-append time.
+        `_topmost_survivor` skips holes, already-moved srcs, and `_pending_reuse`
+        pages (all have `p2v=-1`), so a `v_moved < 0` in the loop body is a
+        corrupt-state bug and raises.
         """
         if not self.lazy_compaction:
             return 0
@@ -2176,45 +2258,41 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # §S373 step 3: ONE D2H sync — `.tolist()` of the sorted
             # tensor. This is the ONE sync per `_flush` call.
             all_cpu = self._free_phys_pages.tolist()
-            M = len(all_cpu)
 
-            # §S373 step 4: CPU-side COMPLETE boundary absorb (no
-            # SCAN_BLOCK cap — there may be many free slots; we want
-            # all contiguous-from-watermark ones).
-            wm = self.watermark_physical
-            if self.grow_direction == "up":
-                n_absorbed = 0
-                while (
-                    n_absorbed < M
-                    and all_cpu[M - 1 - n_absorbed] == wm - 1 - n_absorbed
-                ):
-                    n_absorbed += 1
-                new_wm = wm - n_absorbed
-                holes_cpu = all_cpu[: M - n_absorbed]
-            else:
-                n_absorbed = 0
-                while (
-                    n_absorbed < M
-                    and all_cpu[n_absorbed] == wm + 1 + n_absorbed
-                ):
-                    n_absorbed += 1
-                new_wm = wm + n_absorbed
-                holes_cpu = all_cpu[n_absorbed:]
-
-            # §S373 step 5: update watermark + slice GPU tensor using
-            # CPU int (no sync). After this slice, the GPU
-            # `_free_phys_pages` exactly matches `holes_cpu`.
-            self.watermark_physical = new_wm
-            new_len = M - n_absorbed
-            if self.grow_direction == "up":
-                self._free_phys_pages = self._free_phys_pages[:new_len]
-            else:
-                self._free_phys_pages = self._free_phys_pages[n_absorbed:]
-            # §S373 stats: count pages absorbed into watermark this flush
-            # (an indicator of boundary-shortcut activity).
-            self._stats_n_pages_absorbed += n_absorbed
+            # §S373 step 4-5: retreat the watermark past free slots already
+            # contiguous with it (boundary absorb) and slice them off the free
+            # list. `holes_cpu` = the remaining INTERIOR holes the survivor
+            # walk below compacts. After this, `_free_phys_pages == holes_cpu`.
+            new_wm, holes_cpu = self._absorb_boundary_holes(all_cpu)
 
             latest_event = self._latest_forward_done_event
+
+            # --- Single-pass FULL-PACK compaction (urgent only) ---
+            #
+            # Step 4-5 above absorbs ONLY holes already boundary-contiguous.
+            # Under urgent we want ONE flush to reclaim ALL interior holes so
+            # the alloc-shortfall retry succeeds (else it OOMs despite
+            # reclaimable holes — Falcon eval_167/168). The crossing-checked
+            # survivor walk below packs every live page below the frontier, so
+            # all interior holes end up above the watermark; the flush-exit
+            # block then retreats past the whole `len(holes_cpu)` in one shot.
+            #
+            # For that to be safe in a single pass, a freed src must be
+            # immediately reuse-safe: the in-flight forward must have settled on
+            # KV[src] — its READ (attn; else the next alloc's write races the
+            # read) and, for pools the forward writes, its WRITE (else the
+            # survivor MOVE reads mid-write). `_latest_forward_done_event` IS
+            # the single `forward_done` event recorded after the WHOLE forward
+            # (the scheduler stamps the SAME event into `_inflight_forward`; the
+            # two fields differ only in metadata, not the event), so waiting it
+            # ONCE settles both hazards. We wait it up front, drop the now-moot
+            # write-set, and treat every src as event-FIRED — making the walk
+            # race-free (empty `write_set`) with no `_pending_reuse` srcs, so
+            # the full-pack reclaim is exact.
+            single_pass_absorb = urgent and len(holes_cpu) > 0
+            if single_pass_absorb:
+                self._settle_inflight_forward()
+                latest_event = None  # reads/writes settled → srcs are fired
 
             # Lazy write-set materialization.
             # `write_set is None` means "not yet
@@ -2226,7 +2304,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # empty-list fast path in `flush_opportunistic` short-
             # circuits), so the bs-sized D2H inside
             # `_materialize_inflight_write_set` is paid ONLY when needed.
-            write_set: Optional[Set[int]] = None
+            # When we settled the forward above, there is no race → empty set.
+            write_set: Optional[Set[int]] = set() if single_pass_absorb else None
 
             # Accumulated move batch — committed in one shot below.
             srcs: List[int] = []
@@ -2345,6 +2424,21 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # Case B/C: no write race. Pick dst from holes_cpu by
                 # cursor (NO `.item()` sync).
                 dst = holes_cpu[dst_cursor]
+                # Two-pointer crossing check. `src` (topmost survivor) descends
+                # for grow-up / ascends for grow-down; `dst` (next hole) moves
+                # the opposite way. Once they CROSS — `src` is already on the
+                # packed side of the smallest remaining hole — every remaining
+                # live page is below (grow-up) / above (grow-down) every
+                # remaining hole: the band is packed. Moving now would relocate
+                # a live page the WRONG direction (into a hole beyond it),
+                # shuffling a hole back toward the frontier and BLOCKING the
+                # watermark retreat. Stop here so the walk fully compacts in one
+                # pass (the missing stop was why urgent flushes reclaimed only a
+                # small contiguous run instead of all holes — eval_168).
+                if (self.grow_direction == "up" and src < dst) or (
+                    self.grow_direction == "down" and src > dst
+                ):
+                    break
                 if self.grow_direction == "up":
                     dst_cursor += 1
                 else:
@@ -2387,41 +2481,47 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             )
             n_moves += len(srcs)
 
-            # §S373: slice off consumed dsts from `_free_phys_pages` in
-            # ONE GPU op (replaces the eval_122 per-iter pop loop).
-            #
-            # solution-(4) invariant: at this point `_free_phys_pages` is
-            # still byte-identical to `holes_cpu` (the post-absorb snapshot)
-            # — `_commit_move_batch` accumulated fired srcs into
-            # `released_fired` rather than mutating the free list, so NO
-            # produce/re-sort happened between the snapshot and this slice.
-            # The consumed dsts therefore occupy exactly the front
-            # `n_dst_consumed` entries (grow-up) / back `n_dst_consumed`
-            # entries (grow-down) of `_free_phys_pages`, so the directional
-            # slice removes precisely them in both directions.
-            if n_dst_consumed > 0:
+            if single_pass_absorb:
+                # FULL-PACK reclaim (urgent). The crossing-checked walk packed
+                # every live page below the frontier, so ALL `len(holes_cpu)`
+                # interior holes — whether filled (their freed src is now a top
+                # hole) or left unfilled at the top — sit above the watermark.
+                # Retreat past the whole lot in one shot and EMPTY the free
+                # list: those pages are beyond-frontier free space (p2v=-1),
+                # reclaimed by the next watermark extension, so they neither go
+                # on the free list nor fall in the ghost-check range. The
+                # `released_fired` tensors are simply dropped for the same
+                # reason. One urgent flush == complete compaction, one D2H.
+                n_reclaimed = len(holes_cpu)
                 if self.grow_direction == "up":
-                    self._free_phys_pages = (
-                        self._free_phys_pages[n_dst_consumed:]
-                    )
+                    self.watermark_physical = new_wm - n_reclaimed
                 else:
-                    self._free_phys_pages = (
-                        self._free_phys_pages[:-n_dst_consumed]
+                    self.watermark_physical = new_wm + n_reclaimed
+                self._stats_n_pages_absorbed += n_reclaimed
+                self._free_phys_pages = self._free_phys_pages[:0]
+            else:
+                # Lazy partial pass (non-urgent): the watermark stays at the
+                # boundary-absorb value; a later flush's step 4 absorbs the
+                # now-top holes. Slice consumed dsts off `_free_phys_pages`
+                # (solution-(4) invariant: it is still byte-identical to
+                # `holes_cpu`, so the consumed dsts occupy exactly the front
+                # `n_dst_consumed` (grow-up) / back `n_dst_consumed` (grow-down)
+                # entries), then merge the freed srcs back in ONE cat.
+                if n_dst_consumed > 0:
+                    if self.grow_direction == "up":
+                        self._free_phys_pages = (
+                            self._free_phys_pages[n_dst_consumed:]
+                        )
+                    else:
+                        self._free_phys_pages = (
+                            self._free_phys_pages[:-n_dst_consumed]
+                        )
+                if released_fired:
+                    self._release_phys_pages_batch(
+                        released_fired[0]
+                        if len(released_fired) == 1
+                        else torch.cat(released_fired)
                     )
-
-            # solution-(4): NOW merge the event-fired compaction-src pages
-            # back into the (just-sliced) free list, in ONE cat. Routing
-            # through `_release_phys_pages_batch` also re-applies the
-            # sort=ON invariant once, so the next flush's step-2 sort-skip
-            # stays valid. For sort=OFF the list is left front-sorted +
-            # srcs-appended, which the next flush's step-2 sort normalizes —
-            # exactly the pre-existing sort=OFF behavior.
-            if released_fired:
-                self._release_phys_pages_batch(
-                    released_fired[0]
-                    if len(released_fired) == 1
-                    else torch.cat(released_fired)
-                )
             # §S373 stats: count flushes that did real survivor work and
             # the total moves, then maybe emit the periodic summary.
             if n_moves > 0:
@@ -2687,11 +2787,16 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     @property
     def size(self) -> int:
         # Both terms are in TOKENS (post-Stage-3 unit-correction):
-        #   - `available_size()` already converts pages → tokens on the boundary.
+        #   - `schedulable_available_size()` already converts pages → tokens.
         #   - `allocated_count()` now returns tokens (was pages in an earlier
         #     Stage 3 revision; that mismatch caused the eval_results_15 leak).
+        # MUST use the SAME available view as `available_size()` below so the
+        # leak invariant self-cancels (`total = size`, `available = available_size()`
+        # → the available term cancels and the check reduces to
+        # `evictable + protected + ... == allocated`, independent of the
+        # peer-hole credit). See pool_stats_observer._get_mamba_token_info.
         return (
-            self.full_attn_allocator.available_size()
+            self.full_attn_allocator.schedulable_available_size()
             + self.full_attn_allocator.allocated_count()
         )
 
@@ -2702,14 +2807,38 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     # -- token-slot surface: MHA side --
 
+    # Scheduler-facing capacity: the realizable-with-compaction view so the
+    # retract gate / evict / schedule_policy do NOT over-retract when the mamba
+    # peer holds drainable holes (139 MB/slot) that an urgent flush would
+    # convert into shared-gap room. This is the fix for the Falcon "wedge"
+    # (available_size collapsing to ~0 under lazy compaction's high-water
+    # mamba watermark). The per-side alloc gates still use the un-credited
+    # `MultiEndedAllocator.available_size()` so they flush before extending.
     def available_size(self) -> int:
-        return self.full_attn_allocator.available_size()
+        return self.full_attn_allocator.schedulable_available_size()
 
     def full_available_size(self) -> int:
-        return self.full_attn_allocator.available_size()
+        return self.full_attn_allocator.schedulable_available_size()
 
-    def mamba_available_size(self) -> int:
-        return self.mamba_allocator.available_size()
+    def mamba_slot_full_token_cost(self) -> int:
+        """Full-token-equivalents of shared-gap bytes ONE mamba state consumes.
+
+        full and mamba share one byte buffer (the gap), so allocating a mamba
+        state — even a single one (~139 MB) — removes that many full-KV tokens
+        from the gap. The prefill planner reserves this per new mamba slot so
+        admission stays inside the JOINT budget (`available_size()` reports the
+        gap in full tokens but does NOT subtract the mamba slots the admitted
+        requests will also need). Defined ONLY on the shared composite — the
+        non-shared allocator has separate pools, so a mamba slot costs zero
+        full-KV bytes and the planner sources this via `getattr(..., None)`.
+
+        = mamba bytes/slot (mamba page_size==1 → `entry_bytes_per_page`)
+        ÷ full bytes/token (`entry_bytes`).
+        """
+        return (
+            self.mamba_allocator.entry_bytes_per_page
+            // self.full_attn_allocator.entry_bytes
+        )
 
     @property
     def size_full(self) -> int:
@@ -2942,13 +3071,17 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                                       for `alloc(N)` because N slots cost N*
                                       (entry_full + entry_swa) bytes out of the
                                       shared gap.
-    - `full_available_size()` /
-      `swa_available_size()`        : slot-conservation, for the leak invariant.
-                                      Static cap − allocated_count.
+    - `_conserve_full_available_size()` /
+      `_conserve_swa_available_size()` : slot-conservation (static cap −
+                                         allocated_count), for the LEAK invariant
+                                         only (via pool_stats_observer).
     - `schedulable_full_available_size()` /
-      `schedulable_swa_available_size()` : byte-coordinated, for the scheduler's
-                                           alloc planner — may be smaller than
-                                           the slot-conservation view.
+      `schedulable_swa_available_size()` : byte-coordinated, realizable-with-
+                                           compaction (peer drainable holes
+                                           credited).
+    - `full_available_size()` /
+      `swa_available_size()`        : PHYSICAL per-side view for the scheduler /
+                                      evict / radix = min(conserve, schedulable).
     """
 
     # The parent declares `size` as a `@property` without a setter, but
@@ -3102,9 +3235,15 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         fa, sa = self.full_attn_allocator, self.swa_attn_allocator
         e_f = fa.entry_bytes_per_page
         e_s = sa.entry_bytes_per_page
-        full_high = fa._byte_high_frontier()
-        swa_low = sa._byte_low_frontier()
-        gap_bytes = max(0, swa_low - full_high)
+        # Direction-agnostic shared gap: the free byte band between the two
+        # pools, regardless of which side grows up vs down. The grow-up side
+        # sits at the low bytes (its high frontier is the lower edge of the
+        # gap); the grow-down side sits at the high bytes (its low frontier is
+        # the upper edge of the gap). Both perspectives yield the same band.
+        if fa.grow_direction == "up":
+            gap_bytes = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
+        else:
+            gap_bytes = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
         R_f = (
             fa.num_pages - fa.min_page_index - fa._allocated_pages()
         )
@@ -3144,37 +3283,74 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         K_total = min(K_total, H_f + R_f, H_s + R_s)
         return K_total * self.page_size
 
-    # Slot-conservation views — the only views the leak invariant should see.
-    # Under shared SWA, the swa side can consume bytes that originally counted
-    # toward the full side's static budget. Returning the byte-coordinated
-    # (dynamic, peer-aware) value here would generate spurious leak
-    # detections. (v1 lesson #2: lines 1158–1177.)
+    # Slot-conservation views — the ONLY views the leak invariant should see
+    # (routed there via `pool_stats_observer._get_swa_token_info`). Under
+    # shared SWA, the swa side can consume bytes that originally counted toward
+    # the full side's static budget. Returning the byte-coordinated (dynamic,
+    # peer-aware) value here would generate spurious leak detections.
+    # (v1 lesson #2: lines 1158–1177.)
     #
     # `allocated_count()` returns TOKENS (matching upstream convention), so
     # `cap_TOKENS - allocated_count()` is in TOKENS — the unit the leak
     # invariant expects. The Stage-3 eval_results_15 crash was caused by an
     # earlier revision that returned pages here.
-    def full_available_size(self) -> int:
+    def _conserve_full_available_size(self) -> int:
         return (
             self._full_max_total_num_tokens
             - self.full_attn_allocator.allocated_count()
         )
 
-    def swa_available_size(self) -> int:
+    def _conserve_swa_available_size(self) -> int:
         return (
             self._swa_max_total_num_tokens
             - self.swa_attn_allocator.allocated_count()
         )
 
-    # Byte-coordinated views — used by the scheduler's alloc planner
-    # (`schedule_policy` etc.). On the non-shared `SWATokenToKVPoolAllocator`
-    # these methods alias the static views (no peer coupling). The split
-    # only matters under shared pool. (v1 lesson #3.)
+    # PHYSICAL per-side views — what every SCHEDULING / eviction consumer
+    # (`evict_from_tree_cache`, `schedule_policy`, the radix caches, disagg)
+    # reads. Upstream's `SWATokenToKVPoolAllocator.full_available_size()`
+    # returns the sub-allocator's physical `available_size()`; we preserve that
+    # CONTRACT (physical, not slot-conserve — the leak path uses the
+    # `_conserve_*` methods above instead). The `min(...)` keeps the report
+    # sound under dynamic borrowing: the static-conserve cap bounds the
+    # lending side (which would otherwise report bytes the borrower physically
+    # took), while the byte-coordinated `schedulable_*` view bounds the side
+    # that has already grown into the shared gap. Whichever is tighter wins.
+    def full_available_size(self) -> int:
+        return min(
+            self._conserve_full_available_size(),
+            self.schedulable_full_available_size(),
+        )
+
+    def swa_available_size(self) -> int:
+        return min(
+            self._conserve_swa_available_size(),
+            self.schedulable_swa_available_size(),
+        )
+
+    # Byte-coordinated, realizable-with-compaction views (peer drainable holes
+    # credited — see `MultiEndedAllocator.schedulable_available_size`). On the
+    # non-shared `SWATokenToKVPoolAllocator` the sub-allocators have no peer,
+    # so these collapse to the static physical view. (v1 lesson #3.)
     def schedulable_full_available_size(self) -> int:
-        return self.full_attn_allocator.available_size()
+        return self.full_attn_allocator.schedulable_available_size()
 
     def schedulable_swa_available_size(self) -> int:
-        return self.swa_attn_allocator.available_size()
+        return self.swa_attn_allocator.schedulable_available_size()
+
+    def _flush_both_for_alloc(self, need_tokens: int) -> bool:
+        """SWA analogue of `MultiEndedAllocator._flush_peer_for_alloc`.
+
+        Each composite alloc consumes a full-side AND a swa-side page, and
+        either side's compaction opens shared gap for the other, so we flush
+        BOTH. A single urgent flush per side retreats its watermark in one
+        pass (full-pack compaction in `_flush`), so no loop is needed.
+        """
+        if not self.lazy_compaction:
+            return need_tokens <= self.available_size()
+        self.full_attn_allocator._flush(urgent=True)
+        self.swa_attn_allocator._flush(urgent=True)
+        return need_tokens <= self.available_size()
 
     # `size_full` / `size_swa` are inherited from `SWATokenToKVPoolAllocator`
     # — they read `_size_full` / `_size_swa`, which we set to the static
@@ -3319,12 +3495,9 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # bytes into the shared gap that the OTHER side can extend
             # into, so under lazy we flush BOTH on shortfall.
             if need_size > self.available_size():
-                if self.lazy_compaction:
-                    self.full_attn_allocator._flush(urgent=True)
-                    self.swa_attn_allocator._flush(urgent=True)
-                    if need_size > self.available_size():
-                        return None
-                else:
+                # One joint urgent flush — each side retreats in one pass via its
+                # full-pack compaction (see `_flush_both_for_alloc`).
+                if not self._flush_both_for_alloc(need_size):
                     return None
             # Snapshot the virtual PAGES the full-side alloc is about to
             # consume, so we can bind them on the swa side too.
@@ -3378,13 +3551,8 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # Joint pre-check at page granularity (matches v1 lesson #1).
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                # Lazy: flush BOTH sides, then retry once.
-                if self.lazy_compaction:
-                    self.full_attn_allocator._flush(urgent=True)
-                    self.swa_attn_allocator._flush(urgent=True)
-                    if need_tokens > self.available_size():
-                        return None
-                else:
+                # One joint urgent flush (see `_flush_both_for_alloc`).
+                if not self._flush_both_for_alloc(need_tokens):
                     return None
 
             # Snapshot the virtual PAGES that the full-side kernel call is
@@ -3430,13 +3598,8 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # this is trivially true (kernel still runs to fill out_indices).
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                # Lazy: flush BOTH sides, then retry once.
-                if self.lazy_compaction:
-                    self.full_attn_allocator._flush(urgent=True)
-                    self.swa_attn_allocator._flush(urgent=True)
-                    if need_tokens > self.available_size():
-                        return None
-                else:
+                # One joint urgent flush (see `_flush_both_for_alloc`).
+                if not self._flush_both_for_alloc(need_tokens):
                     return None
 
             fa = self.full_attn_allocator

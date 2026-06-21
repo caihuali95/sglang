@@ -487,6 +487,21 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
+        # SHARED-pool joint budget: a new mamba state consumes shared-gap bytes
+        # that `rem_total_tokens` (full KV) otherwise counts as free. Reserve
+        # that gap per new mamba slot so admission can't over-commit (the
+        # chunk-normal over-admit). Cost is 0 for the non-shared allocator
+        # (separate pools — a mamba slot costs no full-KV bytes), keeping the
+        # baseline path byte-identical: the method exists ONLY on the shared
+        # composite, so `getattr(..., None)` yields a no-op.
+        self._mamba_slot_cost = 0
+        if self.is_hybrid_ssm_cache:
+            _cost_fn = getattr(
+                self.token_to_kv_pool_allocator, "mamba_slot_full_token_cost", None
+            )
+            if _cost_fn is not None:
+                self._mamba_slot_cost = _cost_fn()
+
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
@@ -584,6 +599,18 @@ class PrefillAdder:
             budget += self.ceil_paged_tokens(swa_host_hit_length)
         return budget
 
+    def _mamba_gap_budget_for_req(self, req: Req) -> int:
+        """Shared-gap reservation (full-token-equivalents) for a request's
+        mamba state. Only the SHARED Mamba pool couples mamba into the full gap
+        (`self._mamba_slot_cost > 0`); a new state is needed only when the req
+        has none yet (`mamba_pool_idx is None` — mirrors
+        `HybridReqToTokenPool.alloc`, so a chunked-prefill continuation or a
+        radix state-reuse that won't allocate is not charged). 0 otherwise,
+        which keeps the baseline / SWA / non-Mamba paths unchanged."""
+        if self._mamba_slot_cost and req.mamba_pool_idx is None:
+            return self._mamba_slot_cost
+        return 0
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -612,14 +639,23 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
+        mamba_gap_reserve: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
-        self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
-        self.cur_rem_token_offset += extend_input_len + page_overhead
+        # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the
+        # new mamba state's shared-gap cost to BOTH full budgets so admission
+        # stays within the joint budget — the slot is allocated immediately
+        # (`alloc_req_slots`), so it consumes `cur_rem` too, and held for the
+        # request lifetime, so it counts against `rem_total`. See
+        # `_mamba_gap_budget_for_req`.
+        self.rem_total_token_offset += (
+            extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
+        )
+        self.cur_rem_token_offset += extend_input_len + page_overhead + mamba_gap_reserve
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -664,7 +700,13 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
+        self._update_prefill_budget(
+            prefix_len,
+            trunc_len,
+            0,
+            req.retracted_stain,
+            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+        )
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -691,7 +733,11 @@ class PrefillAdder:
             else 0
         )
         self._update_prefill_budget(
-            0, req.extend_input_len, max_new_tokens, req.retracted_stain
+            0,
+            req.extend_input_len,
+            max_new_tokens,
+            req.retracted_stain,
+            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
         # Return based on remaining token availability
@@ -732,6 +778,7 @@ class PrefillAdder:
                 else 0
             ),
             req.retracted_stain,
+            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
         )
 
         # Return if chunked prefill not finished
@@ -756,6 +803,10 @@ class PrefillAdder:
 
     def add_one_req_ignore_eos(self, req: Req):
         paged_input = self.ceil_paged_tokens(req.extend_input_len)
+        # Shared Mamba pool: the request's new mamba state also draws on the
+        # shared gap (full-token-equivalents); fold it into the budget gate so
+        # admission can't over-commit (0 for baseline / non-Mamba).
+        paged_input += self._mamba_gap_budget_for_req(req)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
@@ -838,6 +889,7 @@ class PrefillAdder:
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
+                mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -851,7 +903,13 @@ class PrefillAdder:
             req.fill_len = len(req.prefix_indices) + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0, req.retracted_stain)
+            self._update_prefill_budget(
+            0,
+            trunc_len,
+            0,
+            req.retracted_stain,
+            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+        )
 
         return self.budget_state()
 
@@ -890,6 +948,11 @@ class PrefillAdder:
             CLIP_MAX_NEW_TOKENS,
         )
         total_tokens = req.extend_input_len + max_new + self.page_size
+        # Shared Mamba pool: the request's new mamba state also draws on the
+        # shared gap (full-token-equivalents); fold it into `total_tokens` so
+        # BOTH `rem_total_tokens` gates below reflect the joint budget. 0 for
+        # baseline / non-Mamba, so those paths are unchanged.
+        total_tokens += self._mamba_gap_budget_for_req(req)
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
@@ -982,6 +1045,7 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
+                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
             else:
                 # Make sure at least one page is available
@@ -1017,7 +1081,11 @@ class PrefillAdder:
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    prefix_len, trunc_len, 0, req.retracted_stain
+                    prefix_len,
+                    trunc_len,
+                    0,
+                    req.retracted_stain,
+                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
 
         return self.budget_state()

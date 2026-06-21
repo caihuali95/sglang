@@ -1053,9 +1053,12 @@ class SharedMambaSlotAllocator:
 
     def schedulable_available_size(self) -> int:
         """Byte-coordinated free count — the ``>= N => alloc(N) succeeds``
-        contract used by ``common.alloc_req_slots`` (smaller than
-        ``available_size`` when the peer pool's bytes tighten this side)."""
-        return self._mea.available_size()
+        contract used by ``common.alloc_req_slots``. Uses the MEA's
+        realizable-with-compaction view (peer drainable holes credited), so a
+        mamba-state admission is not starved when the shared gap is choked by
+        the full peer's uncompacted holes — ``alloc`` flushes the peer before
+        extending, so the credited capacity is obtainable."""
+        return self._mea.schedulable_available_size()
 
     @property
     def free_slots(self) -> torch.Tensor:
@@ -1296,13 +1299,19 @@ def init_shared_mamba_pools(
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
+    # Layout convention: the full-attn KV sub-pool sits at the HIGH-byte end
+    # (grow-down, watermark retreats toward the gap) and the peer (mamba)
+    # sits at the LOW-byte end (grow-up, just above the slot-0 dummy sink).
+    # The two pools grow toward each other through the shared middle gap. All
+    # frontier/available_size math is direction-agnostic, so the assignment is
+    # a convention, not a correctness constraint (see MultiEndedAllocator).
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),
         head_num=head_num,
         head_dim=head_dim,
         store_dtype=store_dtype,
-        grow_direction="up",
+        grow_direction="down",
     )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -1312,7 +1321,7 @@ def init_shared_mamba_pools(
         conv_dtype=cp.dtype.conv,
         temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
         temporal_dtype=cp.dtype.temporal,
-        grow_direction="down",
+        grow_direction="up",
     )
     total_bytes = (
         max_total_num_tokens * full_spec.entry_bytes()
@@ -1890,6 +1899,9 @@ def init_shared_swa_pools(
     )
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
+    # Layout convention (mirrors the mamba builder): full-attn KV at the
+    # HIGH-byte end (grow-down), the SWA peer at the LOW-byte end (grow-up).
+    # Both grow toward the shared middle gap; the math is direction-agnostic.
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),
@@ -1897,7 +1909,7 @@ def init_shared_swa_pools(
         head_dim=head_dim,
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
-        grow_direction="up",
+        grow_direction="down",
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -1906,7 +1918,7 @@ def init_shared_swa_pools(
         head_dim=swa_head_dim,
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
-        grow_direction="down",
+        grow_direction="up",
     )
     total_bytes = (
         full_max_total_num_tokens * full_spec.entry_bytes()

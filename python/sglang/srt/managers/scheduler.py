@@ -3124,6 +3124,19 @@ class Scheduler(
                         len(r.output_ids) for r in retracted_reqs
                     ),
                 )
+            # Guard against an admission deadlock. When retract_decode aborts
+            # the last/only request (e.g. a single request larger than the
+            # entire KV pool at a tight mem-fraction), the post-retract estimate
+            # is computed on an EMPTY batch and returns 0.0. Applied as-is,
+            # current=0.0 admits no new tokens, so the queue starves forever and
+            # the server hangs with no crash and no progress (observed on Falcon
+            # mfs0.30 chunk/normal cg_on — the shared pool's optimistic
+            # available_size over-admits a request that then cannot fit). Floor
+            # at the tracker's `min` (the same floor decay_step enforces) so
+            # admission can always resume: the oversized request fails
+            # gracefully (it is aborted with a 500 just below) and the scheduler
+            # keeps draining the queue instead of hanging.
+            new_token_ratio = max(new_token_ratio, self.new_token_ratio_tracker.min)
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish

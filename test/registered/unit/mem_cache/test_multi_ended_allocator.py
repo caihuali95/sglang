@@ -786,14 +786,17 @@ class TestSharedSWATokenToKVPoolAllocator(unittest.TestCase):
             self._check_sub_pool_invariants(
                 allocator.swa_attn_allocator, kvcache.swa_kv_pool
             )
-            # Slot-conservation invariant balances at all times.
+            # Slot-conservation invariant balances at all times. NOTE: the
+            # leak view is now `_conserve_*` — the public `full/swa_available_size()`
+            # returns `min(conserve, schedulable)` (physical), which can be
+            # strictly smaller (e.g. the reserved sink page).
             self.assertEqual(
-                allocator.full_available_size(),
+                allocator._conserve_full_available_size(),
                 allocator._full_max_total_num_tokens
                 - allocator.full_attn_allocator.allocated_count(),
             )
             self.assertEqual(
-                allocator.swa_available_size(),
+                allocator._conserve_swa_available_size(),
                 allocator._swa_max_total_num_tokens
                 - allocator.swa_attn_allocator.allocated_count(),
             )
@@ -1727,36 +1730,38 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             swa_max_total_num_tokens=swa_max,
             page_size=PS, need_sort=False, forward_stream=None,
         )
-        # Idle: full_available_size == cap (in tokens).
-        self.assertEqual(allocator.full_available_size(), full_max)
-        self.assertEqual(allocator.swa_available_size(), swa_max)
+        # Idle: conserve view == cap (in tokens). (The leak invariant reads
+        # `_conserve_*`; the public `full/swa_available_size()` is now
+        # `min(conserve, schedulable)` and may be smaller — reserved sink page.)
+        self.assertEqual(allocator._conserve_full_available_size(), full_max)
+        self.assertEqual(allocator._conserve_swa_available_size(), swa_max)
 
         # Alloc 2 pages = 2*PS tokens.
         v = allocator.alloc(2 * PS)
         self.assertIsNotNone(v)
 
-        # full_available_size must drop by 2*PS TOKENS, not by 2 (pages).
+        # conserve view must drop by 2*PS TOKENS, not by 2 (pages).
         self.assertEqual(
-            allocator.full_available_size(),
+            allocator._conserve_full_available_size(),
             full_max - 2 * PS,
-            "REGRESSION: full_available_size() must drop by token-count, "
+            "REGRESSION: the conserve view must drop by token-count, "
             "not page-count. The eval_results_15 'pool memory leak detected' "
             "crash was caused by a page-count drop here.",
         )
         self.assertEqual(
-            allocator.swa_available_size(),
+            allocator._conserve_swa_available_size(),
             swa_max - 2 * PS,
         )
 
         # First-principles leak invariant: at this point, allocated tokens
         # are all "live" (no eviction yet). So:
-        #   total = full_available_size() + allocated_tokens
-        # where allocated_tokens = full_max - full_available_size().
-        allocated_tokens = full_max - allocator.full_available_size()
+        #   total = conserve + allocated_tokens
+        # where allocated_tokens = full_max - conserve.
+        allocated_tokens = full_max - allocator._conserve_full_available_size()
         self.assertEqual(allocated_tokens, 2 * PS)
         self.assertEqual(
             allocated_tokens
-            + allocator.full_available_size(),
+            + allocator._conserve_full_available_size(),
             full_max,
         )
 

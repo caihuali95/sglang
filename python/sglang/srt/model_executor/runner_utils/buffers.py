@@ -70,6 +70,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
     out_cache_loc_swa: Optional[torch.Tensor]
+    # Shared-memory-pool cuda-graph WRITE-location buffer (int64, matching the
+    # v2p table dtype). Holds the full-physical write locations under the shared
+    # pool, refreshed IN-GRAPH each replay by `_capture_shared_pool_write_translate`.
+    # `None` for non-shared pools (then the capture pins / in-graph translate are
+    # no-ops, keeping baseline cg_on byte-identical).
+    out_cache_loc_full_physical: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -108,6 +114,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
+        enable_shared_memory_pool: bool = False,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -115,11 +122,27 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int64)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-            out_cache_loc_swa = (
-                torch.zeros((max_num_token,), dtype=torch.int64)
-                if is_hybrid_swa
-                else None
-            )
+            # Shared pool: SWA write locations are int32 (the SWA physical-id
+            # Triton-kernel contract) and a separate int64 full-physical write
+            # buffer is allocated (matching the v2p table). Both are refreshed
+            # in-graph each replay. Baseline keeps the upstream int64 swa buffer
+            # (when hybrid-SWA) and no full-physical buffer.
+            if enable_shared_memory_pool:
+                out_cache_loc_swa = (
+                    torch.zeros((max_num_token,), dtype=torch.int32)
+                    if is_hybrid_swa
+                    else None
+                )
+                out_cache_loc_full_physical = torch.zeros(
+                    (max_num_token,), dtype=torch.int64
+                )
+            else:
+                out_cache_loc_swa = (
+                    torch.zeros((max_num_token,), dtype=torch.int64)
+                    if is_hybrid_swa
+                    else None
+                )
+                out_cache_loc_full_physical = None
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -207,6 +230,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
             out_cache_loc_swa=out_cache_loc_swa,
+            out_cache_loc_full_physical=out_cache_loc_full_physical,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,

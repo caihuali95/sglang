@@ -4562,15 +4562,20 @@ class ServerArgs:
         #
         # Piecewise cuda-graph capture (prefill/extend, separate code path
         # in `piecewise_cuda_graph_runner.py`) has NOT been wired for the
-        # shared pool yet — guard explicitly. Recent SGLang defaults to
-        # `disable_piecewise_cuda_graph=True`, so this guard only fires for
-        # users who explicitly opt into piecewise.
-        if not self.disable_piecewise_cuda_graph:
+        # shared pool yet — guard explicitly. Upstream replaced the flat
+        # `disable_piecewise_cuda_graph` flag with the per-phase
+        # `cuda_graph_config.prefill.backend` enum; piecewise is enabled only
+        # when that backend is `tc_piecewise` (default DISABLED, resolved by
+        # `_handle_cuda_graph_config()` earlier in __post_init__), so this guard
+        # only fires for users who explicitly opt into piecewise prefill.
+        _cg_cfg = self.cuda_graph_config
+        if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
             raise ValueError(
                 "--enable-shared-memory-pool currently supports monolithic "
-                "cuda-graph capture only (decode). Piecewise capture is not "
-                "yet wired for the shared pool — pass "
-                "--disable-piecewise-cuda-graph to disable it, or wait for "
+                "cuda-graph capture only (decode). Piecewise (tc_piecewise) "
+                "prefill capture is not yet wired for the shared pool — set the "
+                "prefill cuda-graph backend to something other than tc_piecewise "
+                "(e.g. --cuda-graph-backend-prefill=disabled), or wait for "
                 "Stage 3.6."
             )
         # Overlap-schedule note:
