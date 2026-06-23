@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -1045,6 +1044,7 @@ class TritonAttnBackend(AttentionBackend):
         if self._translate_kv_loc_bounded is None:
             return  # non-shared → translate-free graph (Invariant 2)
         # Full-attention read path: cuda_graph_kv_indices[0:kv_indptr[bs]].
+        # Translate VIRTUAL -> PHYSICAL in place at replay (reads the LIVE v2p).
         self._translate_kv_loc_bounded(
             self.cuda_graph_kv_indices, self.kv_indptr, bs
         )
@@ -1060,7 +1060,9 @@ class TritonAttnBackend(AttentionBackend):
             and self.sliding_window_size > 0
         ):
             self._translate_loc_from_full_to_swa_bounded(
-                self.cuda_graph_window_kv_indices, self.window_kv_indptr, bs
+                self.cuda_graph_window_kv_indices,
+                self.window_kv_indptr,
+                bs,
             )
 
     def _apply_cuda_graph_metadata(

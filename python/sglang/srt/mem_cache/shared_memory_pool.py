@@ -30,7 +30,6 @@ import torch
 from torch.profiler import record_function
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -768,12 +767,10 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
                 cache_k = cache_k.view(self.store_dtype)
                 cache_v = cache_v.view(self.store_dtype)
 
-            # Step 3: write into the 4-D layer-major view.
-            # Default: single-launch Triton `store_cache_4d_kernel` (called
-            # directly; the Python wrapper `store_cache_4d` in `utils.py`
-            # is bypassed for latency since its validation asserts are
-            # guaranteed by `_build_mha_views`).
-            # Fallback (env-gated): legacy PyTorch advanced-indexing.
+            # Step 3: write into the 4-D layer-major view via a single-launch
+            # Triton `store_cache_4d_kernel` (called directly; the Python
+            # wrapper `store_cache_4d` in `utils.py` is bypassed for latency
+            # since its validation asserts are guaranteed by `_build_mha_views`).
             # See plan-file §S361 (Stage 3.6.1 action plan) and design-doc
             # §19 for the eval journey that motivated the Triton kernel.
             layer_id = (
@@ -782,29 +779,11 @@ class SharedMHATokenToKVPool(MHATokenToKVPool):
             k_view = self.k_buffer[layer_id]
             v_view = self.v_buffer[layer_id]
             ps = self._page_size
-
-            if envs.SGLANG_DISABLE_STORE_CACHE_4D.get():
-                # Legacy PyTorch advanced-indexing write path. PyTorch resolves
-                # each (page, tok) pair to the right byte address via the
-                # view's strides — correct but decomposes into 5-7 small CUDA
-                # kernel launches per call.
-                if ps == 1:
-                    k_view[loc, 0] = cache_k
-                    v_view[loc, 0] = cache_v
-                else:
-                    page_id = loc // ps
-                    tok_in_p = loc % ps
-                    k_view[page_id, tok_in_p] = cache_k
-                    v_view[page_id, tok_in_p] = cache_v
-                return
-
-            # Hot path: inline store_cache_4d's body (kernel launch only).
-            # The contract — 4-D K/V views with stride(-1)==1 and
-            # stride(-2)==head_dim, 3-D cache_k/cache_v with matching
-            # batch dim — is guaranteed by `_build_mha_views` (K/V) and
-            # the model forward (cache_k/cache_v). Skipping the wrapper's
-            # validation asserts saves ~10-30 µs/call; for a debug build
-            # use the legacy fallback via SGLANG_DISABLE_STORE_CACHE_4D.
+            # Inline store_cache_4d's body (kernel launch only). The contract —
+            # 4-D K/V views with stride(-1)==1 and stride(-2)==head_dim, 3-D
+            # cache_k/cache_v with matching batch dim — is guaranteed by
+            # `_build_mha_views` (K/V) and the model forward (cache_k/cache_v).
+            # Skipping the wrapper's validation asserts saves ~10-30 µs/call.
             N = loc.numel()
             if N == 0:
                 return
@@ -1178,7 +1157,17 @@ class SharedHybridReqToTokenPool(HybridReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: Optional[int] = None,
+        speculative_eagle_topk: Optional[int] = None,
     ):
+        # `speculative_eagle_topk` (phase-6 upstream addition to
+        # `HybridReqToTokenPool._init_mamba_pool`, forwarded from `__init__`) is
+        # accepted to match the parent signature but NOT forwarded to
+        # `SharedMambaPool`: in the base `MambaPool` it only sizes the conv-state
+        # ALLOCATION (the linear-vs-tree draft-chain shape), whereas the shared
+        # pool's conv/temporal state are VIEWS into the shared buffer whose shape
+        # is fixed by the `MambaSubPoolSpec` (built in `init_shared_mamba_pools`).
+        # So there is nothing to allocate here. (A future shared-pool + eagle
+        # spec-decode config would thread it through the sub-pool spec instead.)
         # Parent's contract: `mamba_size` is the source of truth for the mamba
         # pool's slot count. Under the shared pool that source of truth is
         # `SharedMemoryPool.max_slots("mamba") - 1` (= self._shared_mamba_size,
@@ -1214,6 +1203,18 @@ class SharedHybridReqToTokenPool(HybridReqToTokenPool):
         # before the factory wiring completes.
         self.mamba_allocator = None
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
+        # `mamba_ckpt_pool` (phase-6 upstream addition): an OPTIONAL int8 mamba
+        # checkpoint pool the radix cache uses to hold cached prefix states in
+        # int8 instead of the active bf16 pool. The parent sets it via
+        # `maybe_init_int8_mamba_checkpoint_pool` (returns None unless the int8
+        # checkpoint server-arg is on). The shared pool keeps its mamba states in
+        # the shared byte buffer and does NOT use a separate int8 checkpoint pool,
+        # so set None — the parent's reset path guards on `is not None`
+        # (memory_pool.py: `if self.mamba_ckpt_pool is not None`), so None is the
+        # "feature off" state and the radix cache falls back to the normal path.
+        # (Enabling int8 checkpoint WITH the shared pool would be a separate
+        # feature to thread through `init_shared_mamba_pools`.)
+        self.mamba_ckpt_pool = None
         self.device = device
         # Mirror the parent's sizing: indexed by req_pool_idx, so by the
         # req_to_token buffer's first dim — which is `self.size + 1`, NOT
@@ -1228,7 +1229,14 @@ class SharedHybridReqToTokenPool(HybridReqToTokenPool):
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
                     (req_pool_size, self.mamba_ping_pong_track_buffer_size),
-                    dtype=torch.int32,
+                    # int64 to match the parent: the alloc-path `index_put` source
+                    # `torch.stack(mamba_ping_pong_track_buffers)` is int64 and is
+                    # NOT cast (unlike `mamba_index_tensor`, which is cast to
+                    # int32), so an int32 destination raises
+                    # "Index put requires the source and destination dtypes match"
+                    # on the first radix prefill (enable_mamba_extra_buffer is set
+                    # by the radix cache, not chunk — hence radix-only).
+                    dtype=torch.int64,
                     device=self.device,
                 )
             )

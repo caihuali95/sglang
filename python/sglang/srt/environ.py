@@ -266,11 +266,6 @@ class Envs:
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
-    # Disable the Triton `store_cache_4d` kernel and fall back
-    # to the legacy PyTorch advanced-indexing write path in
-    # `SharedMHATokenToKVPool.set_kv_buffer`. Used for production
-    # A/B and quick rollback. Default False (use the Triton kernel).
-    SGLANG_DISABLE_STORE_CACHE_4D = EnvBool(False)
     # Disable lazy compaction in the shared memory pool allocator and
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).

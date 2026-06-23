@@ -291,10 +291,9 @@ class TestStoreCache4DAssertions(unittest.TestCase):
 class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
     """Integration parity test — exercises the kernel through the FULL
     ``SharedMHATokenToKVPool.set_kv_buffer`` path, including the
-    ``_external_allocator`` v2p translation, the dtype cast, and the
-    env-gated dispatch. Confirms the production code path produces
-    bit-identical output to the legacy ``SGLANG_DISABLE_STORE_CACHE_4D=1``
-    fallback.
+    ``_external_allocator`` v2p translation and the dtype cast. Confirms the
+    production code path produces bit-identical output to a PyTorch
+    advanced-indexing reference write.
     """
 
     def _build_pool_and_stub_alloc(self, page_size: int, v2p=None):
@@ -360,7 +359,6 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
 
     def _run_set_kv_buffer_and_compare(self, page_size: int):
         import torch as _t
-        from sglang.srt.environ import envs
 
         kv_pool = self._build_pool_and_stub_alloc(page_size)
 
@@ -384,31 +382,36 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
             (N, head_num, head_dim), dtype=_t.bfloat16, device="cuda"
         )
 
-        # Run with the kernel (default).
-        envs.SGLANG_DISABLE_STORE_CACHE_4D.set(False)
+        # Production path: the Triton `store_cache_4d` kernel via set_kv_buffer.
         kv_pool.set_kv_buffer(layer, loc, cache_k.clone(), cache_v.clone())
         k_kernel = kv_pool.k_buffer[0].clone()
         v_kernel = kv_pool.v_buffer[0].clone()
 
-        # Reset buffers + run with legacy fallback.
+        # Reference: PyTorch advanced-indexing into a fresh view. The stub
+        # allocator's v2p is identity, so physical loc == virtual loc and no
+        # dtype cast happens (store_dtype == dtype), making this the exact
+        # write the kernel performs.
         kv_pool.k_buffer[0].zero_()
         kv_pool.v_buffer[0].zero_()
-        envs.SGLANG_DISABLE_STORE_CACHE_4D.set(True)
-        try:
-            kv_pool.set_kv_buffer(
-                layer, loc, cache_k.clone(), cache_v.clone()
-            )
-            k_legacy = kv_pool.k_buffer[0].clone()
-            v_legacy = kv_pool.v_buffer[0].clone()
-        finally:
-            envs.SGLANG_DISABLE_STORE_CACHE_4D.set(False)
+        k_view = kv_pool.k_buffer[0]
+        v_view = kv_pool.v_buffer[0]
+        if page_size == 1:
+            k_view[loc, 0] = cache_k
+            v_view[loc, 0] = cache_v
+        else:
+            page_id = loc // page_size
+            tok_in_p = loc % page_size
+            k_view[page_id, tok_in_p] = cache_k
+            v_view[page_id, tok_in_p] = cache_v
+        k_ref = kv_pool.k_buffer[0].clone()
+        v_ref = kv_pool.v_buffer[0].clone()
 
         self.assertTrue(
-            _t.equal(k_kernel, k_legacy),
+            _t.equal(k_kernel, k_ref),
             f"K view mismatch through set_kv_buffer at ps={page_size}",
         )
         self.assertTrue(
-            _t.equal(v_kernel, v_legacy),
+            _t.equal(v_kernel, v_ref),
             f"V view mismatch through set_kv_buffer at ps={page_size}",
         )
 

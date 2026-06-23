@@ -2487,7 +2487,6 @@ class Scheduler(
             release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
-        self._chunked_req_scheduled_last_iter = False
         self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -2792,9 +2791,19 @@ class Scheduler(
         _prev_is_chunked = (
             self.chunked_req.inflight_middle_chunks if self.chunked_req is not None else None
         )
+        # `add_chunked_req` (below) is the ONLY writer of `fill_len` here; it
+        # advances it to `len(prefix_indices) + extend_input_len`. Snapshot the
+        # pre-advance value so the graceful-refusal path can restore it: a
+        # refused chunk commits no KV, so its `fill_len` must stay at the last
+        # COMMITTED frontier. Otherwise the content-based stash gate at the top
+        # of the next iter (`fill_len > len(prefix_indices)`) spuriously fires
+        # and caches the un-run chunk (→ `prefix_indices == fill_ids` →
+        # `extend_num_tokens == 0` → empty `forward_extend` rotary crash).
+        _prev_fill_len = None
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            _prev_fill_len = self.chunked_req.fill_len
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
@@ -2992,20 +3001,28 @@ class Scheduler(
             # is None, so self.chunked_req is correctly cleared.
             self.chunked_req = _prev_chunked_req
             # CRITICAL: this iteration's chunk was REFUSED — it did NOT commit
-            # any KV. So next iter must NOT stash it. `_chunked_req_scheduled_
-            # last_iter` gates the `stash_chunked_request` →
-            # `cache_unfinished_req` call at the top of the next
-            # get_next_batch_to_run; stashing here would set
-            # `prefix_indices = req_to_token[:len(fill_ids)]`, marking the
-            # un-run chunk as already-prefilled. For a LAST chunk that makes
-            # `prefix_indices == fill_ids` → `extend_num_tokens == 0` → an
-            # empty `forward_extend` that crashes in rotary_emb
-            # (`reshape tensor of 0 elements`). Forcing False keeps
-            # prefix_indices at the last COMMITTED chunk, so the extend
-            # recomputes to the remaining (>0) tokens.
-            self._chunked_req_scheduled_last_iter = False
+            # any KV, so `add_chunked_req`'s `fill_len` advance must be undone.
+            # The stash gate at the top of the next get_next_batch_to_run is
+            # content-based (`fill_len > len(prefix_indices)` → stash via
+            # `cache_unfinished_req`); leaving `fill_len` advanced would stash
+            # the un-run chunk, setting `prefix_indices = req_to_token[:fill_len]`
+            # and marking it already-prefilled. For a LAST chunk that makes
+            # `prefix_indices == fill_ids` → `extend_num_tokens == 0` → an empty
+            # `forward_extend` that crashes in rotary_emb (`reshape tensor of 0
+            # elements`); for a MIDDLE chunk it silently skips computing real
+            # tokens (garbage KV). Restoring `fill_len` to its pre-advance value
+            # keeps the gate at the last COMMITTED frontier, so the extend
+            # recomputes the remaining (>0) tokens next iter.
+            #
+            # (The legacy `_chunked_req_scheduled_last_iter = False` suppression
+            # that lived here is gone: upstream replaced the flag-based stash
+            # gate with the content-based one above, so the flag no longer gates
+            # anything — restoring `fill_len` is the equivalent fix for the new
+            # gate.)
             if _prev_chunked_req is not None:
                 _prev_chunked_req.inflight_middle_chunks = _prev_is_chunked
+                if _prev_fill_len is not None:
+                    _prev_chunked_req.fill_len = _prev_fill_len
             # Signal back-off for this iter; the next iter will retry.
             self.running_batch.batch_is_full = True
             return None
@@ -3124,18 +3141,24 @@ class Scheduler(
                         len(r.output_ids) for r in retracted_reqs
                     ),
                 )
-            # Guard against an admission deadlock. When retract_decode aborts
-            # the last/only request (e.g. a single request larger than the
-            # entire KV pool at a tight mem-fraction), the post-retract estimate
-            # is computed on an EMPTY batch and returns 0.0. Applied as-is,
-            # current=0.0 admits no new tokens, so the queue starves forever and
-            # the server hangs with no crash and no progress (observed on Falcon
-            # mfs0.30 chunk/normal cg_on — the shared pool's optimistic
-            # available_size over-admits a request that then cannot fit). Floor
-            # at the tracker's `min` (the same floor decay_step enforces) so
-            # admission can always resume: the oversized request fails
-            # gracefully (it is aborted with a 500 just below) and the scheduler
-            # keeps draining the queue instead of hanging.
+            # Guard against an admission deadlock on the EMPTY-batch path.
+            # `estimate_new_token_ratio_after_retract([])` returns 0.0 (its
+            # arithmetic is `0 / (0 + 1)`), and `retract_decode` empties the
+            # batch when it aborts the last/only request — one that cannot fit
+            # even alone (a genuinely ~pool-sized request at a tight
+            # mem-fraction). Neither that estimator nor `retract_decode` floors
+            # the result, so applied raw `current = 0.0` freezes admission and
+            # the server hangs with no progress. Floor at the tracker's `min`
+            # (the same floor `decay_step` enforces) so admission always
+            # resumes; the oversized request is aborted with a 500 below and the
+            # scheduler keeps draining the queue.
+            #
+            # NOTE: the ORIGINAL trigger was the shared pool's optimistic
+            # `available_size` OVER-admitting a too-big request (Falcon mfs0.30
+            # chunk/normal cg_on) — now fixed by the Mamba joint-budget
+            # reservation (design §28.14.4). This floor is KEPT as the GENERAL
+            # safety for the empty-batch ratio-0 case, which is independent of
+            # that fix (and which upstream's unfloored estimator shares).
             new_token_ratio = max(new_token_ratio, self.new_token_ratio_tracker.min)
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:

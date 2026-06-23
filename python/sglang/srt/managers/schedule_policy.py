@@ -494,13 +494,21 @@ class PrefillAdder:
         # (separate pools — a mamba slot costs no full-KV bytes), keeping the
         # baseline path byte-identical: the method exists ONLY on the shared
         # composite, so `getattr(..., None)` yields a no-op.
+        #
+        # Gate on the ALLOCATOR (shared Mamba composite), NOT on
+        # `is_hybrid_ssm_cache` (= `tree_cache.supports_mamba()`): the latter is
+        # False for `ChunkCache` (only `MambaRadixCache` returns True), which
+        # would silently skip the reservation on the chunk-cache path and let
+        # prefill over-admit the shared gap → "Prefill out of memory" at the
+        # mfs0.30 corner. The gap coupling is a property of the byte buffer, not
+        # of whether the prefix cache caches mamba states, so both chunk and
+        # radix shared-Mamba pools must reserve.
         self._mamba_slot_cost = 0
-        if self.is_hybrid_ssm_cache:
-            _cost_fn = getattr(
-                self.token_to_kv_pool_allocator, "mamba_slot_full_token_cost", None
-            )
-            if _cost_fn is not None:
-                self._mamba_slot_cost = _cost_fn()
+        _cost_fn = getattr(
+            self.token_to_kv_pool_allocator, "mamba_slot_full_token_cost", None
+        )
+        if _cost_fn is not None:
+            self._mamba_slot_cost = _cost_fn()
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold

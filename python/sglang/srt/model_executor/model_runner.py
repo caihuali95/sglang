@@ -3195,9 +3195,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
+                # Shared-pool eager write-path v2p translate + pin, restored here
+                # because the upstream `with ctx_mgr:` rewrite of `_forward_raw`
+                # orphaned the original block (now the unreachable tail of this
+                # method, ~L3237). Without it the first eager prefill consumed the
+                # STALE slot-0 pin baked at decode-graph capture (out_cache_loc=0
+                # -> v2p[0]=0 -> slot 0 sink), writing the prompt KV to the sink
+                # while the decode read resolved the (empty) real slots — Bug #2.
+                # The decode cuda-graph path returns earlier with the translate
+                # captured in-graph; this is the eager/non-graph path only.
+                self._shared_pool_eager_precompute_and_pin(forward_batch)
                 ret = self.eager_runner.execute(
                     forward_batch, pp_proxy_tensors=pp_proxy_tensors
                 )
+                self._shared_pool_eager_clear_pin(forward_batch)
 
             if (
                 forward_batch.global_num_tokens_cpu is not None
@@ -3331,6 +3342,61 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._stage36_profiler_step(forward_batch)
 
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+    def _shared_pool_eager_precompute_and_pin(self, forward_batch: ForwardBatch):
+        """Shared-pool write-path v2p translate + pin for the EAGER / non-graph
+        forward (extend / prefill / idle, and any decode that can't use the
+        decode cuda-graph). Materializes the full->physical (and SWA) translate
+        ONCE off the LIVE v2p, then pins it so the shared `set_kv_buffer` fast
+        path avoids a per-layer gather. No-op for non-shared pools (and a no-op
+        for baseline SWA, which lacks `set_swa_loc`).
+
+        The decode cuda-graph path captures this translate IN-graph and returns
+        earlier, so it never reaches here. This is the same logic the upstream
+        `_forward_raw` rewrite orphaned (it now sits, unreachable, at the tail of
+        `_forward_raw`); restoring it on the LIVE eager path fixes Bug #2 (the
+        first eager prefill otherwise wrote the prompt KV to the stale slot-0
+        capture pin)."""
+        if getattr(self, "enable_shared_memory_pool", False):
+            alloc = self.token_to_kv_pool_allocator
+            if (
+                forward_batch.out_cache_loc is not None
+                and forward_batch.out_cache_loc_full_physical is None
+                and hasattr(alloc, "translate_kv_loc")
+            ):
+                forward_batch.out_cache_loc_full_physical = alloc.translate_kv_loc(
+                    forward_batch.out_cache_loc
+                )
+            if (
+                self.is_hybrid_swa
+                and forward_batch.out_cache_loc is not None
+                and forward_batch.out_cache_loc_swa is None
+                and hasattr(alloc, "translate_loc_from_full_to_swa")
+            ):
+                forward_batch.out_cache_loc_swa = alloc.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+        if forward_batch.out_cache_loc_swa is not None and hasattr(
+            self.token_to_kv_pool, "set_swa_loc"
+        ):
+            self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+        if forward_batch.out_cache_loc_full_physical is not None and hasattr(
+            self.token_to_kv_pool, "set_full_loc"
+        ):
+            self.token_to_kv_pool.set_full_loc(
+                forward_batch.out_cache_loc_full_physical
+            )
+
+    def _shared_pool_eager_clear_pin(self, forward_batch: ForwardBatch):
+        """Clear the shared-pool write-path pin after the eager forward so a
+        stale precomputed loc never survives into the next batch (Stage 3.5
+        slice-safety; mirrors the data_ptr check in `set_kv_buffer`)."""
+        if hasattr(self.token_to_kv_pool, "set_full_loc"):
+            self.token_to_kv_pool.set_full_loc(None)
+        if forward_batch.out_cache_loc_swa is not None and hasattr(
+            self.token_to_kv_pool, "set_swa_loc"
+        ):
+            self.token_to_kv_pool.set_swa_loc(None)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

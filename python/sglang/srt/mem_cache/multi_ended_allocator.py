@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.triton_ops.virtual_slot import (
     translate_kv_indices_inplace,
 )
 from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -94,18 +95,6 @@ _LAZY_COMPACTION_STATS_ENABLED = (
 )
 _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     os.environ.get("SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC", "30")
-)
-# §S373 debug — fail-fast "ghost page" invariant. When enabled,
-# `_assert_no_ghost(where)` is called at the free / flush BOUNDARIES and
-# asserts that every physical page inside the allocated range whose `p2v < 0`
-# is registered as free (in `_free_phys_pages` or `_pending_reuse_pages_cpu`).
-# A page that was cleared (by a retract/free or a compaction move) but never
-# registered is a "ghost": a later `_flush` survivor walk picks it and trips
-# the `p2v=-1` assertion at the DETECTION site, far from the CREATION site.
-# This check fails fast at the creating op so the first fire localizes the bug.
-# Off by default (one D2H + a set-build per call); enable for debugging only.
-_GHOST_CHECK_ENABLED = (
-    os.environ.get("SGLANG_DEBUG_CHECK_GHOST_PAGES", "0") == "1"
 )
 # Module-level WeakSet of every MultiEndedAllocator instance with stats
 # enabled. The signal handler below iterates this on SIGTERM/SIGINT and
@@ -1510,7 +1499,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return
             if self.lazy_compaction:
                 self._free_lazy(free_index)
-                self._assert_no_ghost("free_lazy")
                 return
             # --- EAGER path (unchanged from Stages 1–3.6.2) ---
             # Overlap-mode barrier (single, at the start). In normal mode this is
@@ -1543,7 +1531,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     [self.free_virtual_ids, free_v_pages]
                 )
             self._compact_pending(freed_p_pages)
-            self._assert_no_ghost("free_eager")
 
     def _free_lazy(self, free_index: torch.Tensor) -> None:
         """Lazy free path (§S373).
@@ -2113,51 +2100,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return p, j
             return None, j
 
-    def _assert_no_ghost(self, where: str) -> None:
-        """§S373 debug invariant (gated by SGLANG_DEBUG_CHECK_GHOST_PAGES).
-
-        Assert that NO physical page inside the allocated range has `p2v < 0`
-        while being absent from BOTH `_free_phys_pages` and
-        `_pending_reuse_pages_cpu`. Such a page is a "ghost": its `p2v` was
-        cleared (retract/free, or a compaction move) but it was never
-        registered as free, so a later `_flush` survivor walk picks it and
-        trips the `p2v=-1` assertion — at the DETECTION site, not the CREATION
-        site. Call this at the free / flush BOUNDARIES (outside the flush
-        move-loop, where the flush-scoped `released_fired` accumulator is
-        legitimately untracked-but-pending) so the FIRST fire pins the
-        creating op via `where`.
-
-        Allocated range is page-granular: `[min_page_index, watermark)` for
-        grow-up, `(watermark, num_pages-1]` for grow-down.
-        """
-        if not _GHOST_CHECK_ENABLED:
-            return
-        if self.grow_direction == "up":
-            lo, hi = self.min_page_index, self.watermark_physical
-        else:
-            lo, hi = self.watermark_physical + 1, self.num_pages
-        if hi <= lo:
-            return
-        p2v = self.physical_to_virtual[lo:hi].tolist()
-        holes = set(self._free_phys_pages.tolist())
-        pend = self._pending_reuse_pages_cpu
-        ghosts = [
-            lo + i
-            for i, v in enumerate(p2v)
-            if v < 0 and (lo + i) not in holes and (lo + i) not in pend
-        ]
-        if ghosts:
-            shown = ghosts[:8]
-            raise AssertionError(
-                f"GHOST page(s) detected at '{where}' in "
-                f"MultiEndedAllocator({self.sub_pool_name!r}): pages {shown}"
-                f"{'...' if len(ghosts) > 8 else ''} have p2v<0 inside the "
-                f"allocated range but are in NEITHER _free_phys_pages NOR "
-                f"_pending_reuse — cleared without being registered as free. "
-                f"n_ghost={len(ghosts)}. State: {self.allocator_state_str()}, "
-                f"#holes={len(holes)}, #pending_reuse={len(pend)}"
-            )
-
     def _absorb_boundary_holes(self, all_cpu: List[int]) -> Tuple[int, List[int]]:
         """Retreat the watermark past free slots ALREADY contiguous with it,
         slice them off `_free_phys_pages`, and return
@@ -2325,7 +2267,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # just-appended srcs instead of the consumed dsts, and a sort=ON
             # re-sort (inside `_release_phys_pages_batch`) would scramble the
             # grow-up slice too — both leaving ghost (`p2v=-1`, untracked)
-            # pages that trip the survivor-walk assertion on a later flush,
+            # pages that corrupt the free-list bookkeeping on a later flush,
             # plus double-bound dsts that silently corrupt KV. Event-PENDING
             # srcs still route to `_pending_reuse` (read-race gating MUST be
             # preserved — a src whose reader event has not fired cannot
@@ -2489,7 +2431,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # Retreat past the whole lot in one shot and EMPTY the free
                 # list: those pages are beyond-frontier free space (p2v=-1),
                 # reclaimed by the next watermark extension, so they neither go
-                # on the free list nor fall in the ghost-check range. The
+                # on the free list nor need free-registration. The
                 # `released_fired` tensors are simply dropped for the same
                 # reason. One urgent flush == complete compaction, one D2H.
                 n_reclaimed = len(holes_cpu)
@@ -2528,7 +2470,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._stats_n_flush_did_work += 1
                 self._stats_n_flush_moves += n_moves
             self._maybe_emit_stats()
-            self._assert_no_ghost("flush_exit")
             return n_moves
 
     def _commit_move_batch(
@@ -2915,27 +2856,34 @@ class SharedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         the page math `(-1 // ps == -1)`, `v2p[-1] == -1`, `(-1)*ps + offset
         ≤ 0` — Triton's `select_index` semantics still treat this as padding.
         """
-        return self.full_attn_allocator.translate_kv_loc(loc, out=out)
+        result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
+        return result
 
     def translate_kv_loc_bounded(
         self,
         kv_indices: torch.Tensor,
         kv_indptr: torch.Tensor,
         bs: int,
+        *,
+        src: Optional[torch.Tensor] = None,
     ) -> None:
-        """In-place, GPU-bounded virtual->physical
-        translate of ``kv_indices[0:kv_indptr[bs]]``, for CAPTURE into the
-        decode cuda-graph.
+        """GPU-bounded virtual->physical translate of
+        ``kv_indices[0:kv_indptr[bs]]``, for CAPTURE into the decode cuda-graph.
 
         Unlike ``translate_kv_loc`` (which translates a Python-sliced prefix
         via `.item()` and allocates a transient), this reads the valid extent
-        on-device from ``kv_indptr[bs]`` and rewrites the buffer in place — no
-        `.item()` sync, no transient, capturable. Reads the full sub-pool's
-        live ``virtual_to_physical`` at replay (late-read invariant).
+        on-device from ``kv_indptr[bs]`` — no `.item()` sync, no transient,
+        capturable. Reads the full sub-pool's live ``virtual_to_physical`` at
+        replay (late-read invariant).
+
+        ``src`` (default None -> ``kv_indices``, legacy in-place). When the
+        out-of-place fix is on, ``src`` is the dedicated VIRTUAL buffer and
+        ``kv_indices`` is the PHYSICAL graph buffer the attention reads
+        (idempotent under replay: the src is never overwritten here).
         """
         fa = self.full_attn_allocator
         translate_kv_indices_inplace(
-            kv_indices, fa.virtual_to_physical, kv_indptr, bs, fa.page_size
+            kv_indices, fa.virtual_to_physical, kv_indptr, bs, fa.page_size, src=src
         )
 
     def is_slot_allocated(self, slot: int) -> bool:
@@ -3381,7 +3329,8 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         Stage 3.5: supports ``out=`` for cuda-graph buffer stability.
         """
-        return self.full_attn_allocator.translate_kv_loc(loc, out=out)
+        result = self.full_attn_allocator.translate_kv_loc(loc, out=out)
+        return result
 
     def translate_loc_from_full_to_swa(
         self,
@@ -3454,15 +3403,20 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kv_indices: torch.Tensor,
         kv_indptr: torch.Tensor,
         bs: int,
+        *,
+        src: Optional[torch.Tensor] = None,
     ) -> None:
-        """In-place, GPU-bounded virtual->full-
-        physical translate of the full-attention ``kv_indices[0:kv_indptr[bs]]``,
-        for CAPTURE into the decode cuda-graph. See
-        ``SharedMambaTokenToKVPoolAllocator.translate_kv_loc_bounded``.
+        """GPU-bounded virtual->full-physical translate of the full-attention
+        ``kv_indices[0:kv_indptr[bs]]``, for CAPTURE into the decode cuda-graph.
+        See ``SharedMambaTokenToKVPoolAllocator.translate_kv_loc_bounded``.
+
+        ``src`` (default None -> in place); when the out-of-place fix is on it is
+        the dedicated VIRTUAL source and ``kv_indices`` is the PHYSICAL graph
+        buffer the attention reads (idempotent under replay).
         """
         fa = self.full_attn_allocator
         translate_kv_indices_inplace(
-            kv_indices, fa.virtual_to_physical, kv_indptr, bs, fa.page_size
+            kv_indices, fa.virtual_to_physical, kv_indptr, bs, fa.page_size, src=src
         )
 
     def translate_loc_from_full_to_swa_bounded(
@@ -3470,6 +3424,8 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         window_kv_indices: torch.Tensor,
         window_kv_indptr: torch.Tensor,
         bs: int,
+        *,
+        src: Optional[torch.Tensor] = None,
     ) -> None:
         """In-place, GPU-bounded virtual->swa-physical translate of
         ``window_kv_indices[0:window_kv_indptr[bs]]``,
@@ -3483,7 +3439,12 @@ class SharedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         """
         sa = self.swa_attn_allocator
         translate_kv_indices_inplace(
-            window_kv_indices, sa.virtual_to_physical, window_kv_indptr, bs, sa.page_size
+            window_kv_indices,
+            sa.virtual_to_physical,
+            window_kv_indptr,
+            bs,
+            sa.page_size,
+            src=src,
         )
 
     # -- alloc --

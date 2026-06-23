@@ -43,9 +43,23 @@ def track_mamba_state_if_needed_kernel(
     if not track_mask:
         return
 
-    # Load source and destination indices
-    src_idx = tl.load(cache_indices_ptr + batch_idx)
-    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx)
+    # Load source and destination indices. Cast to int64 BEFORE they multiply the
+    # row stride: `cache_indices` is int32 and the shared pool's conv/ssm are
+    # ENVELOPE-strided (stride_0 = entry_bytes/itemsize ≈ 69.7M elems), so
+    # `idx * stride_0` overflows int32 for idx≳30 (e.g. 41*69679104 = 2.86e9 >
+    # 2.15e9 INT32_MAX) → a wrapped/negative address → illegal access. Baseline's
+    # contiguous state has a tiny stride so it never overflowed; this is the
+    # shared-pool OOB. int64 is harmless for the small-stride (baseline) case.
+    src_idx = tl.load(cache_indices_ptr + batch_idx).to(tl.int64)
+    dst_idx = tl.load(mamba_track_indices_ptr + batch_idx).to(tl.int64)
+
+    # Skip freed/unallocated slots: a freed ping-pong slot translates to -1
+    # (v2p sentinel), and `state_ptr + (-1)*stride` would fault before the
+    # buffer. Writing a Mamba state to a non-existent slot is meaningless.
+    # Mirrors the pad_slot_id (>= 0) skip in the sibling scatter kernel below
+    # and in causal_conv1d_update / selective_state_update.
+    if src_idx < 0 or dst_idx < 0:
+        return
 
     # Copy conv_states
     # Each thread handles BLOCK_SIZE elements

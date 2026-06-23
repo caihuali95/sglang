@@ -230,6 +230,18 @@ class MambaAttnBackendBase(AttentionBackend):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
         )
+        # OPEN-6 FIX: translate the radix prefix-cache mamba TRACK destination
+        # (`mamba_track_indices`) virtual→physical on the cg_on replay path, IN
+        # PLACE on the captured registry slot. The eager `_forward_metadata`
+        # translates it (L133-138); this replay path must too, else the captured
+        # decode track-save (`conv_states[mamba_track_indices] = …`) writes to the
+        # wrong/untranslated slot. No-op for the non-shared pool (no
+        # `translate_mamba_indices`) and at capture.
+        if not in_capture:
+            _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
+            _mt = getattr(forward_batch, "mamba_track_indices", None)
+            if _tr is not None and _mt is not None and _mt.numel() > 0:
+                _mt.copy_(_tr(_mt))
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
@@ -663,6 +675,22 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
         )
+        # OPEN-6 FIX: translate the Mamba prefix-cache track DESTINATION
+        # (`mamba_track_indices`) virtual->physical on the cg_on replay path, IN
+        # PLACE on the captured registry slot. The eager `_forward_metadata`
+        # translates it (L133-138) but THIS override (the path Falcon-H1 actually
+        # runs) did not — so the captured decode track-save
+        # (`conv_states[mamba_track_indices]`, hybrid_linear_attn_backend.py:947 →
+        # mamba_state_scatter_triton) indexed conv with VIRTUAL ids → wrong
+        # physical slot (NaN) / freed-slot sentinel (OOB). Mirrors the working
+        # index staged by `_replay_metadata` above. No-op for the non-shared pool
+        # (no `translate_mamba_indices`) and at capture. The freed-slot -1 result
+        # is now skipped by the kernel's pad_slot_id guard.
+        if not in_capture:
+            _tr = getattr(self.req_to_token_pool, "translate_mamba_indices", None)
+            _mt = getattr(forward_batch, "mamba_track_indices", None)
+            if _tr is not None and _mt is not None and _mt.numel() > 0:
+                _mt.copy_(_tr(_mt))
         spec_info = forward_batch.spec_info
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(

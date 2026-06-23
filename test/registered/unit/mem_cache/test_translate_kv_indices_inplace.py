@@ -72,7 +72,9 @@ class TestTranslateKVIndicesInplace(unittest.TestCase):
         return v2p
 
     def _run(self, kv_indices, v2p, total, page_size, *, num_programs=1024, block=512):
-        from sglang.srt.mem_cache.utils import translate_kv_indices_inplace
+        from sglang.srt.mem_cache.triton_ops.virtual_slot import (
+            translate_kv_indices_inplace,
+        )
 
         n_entries = kv_indices.numel()
         # kv_indptr buffer; element [bs] holds the valid extent. Use bs=3 to

@@ -43,6 +43,7 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -753,6 +754,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
+
+        # Defense-in-depth (Bug #2): each per-shape capture pinned set_full_loc /
+        # set_swa_loc to the captured slot-0 translate buffer (out_cache_loc=0 ->
+        # v2p[0]=0 -> physical slot 0). Clear it so no stale pin survives into the
+        # first real (eager) prefill. The eager path now re-pins the correct live
+        # translate (`_shared_pool_eager_precompute_and_pin`); this is an
+        # independently-sufficient backstop — with the pin None, `set_kv_buffer`
+        # falls back to the correct per-call v2p gather. No-op for non-shared pools.
+        if hasattr(self.model_runner.token_to_kv_pool, "set_full_loc"):
+            self.model_runner.token_to_kv_pool.set_full_loc(None)
+        if hasattr(self.model_runner.token_to_kv_pool, "set_swa_loc"):
+            self.model_runner.token_to_kv_pool.set_swa_loc(None)
 
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(

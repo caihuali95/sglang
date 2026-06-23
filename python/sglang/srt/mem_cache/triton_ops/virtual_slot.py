@@ -9,6 +9,8 @@ convention that Triton kernels live here, not in ``utils.py``.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -42,15 +44,19 @@ import triton.language as tl
 
 @triton.jit
 def translate_kv_indices_inplace_kernel(
-    kv_indices_ptr,  # in/out: VIRTUAL token ids -> PHYSICAL token ids, in place
+    dst_ptr,  # out: PHYSICAL token ids
+    src_ptr,  # in: VIRTUAL token ids (may ALIAS dst_ptr for the in-place case)
     v2p_ptr,  # virtual_to_physical table (int64); full OR swa sub-pool's table
     bound_ptr,  # the kv_indptr buffer; bound = bound_ptr[BS] = sum(seq_lens)
     BS,  # batch size (runtime int): index of the valid-extent entry in kv_indptr
     PAGE_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """In-place translate ``kv_indices[0:total] = v2p_resolve(kv_indices[0:total])``
-    where ``total = bound_ptr[BS]`` is read on-device (no ``.item()``).
+    """Translate ``dst[0:total] = v2p_resolve(src[0:total])`` where ``total =
+    bound_ptr[BS]`` is read on-device (no ``.item()``). When ``src_ptr`` aliases
+    ``dst_ptr`` this is the legacy in-place form; when they are distinct buffers
+    it is out-of-place (read VIRTUAL src, write PHYSICAL dst) — idempotent under
+    cuda-graph replay because the src is never overwritten by this kernel.
 
     Fixed grid (``tl.num_programs(0)``) + GPU-side grid-stride loop bounded by
     ``total`` so the launch is cuda-graph-stable while the work tracks the
@@ -68,7 +74,7 @@ def translate_kv_indices_inplace_kernel(
     for blk in range(pid, num_active_blocks, nprog):
         offs = blk * BLOCK + block_arange
         mask = offs < total
-        virt = tl.load(kv_indices_ptr + offs, mask=mask, other=0).to(tl.int64)
+        virt = tl.load(src_ptr + offs, mask=mask, other=0).to(tl.int64)
         if PAGE_SIZE == 1:
             phys = tl.load(v2p_ptr + virt, mask=mask, other=0)
         else:
@@ -76,7 +82,7 @@ def translate_kv_indices_inplace_kernel(
             off = virt % PAGE_SIZE
             phys = tl.load(v2p_ptr + page, mask=mask, other=0) * PAGE_SIZE + off
         phys = tl.maximum(phys, 0)  # clamp_min(0): tombstone -> padding sink
-        tl.store(kv_indices_ptr + offs, phys, mask=mask)
+        tl.store(dst_ptr + offs, phys, mask=mask)
 
 
 def translate_kv_indices_inplace(
@@ -86,21 +92,30 @@ def translate_kv_indices_inplace(
     bs: int,
     page_size: int,
     *,
+    src: Optional[torch.Tensor] = None,
     block: int = 512,
     num_programs: int = 1024,
 ) -> None:
     """Launch :func:`translate_kv_indices_inplace_kernel`.
 
-    Rewrites ``kv_indices[0:kv_indptr[bs]]`` in place from virtual to physical
-    token ids using ``v2p`` (the relevant sub-pool's ``virtual_to_physical``
-    table). The valid extent ``kv_indptr[bs]`` is read on-device, so no
-    ``.item()`` / D2H sync occurs — this is what makes the op capturable into
-    the decode cuda-graph (Stage 3.6.2 Phase 2).
+    Writes ``kv_indices[0:kv_indptr[bs]]`` = physical(``src[0:kv_indptr[bs]]``)
+    using ``v2p`` (the relevant sub-pool's ``virtual_to_physical`` table). The
+    valid extent ``kv_indptr[bs]`` is read on-device, so no ``.item()`` / D2H
+    sync occurs — this is what makes the op capturable into the decode
+    cuda-graph (Stage 3.6.2 Phase 2).
+
+    ``src`` (default ``None`` -> ``kv_indices``) is the VIRTUAL source:
+        - ``src is None`` (in-place): ``kv_indices`` holds VIRTUAL on entry and
+          PHYSICAL on return (read==write buffer). This is the path the shared
+          pool uses.
+        - ``src is not None`` (out-of-place): read VIRTUAL ids from the dedicated
+          ``src`` buffer, write PHYSICAL ids into ``kv_indices``; ``src`` is never
+          written, so the op is idempotent under replay.
 
     Contract:
-        - ``kv_indices``: 1-D int64, the metadata buffer (e.g.
-          ``cuda_graph_kv_indices`` or ``cuda_graph_window_kv_indices``).
-          Holds VIRTUAL token ids on entry; PHYSICAL on return.
+        - ``kv_indices``: 1-D int64, the metadata buffer the attention reads
+          (e.g. ``cuda_graph_kv_indices`` / ``cuda_graph_window_kv_indices``).
+        - ``src``: 1-D int64 VIRTUAL buffer (same shape) or None (== kv_indices).
         - ``v2p``: 1-D int64 ``virtual_to_physical`` (page-granular for ps>1,
           sized ``num_pages + 1`` with a trailing ``-1`` sentinel).
         - ``kv_indptr``: 1-D int tensor whose element ``[bs]`` is the valid
@@ -113,10 +128,12 @@ def translate_kv_indices_inplace(
     the kernel grid-strides over the active blocks (bounded GPU-side by
     ``kv_indptr[bs]``).
     """
-    assert kv_indices.is_cuda and v2p.is_cuda and kv_indptr.is_cuda
-    assert kv_indices.ndim == 1, (
-        f"translate_kv_indices_inplace: kv_indices must be 1-D, "
-        f"got shape {tuple(kv_indices.shape)}"
+    if src is None:
+        src = kv_indices  # legacy in-place (read==write buffer)
+    assert kv_indices.is_cuda and v2p.is_cuda and kv_indptr.is_cuda and src.is_cuda
+    assert kv_indices.ndim == 1 and src.ndim == 1, (
+        f"translate_kv_indices_inplace: kv_indices/src must be 1-D, got "
+        f"{tuple(kv_indices.shape)}/{tuple(src.shape)}"
     )
     assert v2p.dtype == torch.int64, (
         f"translate_kv_indices_inplace: v2p must be int64, got {v2p.dtype}"
@@ -125,7 +142,8 @@ def translate_kv_indices_inplace(
         return
     grid = (num_programs,)
     translate_kv_indices_inplace_kernel[grid](
-        kv_indices,
+        kv_indices,  # dst (physical)
+        src,  # src (virtual; aliases dst when in-place)
         v2p,
         kv_indptr,
         bs,
