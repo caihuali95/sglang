@@ -138,7 +138,7 @@ class TestStoreCache4D(unittest.TestCase):
     def test_store_cache_4d_ps1_byte_identical(self):
         """At page_size=1 the kernel constexpr-folds to the slot-major
         envelope view. Output must be byte-identical to advanced indexing.
-        This protects the Stage 1/2/3 green eval matrix from regression."""
+        This protects against byte-layout regression."""
         self._check_parity(
             num_pages=64, page_size=1,
             head_num=4, head_dim=128, v_head_dim=128,
@@ -197,8 +197,7 @@ class TestStoreCache4D(unittest.TestCase):
 
     def test_store_cache_4d_dtype_fp8_e5m2(self):
         """fp8_e5m2 is used for KV-cache quantization. Caller is responsible
-        for the cast (Phase 1); the kernel sees same-dtype source and
-        destination."""
+        for the cast; the kernel sees same-dtype source and destination."""
         self._check_parity(
             num_pages=16, page_size=64,
             head_num=4, head_dim=128, v_head_dim=128,
@@ -421,7 +420,7 @@ class TestStoreCache4DThroughSetKVBuffer(unittest.TestCase):
         self._run_set_kv_buffer_and_compare(page_size=64)
 
     def _run_full_loc_fast_path_parity(self, page_size: int):
-        """Stage 3.5 fast-path byte-identity: writing through the precomputed
+        """Fast-path byte-identity: writing through the precomputed
         full-physical loc (`set_loc` fast path) must produce a byte-identical
         KV buffer to writing the virtual loc and letting `set_kv_buffer`
         translate per call. Uses a NON-identity v2p so the two paths are

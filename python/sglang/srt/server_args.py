@@ -753,6 +753,11 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    # Replace the statically-partitioned hybrid-model pools (full-attn KV +
+    # SWA/Mamba state) with one byte buffer split dynamically between sub-pools.
+    # Requires the Triton attention / linear-attn / Mamba backends; not yet
+    # compatible with PD disaggregation or speculative decoding.
+    enable_shared_memory_pool: bool = False
     # Lay out the Mamba state and full/SWA KV caches in a page-granularity
     # envelope layout (within a page, layer-major) instead of upstream's
     # per-layer layout. At page_size==1 this is a token-granularity envelope.
@@ -1089,6 +1094,9 @@ class ServerArgs:
 
         # Validate the page-local KV layout feature gating.
         self._handle_page_local_kv_layout()
+
+        # Validate the shared memory pool feature gating.
+        self._handle_shared_memory_pool()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -4569,6 +4577,56 @@ class ServerArgs:
             "--mamba-backend triton."
         )
 
+    def _handle_shared_memory_pool(self):
+        if not self.enable_shared_memory_pool:
+            return
+        assert self.disaggregation_mode == "null", (
+            "--enable-shared-memory-pool is not yet compatible with PD "
+            "disaggregation."
+        )
+        assert self.speculative_algorithm is None, (
+            "--enable-shared-memory-pool is not yet compatible with speculative "
+            "decoding."
+        )
+        # Only monolithic decode cuda-graph capture is wired; piecewise prefill
+        # capture is not. Guard when the user opts into it.
+        _cg_cfg = self.cuda_graph_config
+        if _cg_cfg is not None and _cg_cfg.prefill.backend == Backend.TC_PIECEWISE:
+            raise ValueError(
+                "--enable-shared-memory-pool supports monolithic (decode) "
+                "cuda-graph capture only; disable piecewise prefill capture "
+                "(e.g. --cuda-graph-backend-prefill=disabled)."
+            )
+        # Only the Triton attention backend's read path translates virtual ->
+        # physical slot ids. Require it for the full-attention layers.
+        backends = {
+            self.attention_backend,
+            self.prefill_attention_backend,
+            self.decode_attention_backend,
+        }
+        backends.discard(None)
+        assert backends <= {"triton"}, (
+            "--enable-shared-memory-pool currently requires the Triton attention "
+            f"backend for the full-attention layers; got {sorted(backends)}. "
+            "Pass --attention-backend triton."
+        )
+        # The Mamba conv/SSM state is stored in envelope-strided views; only the
+        # stride-aware Triton linear-attn / causal-conv kernels read them correctly.
+        linear_backends = {
+            self.linear_attn_backend,
+            self.linear_attn_decode_backend,
+            self.linear_attn_prefill_backend,
+            self.mamba_backend,
+        }
+        linear_backends.discard(None)
+        assert linear_backends <= {"triton"}, (
+            "--enable-shared-memory-pool currently requires the Triton linear-"
+            f"attention / Mamba kernels; got {sorted(linear_backends)}. Pass "
+            "--linear-attn-backend triton and --mamba-backend triton."
+        )
+        # The model-family gate (hybrid Mamba / hybrid SWA) is enforced at
+        # pool-construction time in model_runner_kv_cache_mixin._init_pools.
+
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
@@ -6800,6 +6858,16 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--enable-shared-memory-pool",
+            action="store_true",
+            help=(
+                "For hybrid models (Mamba/SWA), replace the two statically-"
+                "partitioned KV/state pools with one byte buffer split "
+                "dynamically. Requires the Triton backends; not yet compatible "
+                "with PD disaggregation or speculative decoding."
+            ),
         )
         parser.add_argument(
             "--enable-page-local-kv-layout",
