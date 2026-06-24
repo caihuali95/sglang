@@ -390,6 +390,7 @@ class ModelRunnerKVCacheMixin:
                     speculative_eagle_topk=self.server_args.speculative_eagle_topk,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    mamba_envelope_layout=self.server_args.enable_page_local_kv_layout,
                 )
             else:
                 # DSV4 on NPU needs an extended ReqToTokenPool holding per-req
@@ -419,6 +420,15 @@ class ModelRunnerKVCacheMixin:
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
+        )
+
+        # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools.
+        # None keeps upstream's per-layer layout. The Mamba state pool is routed
+        # separately via `mamba_envelope_layout` on the req-to-token pool above.
+        page_local_layout = (
+            "page_local_layer_major"
+            if self.server_args.enable_page_local_kv_layout
+            else None
         )
 
         if is_dsv4_model:
@@ -708,6 +718,7 @@ class ModelRunnerKVCacheMixin:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    kv_cache_layout=page_local_layout,
                     **kwargs,
                 )
             elif config := self.mambaish_config:
@@ -744,6 +755,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
+                    kv_cache_layout=page_local_layout,
                     **extra_args,
                 )
             else:
@@ -791,6 +803,7 @@ class ModelRunnerKVCacheMixin:
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
                         ),
+                        kv_cache_layout=page_local_layout,
                     )
 
         # Initialize token_to_kv_pool_allocator

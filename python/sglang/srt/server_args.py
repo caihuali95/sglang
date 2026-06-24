@@ -753,6 +753,11 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
+    # Lay out the Mamba state and full/SWA KV caches in a page-granularity
+    # envelope layout (within a page, layer-major) instead of upstream's
+    # per-layer layout. At page_size==1 this is a token-granularity envelope.
+    # Requires the Triton attention / linear-attn / Mamba backends.
+    enable_page_local_kv_layout: bool = False
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
@@ -1081,6 +1086,9 @@ class ServerArgs:
 
         # Validate cache settings.
         self._handle_cache_compatibility()
+
+        # Validate the page-local KV layout feature gating.
+        self._handle_page_local_kv_layout()
 
         # Handle diffusion LLM inference.
         self._handle_dllm_inference()
@@ -4529,6 +4537,38 @@ class ServerArgs:
                         "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
 
+    def _handle_page_local_kv_layout(self):
+        if not self.enable_page_local_kv_layout:
+            return
+        # Only the Triton attention kernels read the strided 4-D envelope K/V
+        # views; FA3 / FlashInfer do not.
+        backends = {
+            self.attention_backend,
+            self.prefill_attention_backend,
+            self.decode_attention_backend,
+        }
+        backends.discard(None)
+        assert backends <= {"triton"}, (
+            "--enable-page-local-kv-layout requires the Triton attention backend "
+            f"for the full-attention layers; got {sorted(backends)}. Pass "
+            "--attention-backend triton."
+        )
+        # The Mamba state is stored in envelope-strided views; only the
+        # stride-aware Triton causal-conv / SSM kernels read them correctly.
+        linear_backends = {
+            self.linear_attn_backend,
+            self.linear_attn_decode_backend,
+            self.linear_attn_prefill_backend,
+            self.mamba_backend,
+        }
+        linear_backends.discard(None)
+        assert linear_backends <= {"triton"}, (
+            "--enable-page-local-kv-layout requires the Triton linear-attention / "
+            f"Mamba kernels for the strided conv/SSM state; got "
+            f"{sorted(linear_backends)}. Pass --linear-attn-backend triton and "
+            "--mamba-backend triton."
+        )
+
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:
             return
@@ -6760,6 +6800,16 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--enable-page-local-kv-layout",
+            action="store_true",
+            help=(
+                "Lay out the Mamba state and full/SWA KV caches in a "
+                "page-granularity envelope layout (layer-major within a page) "
+                "instead of upstream's per-layer layout. Requires the Triton "
+                "attention / linear-attn / Mamba backends."
+            ),
         )
         # --- CUDA graph config: canonical JSON entry ---------------------
         parser.add_argument(
