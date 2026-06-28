@@ -129,6 +129,23 @@ def translate_kv_indices_inplace(
     """
     if src is None:
         src = kv_indices  # legacy in-place (read==write buffer)
+    if not kv_indices.is_cuda:
+        # Pure-torch CPU reference for the CUDA-only Triton kernel (CPU unit
+        # tests / CPU-only environments). Translate the valid prefix
+        # [0, kv_indptr[bs]) from VIRTUAL src to PHYSICAL (tombstones clamped
+        # to the slot-0 padding sink); the stale tail is left untouched.
+        if kv_indices.numel() == 0:
+            return
+        total = int(kv_indptr[bs])
+        if total == 0:
+            return
+        virt = src[:total].to(torch.int64)
+        if page_size == 1:
+            phys = v2p[virt]
+        else:
+            phys = v2p[virt // page_size] * page_size + (virt % page_size)
+        kv_indices[:total] = torch.clamp_min(phys, 0).to(kv_indices.dtype)
+        return
     assert kv_indices.is_cuda and v2p.is_cuda and kv_indptr.is_cuda and src.is_cuda
     assert kv_indices.ndim == 1 and src.ndim == 1, (
         f"translate_kv_indices_inplace: kv_indices/src must be 1-D, got "
@@ -266,6 +283,17 @@ def alloc_bind_inplace(
     N = int(v_pages.numel())
     if N == 0:
         return torch.empty(0, dtype=torch.int64, device=v_pages.device)
+    if not v_pages.is_cuda:
+        # Pure-torch CPU reference for the CUDA-only Triton kernel (CPU unit
+        # tests / CPU-only environments). Matches the kernel exactly: an
+        # ascending physical range scattered into v2p[v]=phys and p2v[phys]=v.
+        phys_pages = torch.arange(
+            start_phys, start_phys + N, dtype=torch.int64, device=v_pages.device
+        )
+        v = v_pages.to(torch.int64)
+        v2p[v] = phys_pages
+        p2v[phys_pages] = v
+        return phys_pages
     phys_pages = torch.empty(N, dtype=torch.int64, device=v_pages.device)
     grid = (triton.cdiv(N, ALLOC_BIND_BLOCK),)
     alloc_bind_inplace_kernel[grid](

@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.shared_memory_pool import (
     MHASubPoolSpec,
     SharedMemoryPool,
 )
+from sglang.srt.environ import envs
 
 _DEV = "cpu"
 
@@ -99,17 +100,22 @@ class TestSharedMemoryPoolViews(unittest.TestCase):
         self.assertEqual(len(k_full), 3)
         self.assertEqual(len(k_swa), 2)
         # Write distinct patterns into a couple of slots/layers of "full" and
-        # confirm they read back, and that "swa" was not disturbed.
+        # confirm they read back, and that "swa" was not disturbed. "full" and
+        # "swa" share the buffer from byte 0; "full" grows up (low slots) and
+        # "swa" grows down, so the allocator places "swa" at the high slots.
+        # Mirror that here — a low "swa" slot would byte-overlap "full" slot 5
+        # (a configuration the byte-frontier coordination never produces).
+        swa_slot = pool.max_slots("swa") - 1
         for lyr in range(3):
             k_full[lyr][5] = float(lyr + 1)
             v_full[lyr][5] = float(-(lyr + 1))
         for lyr in range(2):
-            k_swa[lyr][7] = 99.0
+            k_swa[lyr][swa_slot] = 99.0
         for lyr in range(3):
             self.assertTrue(torch.all(k_full[lyr][5] == float(lyr + 1)))
             self.assertTrue(torch.all(v_full[lyr][5] == float(-(lyr + 1))))
         for lyr in range(2):
-            self.assertTrue(torch.all(k_swa[lyr][7] == 99.0))
+            self.assertTrue(torch.all(k_swa[lyr][swa_slot] == 99.0))
         # "full" slot 5 layer-0 K must not alias "full" slot 6 layer-0 K
         self.assertFalse(torch.all(k_full[0][6] == float(1)))
 
@@ -321,13 +327,9 @@ class TestMultiEndedAllocator(unittest.TestCase):
         CPU scope: the GPU write-race *urgent* path (unfired CUDA events ->
         _pending_reuse) needs a real device; this covers the no-event
         move/absorb/free/released_fired bookkeeping. Run on a real device
-        with SGLANG_DEBUG_CHECK_GHOST_PAGES=1 to cover the full path.
+        with SGLANG_DEBUG_CHECK_V2P_TOMBSTONES=1 to cover the full path.
         """
-        import sglang.srt.mem_cache.multi_ended_allocator as mea
-
-        prev = mea._GHOST_CHECK_ENABLED
-        mea._GHOST_CHECK_ENABLED = True
-        try:
+        with envs.SGLANG_DEBUG_CHECK_V2P_TOMBSTONES.override(True):
             rng = random.Random(0x5373)
             _, alloc, kv = self._build_lazy_full(n_full_slots=64, move_cap=2)
             live = []
@@ -351,8 +353,6 @@ class TestMultiEndedAllocator(unittest.TestCase):
             for _ in range(64):
                 alloc.flush_opportunistic()
             self.assertEqual(alloc.allocated_count(), 0)
-        finally:
-            mea._GHOST_CHECK_ENABLED = prev
 
     def test_double_free_raises(self):
         _, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
@@ -848,14 +848,17 @@ class TestSharedSWATokenToKVPoolAllocator(unittest.TestCase):
         self.assertEqual(joint, expected)
 
     # 8. Watermark rollback on partial alloc failure.
-    def test_swa_alloc_rollback_on_partial_failure(self):
+    def test_swa_alloc_swa_failure_is_fail_loud(self):
+        """The SWA composite runs a tight JOINT pre-check before allocating, so
+        a swa-side ``alloc_with_virtual`` failure after the full-side alloc can
+        only mean an internal-state inconsistency. By design (``SharedSWA.alloc``:
+        "assert rather than silently rollback") that surfaces as a loud error,
+        NOT a silent ``None`` / rollback — masking it would hide the bug. The
+        real ``alloc_with_virtual`` self-asserts on shortfall, so the production
+        path is fail-loud too; here we force the failure to prove it propagates.
+        """
         _, allocator, kvcache = self._build()
-        fa = allocator.full_attn_allocator
         sa = allocator.swa_attn_allocator
-        wm_before = fa.watermark_physical
-        free_count_before = int(fa.free_virtual_ids.numel())
-        # Monkeypatch swa.alloc_with_virtual to fail. The composite must
-        # catch the AssertionError and roll back full's allocation.
         original = sa.alloc_with_virtual
 
         def _bomb(virtual_ids):
@@ -863,16 +866,10 @@ class TestSharedSWATokenToKVPoolAllocator(unittest.TestCase):
 
         sa.alloc_with_virtual = _bomb
         try:
-            v = allocator.alloc(3)
-            self.assertIsNone(v)
+            with self.assertRaises(AssertionError):
+                allocator.alloc(3)
         finally:
             sa.alloc_with_virtual = original
-        # Full side state must be restored exactly:
-        self.assertEqual(fa.watermark_physical, wm_before)
-        self.assertEqual(int(fa.free_virtual_ids.numel()), free_count_before)
-        # And the now-unbound slot range must be clean:
-        for p in range(fa.watermark_physical, fa.max_slots):
-            self.assertEqual(int(fa.physical_to_virtual[p].item()), -1)
 
     # -- `out=` parameter regression tests for the SWA composite --
 
@@ -2535,7 +2532,8 @@ class TestO3FusedAllocBind(unittest.TestCase):
         # (the unfused reference implementation).
         phys_b = fa_b.take_physical_pages(5)
         fa_b.bind(v_pages, phys_b)
-        fa_b.live_page_count += 5
+        # take_physical_pages already advances live_page_count (matching the
+        # fused fast path), so no manual bump here.
         # Identical return tensors.
         self.assertTrue(torch.equal(phys_a, phys_b))
         # Identical v2p / p2v after the operation.

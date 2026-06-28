@@ -160,8 +160,14 @@ def build_mamba_envelope_views(
         return tuple(reversed(strides))
 
     conv_itemsize = conv_dtype.itemsize
-    assert entry_bytes % conv_itemsize == 0
-    assert anchor_bytes % conv_itemsize == 0
+    assert entry_bytes % conv_itemsize == 0, (
+        f"misaligned mamba spec: per-slot entry_bytes={entry_bytes} is not a "
+        f"multiple of the conv-state itemsize {conv_itemsize} B"
+    )
+    assert anchor_bytes % conv_itemsize == 0, (
+        f"misaligned mamba spec: anchor_bytes={anchor_bytes} is not a multiple "
+        f"of the conv-state itemsize {conv_itemsize} B"
+    )
     as_conv_dtype = raw.view(conv_dtype)
     conv_slot_stride_elems = entry_bytes // conv_itemsize
 
@@ -190,11 +196,25 @@ def build_mamba_envelope_views(
     # offset (entry stride, anchor, the conv region) must be a whole multiple of
     # itemsize or the offset truncates and mis-places the view.
     itemsize = temporal_dtype.itemsize
-    assert entry_bytes % itemsize == 0
-    assert anchor_bytes % itemsize == 0
+    assert entry_bytes % itemsize == 0, (
+        f"misaligned mamba spec: per-slot entry_bytes={entry_bytes} is not a "
+        f"multiple of the temporal-state itemsize {itemsize} B; the temporal "
+        f"view's storage_offset would truncate and mis-place the state"
+    )
+    assert anchor_bytes % itemsize == 0, (
+        f"misaligned mamba spec: anchor_bytes={anchor_bytes} is not a multiple "
+        f"of the temporal-state itemsize {itemsize} B"
+    )
     inner_shape_bytes = _prod(temporal_state_shape) * itemsize
-    assert inner_shape_bytes % itemsize == 0
-    assert (anchor_bytes + offset_bytes_within_entry) % itemsize == 0
+    assert inner_shape_bytes % itemsize == 0, (
+        f"misaligned mamba spec: temporal inner_shape_bytes={inner_shape_bytes} "
+        f"is not a multiple of the temporal-state itemsize {itemsize} B"
+    )
+    assert (anchor_bytes + offset_bytes_within_entry) % itemsize == 0, (
+        f"misaligned mamba spec: temporal region byte offset "
+        f"{anchor_bytes + offset_bytes_within_entry} is not a multiple of the "
+        f"temporal-state itemsize {itemsize} B"
+    )
     offset_elems = (anchor_bytes + offset_bytes_within_entry) // itemsize
     as_temporal_dtype = raw.view(temporal_dtype)
     stride = (
