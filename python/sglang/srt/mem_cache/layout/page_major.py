@@ -124,6 +124,135 @@ def mamba_entry_bytes(
     return total
 
 
+def spec_state_entry_bytes(
+    *,
+    layer_num: int,
+    num_draft_tokens: int,
+    conv_window_shapes: Sequence[Sequence[int]],
+    conv_dtype: torch.dtype,
+    ssm_state_shape: Sequence[int],
+    ssm_dtype: torch.dtype,
+) -> int:
+    """Bytes occupied by one spec-decode intermediate-state slot across all
+    layers and draft steps (conv windows + SSM states, DENSE conv layout)."""
+    total = 0
+    for shape in conv_window_shapes:
+        total += layer_num * num_draft_tokens * _prod(shape) * conv_dtype.itemsize
+    total += layer_num * num_draft_tokens * _prod(ssm_state_shape) * ssm_dtype.itemsize
+    return total
+
+
+def build_spec_state_views(
+    raw: torch.Tensor,
+    *,
+    layer_num: int,
+    num_draft_tokens: int,
+    conv_window_shapes: Sequence[Sequence[int]],
+    conv_dtype: torch.dtype,
+    ssm_state_shape: Sequence[int],
+    ssm_dtype: torch.dtype,
+    max_slots: int,
+    anchor_bytes: int = 0,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    """Per-slot envelope views over ``raw`` for spec-decode intermediate state.
+
+    Layout per slot: ``[conv_window[0] rows × layers × steps]
+    [conv_window[1] rows × layers × steps]...[ssm rows × layers × steps]``
+    (regions ordered conv-first / ssm-last, mirroring the mamba envelope).
+    Within a region, layer L's ``num_draft_tokens`` step-rows are contiguous.
+
+    Returns ``(ssm_view, conv_window_views)`` shaped
+    ``(layer_num, max_slots, num_draft_tokens, *inner_shape)``, matching
+    ``MambaPool.SpeculativeState.intermediate_ssm`` /
+    ``.intermediate_conv_window[i]`` (DENSE conv layout). Spec state is always
+    slot-granular (page_size == 1).
+    """
+    entry_bytes = spec_state_entry_bytes(
+        layer_num=layer_num,
+        num_draft_tokens=num_draft_tokens,
+        conv_window_shapes=conv_window_shapes,
+        conv_dtype=conv_dtype,
+        ssm_state_shape=ssm_state_shape,
+        ssm_dtype=ssm_dtype,
+    )
+
+    def contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
+        strides = []
+        acc = 1
+        for s in reversed(shape):
+            strides.append(acc)
+            acc *= int(s)
+        return tuple(reversed(strides))
+
+    conv_itemsize = conv_dtype.itemsize
+    assert entry_bytes % conv_itemsize == 0, (
+        f"misaligned spec-state spec: per-slot entry_bytes={entry_bytes} is not "
+        f"a multiple of the conv-window itemsize {conv_itemsize} B"
+    )
+    assert anchor_bytes % conv_itemsize == 0, (
+        f"misaligned spec-state spec: anchor_bytes={anchor_bytes} is not a "
+        f"multiple of the conv-window itemsize {conv_itemsize} B"
+    )
+    as_conv_dtype = raw.view(conv_dtype)
+    entry_stride_conv_elems = entry_bytes // conv_itemsize
+
+    offset_bytes_within_entry = 0
+    conv_window_views: List[torch.Tensor] = []
+    for shape in conv_window_shapes:
+        inner_shape_bytes = _prod(shape) * conv_itemsize
+        offset_elems = (anchor_bytes + offset_bytes_within_entry) // conv_itemsize
+        inner_elems = inner_shape_bytes // conv_itemsize
+        stride = (
+            num_draft_tokens * inner_elems,  # next layer
+            entry_stride_conv_elems,  # next slot
+            inner_elems,  # next draft step
+        ) + contiguous_strides(shape)
+        conv_window_views.append(
+            torch.as_strided(
+                as_conv_dtype,
+                size=(layer_num, max_slots, num_draft_tokens) + tuple(shape),
+                stride=stride,
+                storage_offset=offset_elems,
+            )
+        )
+        offset_bytes_within_entry += layer_num * num_draft_tokens * inner_shape_bytes
+
+    # Same truncation hazard as the mamba temporal view: every term of the ssm
+    # view's byte offset (entry stride, anchor, the conv-window region) must be
+    # a whole multiple of the ssm itemsize or the element offset mis-places it.
+    itemsize = ssm_dtype.itemsize
+    assert entry_bytes % itemsize == 0, (
+        f"misaligned spec-state spec: per-slot entry_bytes={entry_bytes} is not "
+        f"a multiple of the ssm-state itemsize {itemsize} B; the ssm view's "
+        f"storage_offset would truncate and mis-place the state"
+    )
+    assert anchor_bytes % itemsize == 0, (
+        f"misaligned spec-state spec: anchor_bytes={anchor_bytes} is not a "
+        f"multiple of the ssm-state itemsize {itemsize} B"
+    )
+    assert (anchor_bytes + offset_bytes_within_entry) % itemsize == 0, (
+        f"misaligned spec-state spec: ssm region byte offset "
+        f"{anchor_bytes + offset_bytes_within_entry} is not a multiple of the "
+        f"ssm-state itemsize {itemsize} B"
+    )
+    inner_shape_bytes = _prod(ssm_state_shape) * itemsize
+    inner_elems = inner_shape_bytes // itemsize
+    offset_elems = (anchor_bytes + offset_bytes_within_entry) // itemsize
+    as_ssm_dtype = raw.view(ssm_dtype)
+    stride = (
+        num_draft_tokens * inner_elems,  # next layer
+        entry_bytes // itemsize,  # next slot
+        inner_elems,  # next draft step
+    ) + contiguous_strides(ssm_state_shape)
+    ssm_view = torch.as_strided(
+        as_ssm_dtype,
+        size=(layer_num, max_slots, num_draft_tokens) + tuple(ssm_state_shape),
+        stride=stride,
+        storage_offset=offset_elems,
+    )
+    return ssm_view, conv_window_views
+
+
 def build_page_major_mamba_views(
     raw: torch.Tensor,
     *,

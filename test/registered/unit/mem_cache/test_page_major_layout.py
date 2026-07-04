@@ -24,8 +24,10 @@ import torch
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     build_page_major_mha_views,
+    build_spec_state_views,
     mamba_entry_bytes,
     mha_entry_bytes,
+    spec_state_entry_bytes,
 )
 from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
 
@@ -157,6 +159,112 @@ class TestMambaEnvelopeViews(unittest.TestCase):
         for L in range(layers):
             for s in range(slots):
                 self.assertTrue(torch.all(temporal[L, s] == float(s + L * 10 + 1)))
+
+
+class TestSpecStateEnvelopeViews(unittest.TestCase):
+    _LAYERS, _SLOTS, _STEPS = 2, 4, 3
+    _CONV_SHAPES = [(2, 3)]
+    _SSM_SHAPE = (2, 2, 2)
+    _CONV_DT, _SSM_DT = torch.bfloat16, torch.float32
+
+    def _make_views(self):
+        entry = spec_state_entry_bytes(
+            layer_num=self._LAYERS,
+            num_draft_tokens=self._STEPS,
+            conv_window_shapes=self._CONV_SHAPES,
+            conv_dtype=self._CONV_DT,
+            ssm_state_shape=self._SSM_SHAPE,
+            ssm_dtype=self._SSM_DT,
+        )
+        raw = torch.zeros(self._SLOTS * entry, dtype=torch.uint8, device=_DEV)
+        ssm, conv_views = build_spec_state_views(
+            raw,
+            layer_num=self._LAYERS,
+            num_draft_tokens=self._STEPS,
+            conv_window_shapes=self._CONV_SHAPES,
+            conv_dtype=self._CONV_DT,
+            ssm_state_shape=self._SSM_SHAPE,
+            ssm_dtype=self._SSM_DT,
+            max_slots=self._SLOTS,
+        )
+        return raw, entry, ssm, conv_views
+
+    def test_shapes(self):
+        _, _, ssm, conv_views = self._make_views()
+        self.assertEqual(
+            tuple(ssm.shape),
+            (self._LAYERS, self._SLOTS, self._STEPS) + self._SSM_SHAPE,
+        )
+        self.assertEqual(
+            tuple(conv_views[0].shape),
+            (self._LAYERS, self._SLOTS, self._STEPS) + self._CONV_SHAPES[0],
+        )
+
+    def test_no_aliasing_across_layer_slot_step(self):
+        _, _, ssm, conv_views = self._make_views()
+        conv = conv_views[0]
+        for L in range(self._LAYERS):
+            for s in range(self._SLOTS):
+                for d in range(self._STEPS):
+                    ssm[L, s, d] = float(1000 + L * 100 + s * 10 + d)
+                    conv[L, s, d] = float(-(1000 + L * 100 + s * 10 + d))
+        for L in range(self._LAYERS):
+            for s in range(self._SLOTS):
+                for d in range(self._STEPS):
+                    self.assertTrue(
+                        torch.all(ssm[L, s, d] == float(1000 + L * 100 + s * 10 + d))
+                    )
+                    self.assertTrue(
+                        torch.all(conv[L, s, d] == float(-(1000 + L * 100 + s * 10 + d)))
+                    )
+
+    def test_slot_writes_stay_within_entry(self):
+        # Writing everything of slot k touches exactly bytes [k*entry, (k+1)*entry).
+        raw, entry, ssm, conv_views = self._make_views()
+        k = 2
+        ssm[:, k] = 1.0
+        for conv in conv_views:
+            conv[:, k] = 1.0
+        nz = raw.view(torch.uint8) != 0
+        self.assertTrue(torch.any(nz[k * entry : (k + 1) * entry]))
+        self.assertFalse(torch.any(nz[: k * entry]))
+        self.assertFalse(torch.any(nz[(k + 1) * entry :]))
+
+    def test_views_tile_raw_exactly(self):
+        # Filling every cell of every view touches every byte of raw. Fill
+        # values are chosen so EVERY byte of the element is nonzero (0x3f..).
+        raw, _, ssm, conv_views = self._make_views()
+        ssm_fill = (
+            torch.tensor([0x3F3F3F3F], dtype=torch.int32).view(torch.float32).item()
+        )
+        conv_fill = (
+            torch.tensor([0x3F3F], dtype=torch.int16).view(torch.bfloat16).item()
+        )
+        ssm.fill_(ssm_fill)
+        for conv in conv_views:
+            conv.fill_(conv_fill)
+        self.assertTrue(torch.all(raw.view(torch.uint8) != 0))
+
+    def test_band_slice_matches_reference_zeros_layout(self):
+        # A contiguous band slice [band_start : band_start+bs] must behave like
+        # rows [0:bs] of a reference torch.zeros dense layout (the read-back
+        # slice trick used by the commit scatter).
+        _, _, ssm, _ = self._make_views()
+        ref = torch.zeros(
+            (self._LAYERS, self._SLOTS, self._STEPS) + self._SSM_SHAPE,
+            dtype=self._SSM_DT,
+            device=_DEV,
+        )
+        torch.manual_seed(0)
+        band_start, bs = 1, 2
+        data = torch.randn(
+            (self._LAYERS, bs, self._STEPS) + self._SSM_SHAPE, dtype=self._SSM_DT
+        )
+        ssm[:, band_start : band_start + bs] = data
+        ref[:, 0:bs] = data
+        self.assertTrue(
+            torch.equal(ssm[:, band_start : band_start + bs], ref[:, 0:bs])
+        )
 
 
 if __name__ == "__main__":

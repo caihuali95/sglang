@@ -11,14 +11,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""UnifiedKVPool — one physical `uint8` byte buffer shared by 2 sub-pools.
+"""UnifiedKVPool — one physical `uint8` byte buffer shared by N sub-pools.
 
-Two `MultiEndedAllocator`s grow from opposite ends; eager-compacting `free`
-keeps each pool's byte range hole-free. Layout is envelope-major (a slot's data
-for all its layers in one contiguous byte envelope) so a freed slot vacates a
-region the peer can grow into. Everything above the allocator stores virtual
-slot IDs; the allocator owns the per-sub-pool virtual<->physical tables and
-compaction only mutates those (no reference rewriting).
+Two end sub-pools grow from opposite ends (their `MultiEndedAllocator`s meet in
+the middle); optional "float" middle sub-pools live between the two frontiers.
+Eager-compacting `free` keeps each pool's byte range hole-free. Layout is
+envelope-major (a slot's data for all its layers in one contiguous byte
+envelope) so a freed slot vacates a region a neighbor can grow into. Everything
+above the allocator stores virtual slot IDs; the allocator owns the
+per-sub-pool virtual<->physical tables and compaction only mutates those (no
+reference rewriting).
 """
 
 from __future__ import annotations
@@ -26,8 +28,9 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
+import msgspec
 import torch
 import triton
 from torch.profiler import record_function
@@ -36,6 +39,8 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     build_page_major_mha_views,
+    build_spec_state_views,
+    spec_state_entry_bytes,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
@@ -169,43 +174,115 @@ class MambaSubPoolSpec(SubPoolSpec):
         return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
 
 
+class SpecStateSubPoolSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-slot layout of the spec-decode intermediate-state "float" sub-pool.
+
+    One slot = one verify-batch row's intermediate SSM states + conv windows
+    across all mamba layers and draft steps (DENSE conv layout). A float pool
+    lives between the two end pools' frontiers as one contiguous, freely
+    relocatable band. `msgspec.Struct`, deliberately outside the grandfathered
+    `SubPoolSpec` `@dataclass` hierarchy — the sweep type-dispatches.
+    """
+
+    name: str
+    layer_num: int
+    num_draft_tokens: int
+    conv_window_shapes: Tuple[Tuple[int, ...], ...]  # one shape per conv tensor
+    conv_dtype: torch.dtype
+    ssm_state_shape: Tuple[int, ...]
+    ssm_dtype: torch.dtype
+    grow_direction: str = "float"
+
+    def validate(self) -> None:
+        assert self.grow_direction == "float", (
+            f"SpecStateSubPoolSpec must be a float middle pool; "
+            f"got {self.grow_direction!r}"
+        )
+        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
+        assert (
+            self.num_draft_tokens > 0
+        ), f"num_draft_tokens must be positive; got {self.num_draft_tokens}"
+        assert len(self.conv_window_shapes) > 0, "conv_window_shapes must be non-empty"
+
+    def entry_bytes(self) -> int:
+        return spec_state_entry_bytes(
+            layer_num=self.layer_num,
+            num_draft_tokens=self.num_draft_tokens,
+            conv_window_shapes=self.conv_window_shapes,
+            conv_dtype=self.conv_dtype,
+            ssm_state_shape=self.ssm_state_shape,
+            ssm_dtype=self.ssm_dtype,
+        )
+
+    def get_dtype(self) -> torch.dtype:
+        return self.ssm_dtype  # dominant buffer's dtype (informational)
+
+
+# Duck-typed union accepted by UnifiedKVPool: the grandfathered @dataclass
+# hierarchy plus msgspec-based specs (`.claude/rules/no-dataclasses.md`).
+SubPoolSpecLike = Union[SubPoolSpec, SpecStateSubPoolSpec]
+
+
 # ---------------------------------------------------------------------------
 # UnifiedKVPool — the byte buffer + the strided per-sub-pool views
 # ---------------------------------------------------------------------------
 
 
 class UnifiedKVPool:
-    """One physical `uint8` byte buffer shared by 2 sub-pools, each exposing
-    strided per-layer views. Allocators keep byte ranges disjoint; no usage tracking here.
+    """One physical `uint8` byte buffer shared by N sub-pools, each exposing
+    strided per-layer views. Two end pools (one grow-up, one grow-down) plus
+    optional "float" middle pools between their frontiers. Allocators keep
+    byte ranges disjoint; no usage tracking here.
     """
 
     def __init__(
         self,
         *,
         total_bytes: int,
-        sub_pool_specs: List[SubPoolSpec],
+        sub_pool_specs: List[SubPoolSpecLike],
         device: str,
         enable_memory_saver: bool,
         page_size: int = 1,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
-        assert len(sub_pool_specs) == 2, (
-            f"UnifiedKVPool currently supports exactly 2 sub-pools; got "
-            f"{len(sub_pool_specs)} (N>2 is not yet implemented)"
-        )
+        assert (
+            len(sub_pool_specs) >= 2
+        ), f"UnifiedKVPool needs >= 2 sub-pools; got {len(sub_pool_specs)}"
         names = [s.name for s in sub_pool_specs]
-        assert len(set(names)) == 2, f"sub-pool names must be unique; got {names}"
-        directions = sorted(s.grow_direction for s in sub_pool_specs)
-        assert directions == ["down", "up"], (
-            f"UnifiedKVPool needs one grow-up and one grow-down sub-pool; "
-            f"got {directions}"
+        assert len(set(names)) == len(
+            names
+        ), f"sub-pool names must be unique; got {names}"
+        for s in sub_pool_specs:
+            if isinstance(s, SpecStateSubPoolSpec):
+                s.validate()
+        up_specs = [s for s in sub_pool_specs if s.grow_direction == "up"]
+        down_specs = [s for s in sub_pool_specs if s.grow_direction == "down"]
+        float_specs = [s for s in sub_pool_specs if s.grow_direction == "float"]
+        assert len(up_specs) == 1 and len(down_specs) == 1, (
+            f"UnifiedKVPool needs exactly one grow-up and one grow-down end "
+            f"sub-pool; got directions "
+            f"{[s.grow_direction for s in sub_pool_specs]}"
+        )
+        assert len(up_specs) + len(down_specs) + len(float_specs) == len(
+            sub_pool_specs
+        ), (
+            f"unknown grow_direction among "
+            f"{[s.grow_direction for s in sub_pool_specs]}"
         )
 
         self.device = device
         self.total_bytes = total_bytes
-        self.sub_pool_specs = sub_pool_specs
+        # Canonical chain order, low byte end -> high byte end: the grow-up end
+        # pool, floating middles (input order preserved), the grow-down end
+        # pool. Input list order is otherwise irrelevant (all access is
+        # by-name); the chain order is what peer wiring follows.
+        self.sub_pool_specs: List[SubPoolSpecLike] = [
+            up_specs[0],
+            *float_specs,
+            down_specs[0],
+        ]
         self._page_size = page_size
-        self._specs_by_name: Dict[str, SubPoolSpec] = {
+        self._specs_by_name: Dict[str, SubPoolSpecLike] = {
             s.name: s for s in sub_pool_specs
         }
 
@@ -219,15 +296,17 @@ class UnifiedKVPool:
         self._max_slots: Dict[str, int] = {}
         self._anchor_bytes: Dict[str, int] = {}
         self._min_slot_index: Dict[str, int] = {}
-        # MHA: (k_buffer, v_buffer); Mamba: (conv_state_list, temporal_state)
+        # MHA: (k_buffer, v_buffer); Mamba: (conv_state_list, temporal_state);
+        # SpecState: (ssm_view, conv_window_views)
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
+        self._spec_state_views: Dict[str, Tuple[torch.Tensor, List[torch.Tensor]]] = {}
 
-        # Slot-0 dummy writes for both pools land in [0, entry_max); each pool's
+        # Slot-0 dummy writes for every pool land in [0, entry_max); each pool's
         # first allocatable slot is chosen so real data starts at >= entry_max.
-        entry_max = max(s.entry_bytes() for s in sub_pool_specs)
+        entry_max = max(s.entry_bytes() for s in self.sub_pool_specs)
 
-        for spec in sub_pool_specs:
+        for spec in self.sub_pool_specs:
             entry_bytes = spec.entry_bytes()
             max_slots = total_bytes // entry_bytes
             min_slot_index = (entry_max + entry_bytes - 1) // entry_bytes  # ceil
@@ -252,6 +331,10 @@ class UnifiedKVPool:
                 self._mamba_views[spec.name] = self._build_mamba_views(
                     spec, anchor, max_slots
                 )
+            elif isinstance(spec, SpecStateSubPoolSpec):
+                self._spec_state_views[spec.name] = self._build_spec_state_views(
+                    spec, anchor, max_slots
+                )
             else:  # pragma: no cover
                 raise TypeError(f"unsupported SubPoolSpec type: {type(spec)}")
 
@@ -260,9 +343,9 @@ class UnifiedKVPool:
             "%d sub-pool(s)",
             total_bytes / GB,
             total_bytes,
-            len(sub_pool_specs),
+            len(self.sub_pool_specs),
         )
-        for s in sub_pool_specs:
+        for s in self.sub_pool_specs:
             logger.info(
                 "[unified-memory-pool]   sub-pool %r: kind=%s, layer_num=%d, grow=%s, "
                 "entry_bytes=%d, max_slots=%d, min_slot_index=%d (slots [0,%d) reserved)",
@@ -278,7 +361,7 @@ class UnifiedKVPool:
 
     # -- introspection --
 
-    def spec(self, name: str) -> SubPoolSpec:
+    def spec(self, name: str) -> SubPoolSpecLike:
         return self._specs_by_name[name]
 
     def mha_spec(self, name: str) -> MHASubPoolSpec:
@@ -293,6 +376,13 @@ class UnifiedKVPool:
         assert isinstance(
             s, MambaSubPoolSpec
         ), f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
+        return s
+
+    def spec_state_spec(self, name: str) -> SpecStateSubPoolSpec:
+        s = self._specs_by_name[name]
+        assert isinstance(
+            s, SpecStateSubPoolSpec
+        ), f"sub-pool {name!r} is {type(s).__name__}, expected SpecStateSubPoolSpec"
         return s
 
     def max_slots(self, name: str) -> int:
@@ -311,6 +401,11 @@ class UnifiedKVPool:
 
     def mamba_views_for(self, name: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
         return self._mamba_views[name]
+
+    def spec_state_views_for(
+        self, name: str
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        return self._spec_state_views[name]
 
     def _build_mha_views(
         self,
@@ -341,6 +436,21 @@ class UnifiedKVPool:
             conv_dtype=spec.conv_dtype,
             temporal_state_shape=spec.temporal_state_shape,
             temporal_dtype=spec.temporal_dtype,
+            max_slots=max_slots,
+            anchor_bytes=anchor_bytes,
+        )
+
+    def _build_spec_state_views(
+        self, spec: SpecStateSubPoolSpec, anchor_bytes: int, max_slots: int
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        return build_spec_state_views(
+            self._raw,
+            layer_num=spec.layer_num,
+            num_draft_tokens=spec.num_draft_tokens,
+            conv_window_shapes=spec.conv_window_shapes,
+            conv_dtype=spec.conv_dtype,
+            ssm_state_shape=spec.ssm_state_shape,
+            ssm_dtype=spec.ssm_dtype,
             max_slots=max_slots,
             anchor_bytes=anchor_bytes,
         )
