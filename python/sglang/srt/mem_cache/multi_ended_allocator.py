@@ -160,6 +160,12 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.num_virtual_ids = self.num_pages
 
         self._peer: Optional[MultiEndedAllocator] = None
+        # N-pool chain neighbors (§6.4): the nearest sub-pool below/above this
+        # one in the byte buffer. For 2-pool configs `bind_peer` mirrors `_peer`
+        # into the matching side; float middles are wired explicitly via
+        # `bind_low_peer` / `bind_high_peer` (which override the mirror).
+        self.low_peer: Optional[MultiEndedAllocator] = None
+        self.high_peer: Optional[MultiEndedAllocator] = None
 
         # Inverse history of relocations (spec rollback), at PAGE granularity.
         self._inverse_history: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
@@ -245,20 +251,65 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     # -- peer binding --
 
     def bind_peer(self, peer: MultiEndedAllocator) -> None:
+        """Bind the OTHER END pool (lazy peer-flush target). Also mirrors it
+        into the chain side this pool grows toward, unless a float middle was
+        already wired there via `bind_low_peer`/`bind_high_peer`."""
         self._peer = peer
+        if self.grow_direction == "up":
+            if self.high_peer is None:
+                self.high_peer = peer
+        elif self.grow_direction == "down":
+            if self.low_peer is None:
+                self.low_peer = peer
+
+    def bind_low_peer(self, peer: MultiEndedAllocator) -> None:
+        self.low_peer = peer
+
+    def bind_high_peer(self, peer: MultiEndedAllocator) -> None:
+        self.high_peer = peer
 
     @property
     def peer(self) -> Optional[MultiEndedAllocator]:
         return self._peer
 
+    # -- chain frontier walk (§6.4) --
+
+    def _is_frontier_transparent(self) -> bool:
+        """Whether neighbors' frontier checks may see through this pool.
+        End pools are always opaque; empty float bands are transparent."""
+        return False
+
+    def _chain_low_frontier_above_bytes(self) -> int:
+        """Byte low-frontier of the nearest non-transparent pool ABOVE this
+        one, else the buffer top."""
+        p = self.high_peer
+        while p is not None and p._is_frontier_transparent():
+            p = p.high_peer
+        if p is None:
+            return self.unified_buffer.total_bytes
+        return p._byte_low_frontier()
+
+    def _chain_high_frontier_below_bytes(self) -> int:
+        """Byte high-frontier of the nearest non-transparent pool BELOW this
+        one, else byte 0."""
+        p = self.low_peer
+        while p is not None and p._is_frontier_transparent():
+            p = p.low_peer
+        if p is None:
+            return 0
+        return p._byte_high_frontier()
+
     # -- state --
 
-    def clear(self) -> None:
-        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+    def _reset_watermarks(self) -> None:
         if self.grow_direction == "up":
             self.watermark_physical = self.min_page_index
         else:
             self.watermark_physical = self.num_pages - 1
+
+    def clear(self) -> None:
+        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+        self._reset_watermarks()
         self.virtual_to_physical.fill_(-1)
         # Virtual page 0 <-> physical page 0 (padding sink).
         self.virtual_to_physical[0] = 0
@@ -364,18 +415,14 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         return (self.watermark_physical + 1) * self.entry_bytes_per_page
 
     def _current_gap_bytes(self) -> int:
-        """Free byte band between this side's frontier and the peer's CURRENT frontier."""
+        """Free byte band between this side's frontier and the CURRENT frontier
+        of the nearest non-transparent chain neighbor (== the old single-peer
+        math when no float middles are wired)."""
         if self.grow_direction == "up":
             my_high = self._byte_high_frontier()
-            peer_low = (
-                self._peer._byte_low_frontier()
-                if self._peer is not None
-                else self.unified_buffer.total_bytes
-            )
-            return max(0, peer_low - my_high)
+            return max(0, self._chain_low_frontier_above_bytes() - my_high)
         my_low = self._byte_low_frontier()
-        peer_high = self._peer._byte_high_frontier() if self._peer is not None else 0
-        return max(0, my_low - peer_high)
+        return max(0, my_low - self._chain_high_frontier_below_bytes())
 
     def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
         """Tokens allocatable given `extra_gap_bytes` of ADDED gap room
@@ -531,26 +578,25 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             new_wm = self.watermark_physical + num_pages
             if new_wm > self.num_pages:
                 return False
-            # Peer (grow-down) sits ABOVE; don't extend past its low frontier.
-            if self._peer is not None:
-                peer_low_pages = (
-                    self._peer._byte_low_frontier() // self.entry_bytes_per_page
-                )
-                if new_wm > peer_low_pages:
-                    return False
+            # Chain neighbor above (grow-down peer or a non-empty float band);
+            # don't extend past its low frontier.
+            neighbor_low_pages = (
+                self._chain_low_frontier_above_bytes() // self.entry_bytes_per_page
+            )
+            if new_wm > neighbor_low_pages:
+                return False
             self.watermark_physical = new_wm
         else:
             new_wm = self.watermark_physical - num_pages
             if new_wm < self.min_page_index - 1:
                 return False
-            # Peer (grow-up) sits BELOW; `new_wm + 1` (our new lowest live page)
-            # must stay strictly above the peer's high frontier.
-            if self._peer is not None:
-                peer_high_pages = (
-                    self._peer._byte_high_frontier() // self.entry_bytes_per_page
-                )
-                if new_wm + 1 < peer_high_pages:
-                    return False
+            # Chain neighbor below; `new_wm + 1` (our new lowest live page)
+            # must stay strictly above its high frontier.
+            neighbor_high_pages = (
+                self._chain_high_frontier_below_bytes() // self.entry_bytes_per_page
+            )
+            if new_wm + 1 < neighbor_high_pages:
+                return False
             self.watermark_physical = new_wm
         return True
 
@@ -1050,6 +1096,19 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.watermark_physical = new_wm
             vacated_lo, vacated_hi = old_wm + 1, new_wm + 1
 
+        self._apply_compaction_moves(src_list, dst_list, vacated_lo, vacated_hi)
+
+    def _apply_compaction_moves(
+        self,
+        src_list: List[int],
+        dst_list: List[int],
+        vacated_lo: int,
+        vacated_hi: int,
+    ) -> None:
+        """Shared eager-compaction tail: move survivor pages `src_list` into
+        holes `dst_list`, clear the vacated band `[vacated_lo, vacated_hi)`,
+        remap v2p/p2v, and log the inverse. Used by the end-pool impl and the
+        float-pool `_compact_toward`."""
         assert len(src_list) == len(dst_list), (
             f"_compact_pending({self.sub_pool_name!r}): {len(src_list)} survivors vs "
             f"{len(dst_list)} holes — corrupt allocator state"
@@ -1660,6 +1719,333 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.free(merged)
+
+
+class FloatMultiEndedAllocator(MultiEndedAllocator):
+    """§6.4 float MIDDLE pool: one contiguous live band of physical pages
+    `[low_wm_page, high_wm_page)` between two chain neighbors.
+
+    - `alloc` extends toward the roomier gap (smart direction); from empty it
+      first repositions the band to the current inter-frontier midpoint.
+    - `free` compacts toward the TIGHTER side (`_compact_toward`): the tighter
+      neighbor's frontier retreats, ceding bytes to the more-pressured side.
+    - `available_size = max(gap_low, gap_high) // entry_bytes` (conservative:
+      a single alloc extends one side only).
+    - An EMPTY float band is frontier-transparent: neighbors' gap checks walk
+      through it (`_is_frontier_transparent`).
+
+    Eager-only: the lazy event-gating machinery is not wired for float pools.
+    """
+
+    def __init__(self, **kwargs):
+        assert not kwargs.get("lazy_compaction", False), (
+            "FloatMultiEndedAllocator is eager-only; lazy compaction is not "
+            "wired for float middle pools"
+        )
+        super().__init__(**kwargs)
+        assert self.grow_direction == "float", (
+            f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
+            f"{self.grow_direction!r}"
+        )
+
+    # -- watermarks / frontiers --
+
+    def _reset_watermarks(self) -> None:
+        # Park empty at the buffer top; empty-transparency makes the parking
+        # position irrelevant to neighbors.
+        self.low_wm_page = self.num_pages
+        self.high_wm_page = self.num_pages
+        self.watermark_physical = -1  # unused for float pools (logs only)
+
+    def _is_frontier_transparent(self) -> bool:
+        return self.high_wm_page == self.low_wm_page
+
+    def _allocated_pages(self) -> int:
+        return self.high_wm_page - self.low_wm_page
+
+    def _byte_low_frontier(self) -> int:
+        return self.low_wm_page * self.entry_bytes_per_page
+
+    def _byte_high_frontier(self) -> int:
+        return self.high_wm_page * self.entry_bytes_per_page
+
+    def _region_bounds_pages(self) -> Tuple[int, int]:
+        """Page bounds `[lo, hi)` of the inter-frontier region available to
+        this band (chain-transparent; clamped to the slot-0 sink reservation).
+        Rounded conservatively: `lo` up, `hi` down."""
+        epp = self.entry_bytes_per_page
+        lo_bytes = self._chain_high_frontier_below_bytes()
+        hi_bytes = self._chain_low_frontier_above_bytes()
+        lo = max(-(-lo_bytes // epp), self.min_page_index)  # ceil
+        hi = max(lo, hi_bytes // epp)  # floor
+        return lo, hi
+
+    def _gap_pages(self) -> Tuple[int, int]:
+        lo, hi = self._region_bounds_pages()
+        return max(0, self.low_wm_page - lo), max(0, hi - self.high_wm_page)
+
+    def _current_gap_bytes(self) -> int:
+        # Feeds base `_available_tokens`: a single alloc extends ONE side, so
+        # the conservative float gap is the larger of the two.
+        gap_low, gap_high = self._gap_pages()
+        return max(gap_low, gap_high) * self.entry_bytes_per_page
+
+    # -- smart-direction extension --
+
+    def _reserve_band_extension(self, num_pages: int) -> Optional[int]:
+        """Extend the band by `num_pages` toward the roomier side (repositioning
+        to the region midpoint first when empty). Returns the lowest physical
+        page id of the ascending new range, or None on shortfall."""
+        lo, hi = self._region_bounds_pages()
+        if self._is_frontier_transparent():
+            # Reposition-on-alloc-from-empty: collapse to the midpoint.
+            if num_pages > hi - lo:
+                return None
+            mid = lo + (hi - lo - num_pages) // 2
+            self.low_wm_page = self.high_wm_page = mid
+        gap_low = self.low_wm_page - lo
+        gap_high = hi - self.high_wm_page
+        if gap_high >= gap_low:
+            sides = ("high", "low")
+        else:
+            sides = ("low", "high")
+        for side in sides:
+            if side == "high" and self.high_wm_page + num_pages <= hi:
+                start = self.high_wm_page
+                self.high_wm_page += num_pages
+                return start
+            if side == "low" and self.low_wm_page - num_pages >= lo:
+                self.low_wm_page -= num_pages
+                return self.low_wm_page
+        return None
+
+    def _take_physical_eager(self, num_pages: int) -> Optional[torch.Tensor]:
+        start = self._reserve_band_extension(num_pages)
+        if start is None:
+            return None
+        return torch.arange(
+            start, start + num_pages, dtype=torch.int64, device=self.device
+        )
+
+    def _alloc_bind_fast_or_slow(
+        self, v_pages: torch.Tensor, N: int
+    ) -> Optional[torch.Tensor]:
+        with record_function("FloatMultiEndedAlloc._alloc_bind_fast_or_slow"):
+            if N == 0:
+                return torch.empty(0, dtype=torch.int64, device=self.device)
+            start = self._reserve_band_extension(N)
+            if start is None:
+                return None
+            return alloc_bind_inplace(
+                v_pages,
+                self.virtual_to_physical,
+                self.physical_to_virtual,
+                start,
+            )
+
+    def _extend_watermark(self, num_pages: int) -> bool:  # pragma: no cover
+        raise AssertionError(
+            "float pools are eager-only; the lazy _extend_watermark path must "
+            "not be reached"
+        )
+
+    # -- tighter-side compaction --
+
+    def _compact_pending_impl(self, freed_physical_pages: torch.Tensor) -> None:
+        self._compact_toward(freed_physical_pages)
+
+    def _compact_toward(self, freed_physical_pages: torch.Tensor) -> None:
+        """Retreat the TIGHTER side's watermark: relocate that side's boundary
+        survivors into the freed holes, ceding bytes toward the more-pressured
+        neighbor."""
+        freed_set = set(int(x) for x in freed_physical_pages.tolist())
+        if not freed_set:
+            return
+        K = len(freed_set)
+        assert all(
+            self.low_wm_page <= h < self.high_wm_page for h in freed_set
+        ), (
+            f"_compact_toward({self.sub_pool_name!r}): freed physical pages "
+            f"{sorted(freed_set)} not all within the live band "
+            f"[{self.low_wm_page}, {self.high_wm_page})"
+        )
+        gap_low, gap_high = self._gap_pages()
+        if gap_low <= gap_high:
+            # Tighter side = low: vacate [low_wm, low_wm + K).
+            old_low = self.low_wm_page
+            new_low = old_low + K
+            src_list = [s for s in range(old_low, new_low) if s not in freed_set]
+            dst_list = sorted(h for h in freed_set if h >= new_low)
+            self.low_wm_page = new_low
+            vacated_lo, vacated_hi = old_low, new_low
+        else:
+            # Tighter side = high: vacate [high_wm - K, high_wm).
+            old_high = self.high_wm_page
+            new_high = old_high - K
+            src_list = [
+                s for s in range(new_high, old_high) if s not in freed_set
+            ]
+            dst_list = sorted(h for h in freed_set if h < new_high)
+            self.high_wm_page = new_high
+            vacated_lo, vacated_hi = new_high, old_high
+
+        self._apply_compaction_moves(src_list, dst_list, vacated_lo, vacated_hi)
+
+    # -- state snapshot / reporting --
+
+    def backup_state(self):
+        return (
+            (self.low_wm_page, self.high_wm_page),
+            (len(self.free_virtual_ids) if self.is_id_owner else None),
+            len(self._inverse_history),
+        )
+
+    def restore_state(self, state):
+        (low_wm, high_wm), _n_free_virtual, n_inverse = state
+        self.low_wm_page = low_wm
+        self.high_wm_page = high_wm
+        new_entries = self._inverse_history[n_inverse:]
+        if new_entries:
+            logger.warning(
+                "FloatMultiEndedAllocator.restore_state: %d relocation(s) "
+                "recorded inside a backup window (sub_pool=%s).",
+                len(new_entries),
+                self.sub_pool_name,
+            )
+        del self._inverse_history[n_inverse:]
+        return new_entries
+
+    def allocator_state_str(self) -> str:
+        return (
+            f"sub_pool={self.sub_pool_name!r}, grow_direction=float, "
+            f"is_id_owner={self.is_id_owner}, page_size={self.page_size}, "
+            f"min_page_index={self.min_page_index}, num_pages={self.num_pages}, "
+            f"band=[{self.low_wm_page}, {self.high_wm_page}), "
+            f"allocated_pages={self._allocated_pages()}"
+        )
+
+
+class SpecStateBandAllocator(FloatMultiEndedAllocator):
+    """Band-mode float pool for the spec-decode intermediate state.
+
+    Virtual id == BATCH ROW of the current verify batch (0-based, ephemeral —
+    the intermediate's contents die at commit, so rows need no cross-step
+    identity). Physical backing is one exact-fit band placed per decode step by
+    `place_band(bs)`: `v2p[r] = band_start_page + r` for `r < bs`, all other
+    rows tombstoned (-1 → translate clamps to the physical slot-0 sink).
+
+    NO per-slot alloc/free: placement (resize + free relocation) is the only
+    lifecycle operation, and it is zero-copy because nothing persists between
+    steps. The band is pinned inside `run_batch` (metadata build → commit);
+    `pin_band`/`unpin_band` enforce that placement only happens outside the
+    pin window (invariant I-SPEC-2).
+    """
+
+    def __init__(self, *, kvcache, unified_buffer, sub_pool_name: str, device: str):
+        super().__init__(
+            kvcache=kvcache,
+            unified_buffer=unified_buffer,
+            sub_pool_name=sub_pool_name,
+            device=device,
+            is_id_owner=False,
+            page_size=1,
+            need_sort=False,
+            forward_stream=None,
+            lazy_compaction=False,
+        )
+
+    def clear(self) -> None:
+        super().clear()
+        # No virtual-0 sink binding: row 0 is a REAL batch row. Unplaced rows
+        # stay tombstoned; `translate_kv_loc` clamps them to physical 0 (sink).
+        self.virtual_to_physical.fill_(-1)
+        self.physical_to_virtual.fill_(-1)
+        self.placed_num_slots = 0
+        self._band_pinned = False
+
+    # -- band lifecycle --
+
+    @property
+    def band_start_page(self) -> int:
+        return self.low_wm_page
+
+    def pin_band(self) -> None:
+        self._band_pinned = True
+
+    def unpin_band(self) -> None:
+        self._band_pinned = False
+
+    def place_band(self, num_slots: int, prefer_side: str = "low") -> bool:
+        """Size the band to exactly `num_slots` and place it in the current
+        inter-frontier region, flush against the `prefer_side` neighbor
+        (default "low": leaves maximal contiguous room for the grow-down end —
+        the token pool, the fastest-growing in practice). Zero-copy: only
+        watermarks and `v2p[0..num_slots)` are rewritten. Returns False (state
+        unchanged) when the region cannot fit `num_slots` — the caller's
+        decode-retract path handles it.
+        """
+        assert not self._band_pinned, (
+            f"place_band({self.sub_pool_name!r}): band is pinned (a verify "
+            "batch is in flight); placement is only legal outside the "
+            "[metadata build, commit] window (I-SPEC-2)"
+        )
+        assert prefer_side in ("low", "high"), prefer_side
+        assert 0 <= num_slots <= self.num_pages - self.min_page_index, (
+            f"place_band({self.sub_pool_name!r}): num_slots={num_slots} out of "
+            f"range [0, {self.num_pages - self.min_page_index}]"
+        )
+        lo, hi = self._region_bounds_pages()
+        if num_slots > hi - lo:
+            return False  # fail with state unchanged; caller retracts
+        if self.placed_num_slots > 0:
+            self.virtual_to_physical[: self.placed_num_slots] = -1
+        if num_slots == 0:
+            # Park empty at the region top; transparent to neighbors.
+            self.low_wm_page = self.high_wm_page = hi
+            self.placed_num_slots = 0
+            return True
+        start = lo if prefer_side == "low" else hi - num_slots
+        self.low_wm_page = start
+        self.high_wm_page = start + num_slots
+        self.virtual_to_physical[:num_slots] = torch.arange(
+            start, start + num_slots, dtype=torch.int64, device=self.device
+        )
+        self.placed_num_slots = num_slots
+        return True
+
+    # -- band contract: no per-slot lifecycle --
+
+    def _band_mode_error(self, api: str):
+        raise AssertionError(
+            f"SpecStateBandAllocator({self.sub_pool_name!r}).{api}: band-mode "
+            "pool has no per-slot lifecycle; use place_band()"
+        )
+
+    def alloc(self, need_size: int):
+        self._band_mode_error("alloc")
+
+    def alloc_with_virtual(self, virtual_pages: torch.Tensor):
+        self._band_mode_error("alloc_with_virtual")
+
+    def alloc_extend(self, *args, **kwargs):
+        self._band_mode_error("alloc_extend")
+
+    def alloc_decode(self, *args, **kwargs):
+        self._band_mode_error("alloc_decode")
+
+    def free(self, free_index: torch.Tensor):
+        self._band_mode_error("free")
+
+    def take_physical(self, need_size: int):
+        self._band_mode_error("take_physical")
+
+    def allocator_state_str(self) -> str:
+        return (
+            f"sub_pool={self.sub_pool_name!r} (band-mode), "
+            f"band=[{self.low_wm_page}, {self.high_wm_page}), "
+            f"placed_num_slots={self.placed_num_slots}, "
+            f"pinned={self._band_pinned}"
+        )
 
 
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

@@ -30,12 +30,15 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.multi_ended_allocator import (
+    FloatMultiEndedAllocator,
     MultiEndedAllocator,
+    SpecStateBandAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
+    SpecStateSubPoolSpec,
     UnifiedKVPool,
 )
 
@@ -2723,6 +2726,322 @@ class TestO3FusedAllocBind(unittest.TestCase):
         for v, p in zip(v_pages.tolist(), expected.tolist()):
             self.assertEqual(int(sa.virtual_to_physical[v].item()), p)
             self.assertEqual(int(sa.physical_to_virtual[p].item()), v)
+
+
+def _make_spec_state_spec(name="spec_state", layer_num=2, num_draft_tokens=3):
+    return SpecStateSubPoolSpec(
+        name=name,
+        layer_num=layer_num,
+        num_draft_tokens=num_draft_tokens,
+        conv_window_shapes=((2, 3),),
+        conv_dtype=torch.bfloat16,
+        ssm_state_shape=(2, 2),
+        ssm_dtype=torch.float32,
+    )
+
+
+def _make_3pool_chain(
+    *, total_bytes=6336, float_cls=SpecStateBandAllocator, float_kwargs=None
+):
+    """[mamba(up) | float spec-state | full(down)] chain over one buffer.
+    Returns (pool, mamba_alloc, band_alloc, full_alloc, fake_kv)."""
+    full = _make_mha_spec("full", "down", layer_num=2, head_num=2, head_dim=4)
+    mamba = _make_mamba_spec2("mamba", "up")
+    spec = _make_spec_state_spec()
+    pool = UnifiedKVPool(
+        total_bytes=total_bytes,
+        sub_pool_specs=[full, spec, mamba],
+        device=_DEV,
+        enable_memory_saver=False,
+    )
+    fake = _FakeKVCache(max(pool.max_slots(s.name) for s in (full, mamba, spec)))
+    mamba_alloc = MultiEndedAllocator(
+        kvcache=fake,
+        unified_buffer=pool,
+        sub_pool_name="mamba",
+        device=_DEV,
+        is_id_owner=True,
+    )
+    full_alloc = MultiEndedAllocator(
+        kvcache=fake,
+        unified_buffer=pool,
+        sub_pool_name="full",
+        device=_DEV,
+        is_id_owner=True,
+    )
+    if float_cls is SpecStateBandAllocator:
+        band_alloc = SpecStateBandAllocator(
+            kvcache=fake,
+            unified_buffer=pool,
+            sub_pool_name="spec_state",
+            device=_DEV,
+        )
+    else:
+        band_alloc = float_cls(
+            kvcache=fake,
+            unified_buffer=pool,
+            sub_pool_name="spec_state",
+            device=_DEV,
+            **(float_kwargs or {}),
+        )
+    # End-to-end lazy/flush peers + explicit chain through the float middle.
+    mamba_alloc.bind_high_peer(band_alloc)
+    full_alloc.bind_low_peer(band_alloc)
+    mamba_alloc.bind_peer(full_alloc)
+    full_alloc.bind_peer(mamba_alloc)
+    band_alloc.bind_low_peer(mamba_alloc)
+    band_alloc.bind_high_peer(full_alloc)
+    return pool, mamba_alloc, band_alloc, full_alloc, fake
+
+
+def _make_mamba_spec2(name, grow, layer_num=2):
+    return MambaSubPoolSpec(
+        name=name,
+        layer_num=layer_num,
+        conv_state_shapes=((2, 3),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(2, 2),
+        temporal_dtype=torch.float32,
+        grow_direction=grow,
+    )
+
+
+class TestChainFrontierBackCompat(unittest.TestCase):
+    """N=2 gap math must be byte-identical through the chain helpers."""
+
+    def test_two_pool_available_matches_manual_gap(self):
+        full = _make_mha_spec("full", "down", layer_num=2, head_num=2, head_dim=4)
+        mamba = _make_mamba_spec2("mamba", "up")
+        total = 4096
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        fake = _FakeKVCache(pool.max_slots("full"))
+        fa = MultiEndedAllocator(
+            kvcache=fake,
+            unified_buffer=pool,
+            sub_pool_name="full",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        ma = MultiEndedAllocator(
+            kvcache=fake,
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        fa.bind_peer(ma)
+        ma.bind_peer(fa)
+        self.assertIsNotNone(ma.alloc(5))
+        self.assertIsNotNone(fa.alloc(11))
+        # Old single-peer formula, computed by hand:
+        for a, peer in ((ma, fa), (fa, ma)):
+            if a.grow_direction == "up":
+                gap = peer._byte_low_frontier() - a._byte_high_frontier()
+            else:
+                gap = a._byte_low_frontier() - peer._byte_high_frontier()
+            pages_by_bytes = max(0, gap) // a.entry_bytes_per_page
+            index_room = a.num_pages - a.min_page_index - a._allocated_pages()
+            self.assertEqual(a.available_size(), min(pages_by_bytes, index_room))
+
+
+class TestSpecStateBandAllocator(unittest.TestCase):
+    def test_empty_band_is_transparent(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band._is_frontier_transparent())
+        # Ends must see straight through to each other (same as a 2-pool config).
+        self.assertEqual(
+            ma._chain_low_frontier_above_bytes(), fa._byte_low_frontier()
+        )
+        self.assertEqual(
+            fa._chain_high_frontier_below_bytes(), ma._byte_high_frontier()
+        )
+
+    def test_place_band_binds_rows_and_blocks_ends(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        avail_full_before = fa.available_size()
+        self.assertTrue(band.place_band(4))
+        self.assertEqual(band.allocated_count(), 4)
+        self.assertGreaterEqual(band.band_start_page, band.min_page_index)
+        # v2p: row r -> band_start + r; standard translate API.
+        rows = torch.arange(4, dtype=torch.int64)
+        phys = band.translate_kv_loc(rows)
+        expected = band.band_start_page + rows
+        self.assertTrue(torch.equal(phys, expected))
+        # Placed band is opaque: the full end's gap now stops at the band.
+        self.assertEqual(
+            fa._chain_high_frontier_below_bytes(), band._byte_high_frontier()
+        )
+        self.assertLess(fa.available_size(), avail_full_before)
+
+    def test_default_placement_hugs_low_side(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band.place_band(4))
+        lo, _hi = band._region_bounds_pages()
+        self.assertEqual(band.band_start_page, lo)
+        self.assertTrue(band.place_band(4, prefer_side="high"))
+        lo2, hi2 = band._region_bounds_pages()
+        self.assertEqual(band.band_start_page, hi2 - 4)
+
+    def test_unplaced_rows_translate_to_sink(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band.place_band(2))
+        rows = torch.arange(5, dtype=torch.int64)
+        phys = band.translate_kv_loc(rows)
+        self.assertTrue(torch.all(phys[2:] == 0))  # tombstone -> sink clamp
+
+    def test_relocation_across_placements(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        # Park high so the low end can grow underneath.
+        self.assertTrue(band.place_band(4, prefer_side="high"))
+        start_a = band.band_start_page
+        # Grow the low end so the region's lo bound moves up.
+        self.assertIsNotNone(ma.alloc(24))
+        self.assertTrue(band.place_band(3))  # default: hug the (new) low bound
+        start_b = band.band_start_page
+        self.assertNotEqual(start_a, start_b)
+        lo, _hi = band._region_bounds_pages()
+        self.assertEqual(start_b, lo)
+        rows = torch.arange(3, dtype=torch.int64)
+        self.assertTrue(torch.equal(band.translate_kv_loc(rows), start_b + rows))
+        # Rows beyond the new bs are tombstoned even though bs shrank.
+        self.assertEqual(int(band.translate_kv_loc(torch.tensor([3])).item()), 0)
+
+    def test_place_band_failure_leaves_state_unchanged(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band.place_band(4, prefer_side="high"))
+        start = band.band_start_page
+        self.assertIsNotNone(ma.alloc(24))  # shrink the region
+        lo, hi = band._region_bounds_pages()
+        too_big = (hi - lo) + 1
+        capacity = band.num_pages - band.min_page_index
+        self.assertLessEqual(too_big, capacity)  # guard must not be vacuous
+        self.assertFalse(band.place_band(too_big))
+        self.assertEqual(band.band_start_page, start)
+        self.assertEqual(band.allocated_count(), 4)
+        rows = torch.arange(4, dtype=torch.int64)
+        self.assertTrue(torch.equal(band.translate_kv_loc(rows), start + rows))
+
+    def test_pin_blocks_placement(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band.place_band(2))
+        band.pin_band()
+        with self.assertRaises(AssertionError):
+            band.place_band(3)
+        band.unpin_band()
+        self.assertTrue(band.place_band(3))
+
+    def test_shrink_to_zero_restores_transparency(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        avail_before = fa.available_size()
+        self.assertTrue(band.place_band(6))
+        self.assertLess(fa.available_size(), avail_before)
+        self.assertTrue(band.place_band(0))
+        self.assertTrue(band._is_frontier_transparent())
+        self.assertEqual(fa.available_size(), avail_before)
+
+    def test_band_rejects_per_slot_api(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        for call in (
+            lambda: band.alloc(1),
+            lambda: band.free(torch.tensor([1])),
+            lambda: band.take_physical(1),
+            lambda: band.alloc_with_virtual(torch.tensor([1])),
+        ):
+            with self.assertRaises(AssertionError):
+                call()
+
+
+class TestFloatMultiEndedAllocator(unittest.TestCase):
+    """General per-slot float middle pool (§6.4): smart-direction alloc +
+    tighter-side compaction. Unit-validated; production use arrives with the
+    first cache-class middle pool."""
+
+    def _make(self):
+        return _make_3pool_chain(
+            float_cls=FloatMultiEndedAllocator,
+            float_kwargs=dict(is_id_owner=True, page_size=1),
+        )
+
+    def test_alloc_from_empty_repositions_to_midpoint(self):
+        pool, ma, fl, fa, _ = self._make()
+        lo, hi = fl._region_bounds_pages()
+        v = fl.alloc(4)
+        self.assertIsNotNone(v)
+        expected_mid = lo + (hi - lo - 4) // 2
+        self.assertEqual(fl.low_wm_page, expected_mid)
+        self.assertEqual(fl.high_wm_page, expected_mid + 4)
+
+    def test_smart_direction_extends_roomier_side(self):
+        pool, ma, fl, fa, _ = self._make()
+        self.assertIsNotNone(fl.alloc(4))
+        # Shrink the high gap by growing the full (down) end a lot.
+        self.assertIsNotNone(fa.alloc(40))
+        lo, hi = fl._region_bounds_pages()
+        gap_low = fl.low_wm_page - lo
+        gap_high = hi - fl.high_wm_page
+        self.assertGreater(gap_low, gap_high)
+        low_before = fl.low_wm_page
+        self.assertIsNotNone(fl.alloc(3))
+        self.assertEqual(fl.low_wm_page, low_before - 3)  # extended low
+
+    def test_v2p_p2v_mutual_inverse_and_hole_free(self):
+        pool, ma, fl, fa, _ = self._make()
+        vs = fl.alloc(6)
+        self.assertIsNotNone(vs)
+        self._check_invariants(fl)
+
+    def _check_invariants(self, fl):
+        # Every page in the live band is bound, and v2p/p2v are inverses.
+        for p in range(fl.low_wm_page, fl.high_wm_page):
+            v = int(fl.physical_to_virtual[p].item())
+            self.assertNotEqual(v, -1)
+            self.assertEqual(int(fl.virtual_to_physical[v].item()), p)
+
+    def test_free_compacts_tighter_side_and_moves_data(self):
+        pool, ma, fl, fa, fake = self._make()
+        vs = fl.alloc(7)
+        self.assertIsNotNone(vs)
+        # Mark each physical slot with its virtual id.
+        phys = fl.virtual_to_physical[vs]
+        fake.buf[phys] = vs
+        # Make the high side the tighter one.
+        self.assertIsNotNone(fa.alloc(40))
+        lo, hi = fl._region_bounds_pages()
+        self.assertLessEqual(hi - fl.high_wm_page, fl.low_wm_page - lo)
+        high_before = fl.high_wm_page
+        free_vs = vs[torch.tensor([1, 3, 5])]
+        fl.free(free_vs)
+        # Tighter (high) side retreated by K=3.
+        self.assertEqual(fl.high_wm_page, high_before - 3)
+        self._check_invariants(fl)
+        # Surviving virtual ids still find their data at their new physical.
+        keep = [int(v) for v in vs.tolist() if v not in set(free_vs.tolist())]
+        for v in keep:
+            p = int(fl.virtual_to_physical[v].item())
+            self.assertEqual(int(fake.buf[p].item()), v)
+
+    def test_backup_restore_roundtrip(self):
+        pool, ma, fl, fa, _ = self._make()
+        self.assertIsNotNone(fl.alloc(4))
+        snap = fl.backup_state()
+        low0, high0 = fl.low_wm_page, fl.high_wm_page
+        self.assertIsNotNone(fl.alloc(2))
+        fl.restore_state(snap)
+        self.assertEqual((fl.low_wm_page, fl.high_wm_page), (low0, high0))
+
+    def test_available_size_is_max_gap(self):
+        pool, ma, fl, fa, _ = self._make()
+        self.assertIsNotNone(fl.alloc(4))
+        lo, hi = fl._region_bounds_pages()
+        gap_low = fl.low_wm_page - lo
+        gap_high = hi - fl.high_wm_page
+        index_room = fl.num_pages - fl.min_page_index - fl._allocated_pages()
+        self.assertEqual(fl.available_size(), min(max(gap_low, gap_high), index_room))
 
 
 if __name__ == "__main__":
