@@ -190,6 +190,109 @@ class TestThreePoolChain(unittest.TestCase):
         self.assertFalse(torch.any(nz[(k + 1) * entry :]))
 
 
+class TestUnifiedMambaPoolSpecViews(unittest.TestCase):
+    """Step-6 gate: with spec decoding on, UnifiedMambaPool's intermediate_*
+    are strided views into the SAME `_raw` byte buffer (the spec_state band
+    sub-pool), not private torch.zeros."""
+
+    def _make(self, D=3, spec_state_size=4):
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+
+        full = _mha_spec("full", "down")
+        mamba = _mamba_spec("mamba", "up")
+        spec = SpecStateSubPoolSpec(
+            name="spec_state",
+            layer_num=mamba.layer_num,
+            num_draft_tokens=D,
+            conv_window_shapes=mamba.conv_state_shapes,
+            conv_dtype=mamba.conv_dtype,
+            ssm_state_shape=mamba.temporal_state_shape,
+            ssm_dtype=mamba.temporal_dtype,
+        )
+        base_bytes = 1 << 14
+        total = base_bytes + (spec_state_size + 1) * spec.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, mamba, spec],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        mamba_pool = UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=spec_state_size,
+            mamba_layer_ids=list(range(mamba.layer_num)),
+            speculative_num_draft_tokens=D,
+            spec_state_sub_pool="spec_state",
+        )
+        return pool, mamba_pool, spec, D
+
+    def test_intermediates_are_buffer_views(self):
+        pool, mamba_pool, spec, D = self._make()
+        inter_ssm = mamba_pool.mamba_cache.intermediate_ssm
+        inter_conv = mamba_pool.mamba_cache.intermediate_conv_window[0]
+        # Same storage as the unified byte buffer — no private allocation.
+        self.assertEqual(
+            inter_ssm.untyped_storage().data_ptr(),
+            pool._raw.untyped_storage().data_ptr(),
+        )
+        self.assertEqual(
+            inter_conv.untyped_storage().data_ptr(),
+            pool._raw.untyped_storage().data_ptr(),
+        )
+        # Consumer-visible ranks: [L, slots, D, *state_shape].
+        L = spec.layer_num
+        self.assertEqual(inter_ssm.shape[:1], (L,))
+        self.assertEqual(inter_ssm.shape[2], D)
+        self.assertEqual(tuple(inter_ssm.shape[3:]), tuple(spec.ssm_state_shape))
+        self.assertEqual(tuple(inter_conv.shape[3:]), tuple(spec.conv_window_shapes[0]))
+        # Outer dim spans the whole buffer (>= spec_state_size + 1).
+        self.assertGreaterEqual(inter_ssm.shape[1], 4 + 1)
+
+    def test_spec_missing_sub_pool_is_loud(self):
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+
+        full = _mha_spec("full", "down")
+        mamba = _mamba_spec("mamba", "up")
+        pool = UnifiedKVPool(
+            total_bytes=1 << 14,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        with self.assertRaises(AssertionError):
+            UnifiedMambaPool(
+                unified_buffer=pool,
+                sub_pool_name="mamba",
+                spec_state_size=4,
+                mamba_layer_ids=list(range(mamba.layer_num)),
+                speculative_num_draft_tokens=3,
+                spec_state_sub_pool=None,
+            )
+
+    def test_spec_off_matches_two_pool_footprint(self):
+        # With spec off, no third pool and no extra bytes — the exact old path.
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+
+        full = _mha_spec("full", "down")
+        mamba = _mamba_spec("mamba", "up")
+        pool = UnifiedKVPool(
+            total_bytes=1 << 14,
+            sub_pool_specs=[full, mamba],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        mamba_pool = UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=4,
+            mamba_layer_ids=list(range(mamba.layer_num)),
+            speculative_num_draft_tokens=None,
+            spec_state_sub_pool=None,
+        )
+        self.assertFalse(hasattr(mamba_pool.mamba_cache, "intermediate_ssm"))
+
+
 class TestSweepValidation(unittest.TestCase):
     def test_rejects_two_up_pools(self):
         with self.assertRaises(AssertionError):

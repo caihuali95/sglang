@@ -148,6 +148,12 @@ class ModelRunnerKVCacheMixin:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
+        # The spec-decode intermediate reservation below is sized by a
+        # capped-request count; record it so the unified pool's spec-state
+        # band uses the SAME count (accounting must not drift — the deduction
+        # and the sub-pool budget describe the same bytes).
+        self.mamba_spec_state_size: Optional[int] = None
+
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
@@ -167,6 +173,7 @@ class ModelRunnerKVCacheMixin:
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                self.mamba_spec_state_size = capped_reqs
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
@@ -183,6 +190,7 @@ class ModelRunnerKVCacheMixin:
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                self.mamba_spec_state_size = server_args.max_mamba_cache_size
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
@@ -216,6 +224,7 @@ class ModelRunnerKVCacheMixin:
                 )
                 intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                self.mamba_spec_state_size = capped_reqs
             else:
                 server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
 
@@ -410,6 +419,12 @@ class ModelRunnerKVCacheMixin:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # Spec-state band slot count: the SAME capped-request count
+            # handle_max_mamba_cache reserved intermediate bytes for (falls
+            # back to max_num_reqs inside the factory when None). Direct
+            # access: handle_max_mamba_cache always runs before pool init for
+            # mambaish configs.
+            spec_state_size=self.mamba_spec_state_size,
         )
         self.req_to_token_pool = bundle.req_to_token_pool
         self.token_to_kv_pool = bundle.token_to_kv_pool

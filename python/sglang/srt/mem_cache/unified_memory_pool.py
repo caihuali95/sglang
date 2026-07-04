@@ -623,6 +623,7 @@ class UnifiedMambaPool(MambaPool):
         mamba_layer_ids: List[int],
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        spec_state_sub_pool: Optional[str] = None,
     ):
         spec = unified_buffer.mamba_spec(sub_pool_name)
         assert spec.layer_num == len(mamba_layer_ids)
@@ -656,45 +657,34 @@ class UnifiedMambaPool(MambaPool):
             conv_views[0].shape[1] == self._max_size + 1
         ), f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
 
-        # Per-draft-token intermediate buffers have a different outer size
-        # (spec_state_size+1), so they're NOT in the shared buffer; allocate locally.
-        temporal_state_shape = spec.temporal_state_shape
-        conv_state_shape = spec.conv_state_shapes
-        conv_dtype = spec.conv_dtype
-        ssm_dtype = spec.temporal_dtype
+        # Spec-decode intermediates live in the shared buffer as the
+        # "spec_state" float band sub-pool: DENSE envelope views addressed by
+        # PHYSICAL band slots (row r of the current verify batch -> physical
+        # slot band_start + r via the band allocator's v2p). The views span
+        # the whole buffer (their outer dim is max_slots, > spec_state_size+1);
+        # only the placed band's rows ever hold live data.
         if speculative_num_draft_tokens is not None:
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        self.num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device=unified_buffer.device,
-                )
-                intermediate_conv_window_cache = [
-                    torch.zeros(
-                        size=(
-                            self.num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            cshape[0],
-                            cshape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device=unified_buffer.device,
-                    )
-                    for cshape in conv_state_shape
-                ]
+            assert spec_state_sub_pool is not None, (
+                "UnifiedMambaPool: speculative decoding needs a spec_state "
+                "sub-pool in the unified buffer (spec_state_sub_pool=None)"
+            )
+            spec_spec = unified_buffer.spec_state_spec(spec_state_sub_pool)
+            assert spec_spec.layer_num == self.num_mamba_layers
+            assert spec_spec.num_draft_tokens == speculative_num_draft_tokens
+            assert unified_buffer.max_slots(spec_state_sub_pool) >= (
+                spec_state_size + 1
+            ), (
+                f"spec_state sub-pool fits {unified_buffer.max_slots(spec_state_sub_pool)} "
+                f"slots < spec_state_size+1 = {spec_state_size + 1}"
+            )
+            ssm_view, conv_window_views = unified_buffer.spec_state_views_for(
+                spec_state_sub_pool
+            )
             self.mamba_cache = self.SpeculativeState(
                 conv=list(conv_views),
                 temporal=temporal_view,
-                intermediate_ssm=intermediate_ssm_state_cache,
-                intermediate_conv_window=intermediate_conv_window_cache,
+                intermediate_ssm=ssm_view,
+                intermediate_conv_window=list(conv_window_views),
             )
         else:
             self.mamba_cache = self.State(conv=list(conv_views), temporal=temporal_view)
@@ -832,9 +822,11 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         speculative_num_draft_tokens: Optional[int] = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        spec_state_sub_pool: Optional[str] = None,
     ):
         self._unified_buffer = unified_buffer
         self._mamba_sub_pool_name = mamba_sub_pool_name
+        self._spec_state_sub_pool = spec_state_sub_pool
         self._shared_mamba_size = (
             unified_buffer.max_slots(mamba_sub_pool_name) - 1
         )  # reserve slot 0
@@ -886,6 +878,7 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
             mamba_layer_ids=mamba_layer_ids,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            spec_state_sub_pool=self._spec_state_sub_pool,
         )
         # Wired in by init_unified_mamba_pools once the mamba allocator exists.
         self.mamba_allocator = None
@@ -953,6 +946,7 @@ def init_unified_mamba_pools(
     mamba_full_memory_ratio: Optional[float] = None,  # informational only
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
+    spec_state_size: Optional[int] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -986,13 +980,39 @@ def init_unified_mamba_pools(
         temporal_dtype=cp.dtype.temporal,
         grow_direction="up",
     )
+    sub_pool_specs: List[SubPoolSpecLike] = [full_spec, mamba_spec]
     total_bytes = (
         max_total_num_tokens * full_spec.entry_bytes()
         + max_mamba_cache_size * mamba_spec.entry_bytes()
     )
+    # Spec decoding: insert the intermediate-state float band as a MIDDLE
+    # sub-pool and grow the budget by its worst-case band (spec_state_size + 1
+    # slots — one per verify-batch row plus the reserved slot 0). At runtime
+    # the band occupies exactly the current verify bs; the rest of these bytes
+    # sit in the gaps, available to full/mamba growth.
+    spec_state_sub_pool: Optional[str] = None
+    if speculative_num_draft_tokens is not None:
+        if spec_state_size is None:
+            spec_state_size = max_num_reqs
+        spec_state_sub_pool = "spec_state"
+        spec_state_spec = SpecStateSubPoolSpec(
+            name=spec_state_sub_pool,
+            layer_num=len(mamba_layer_ids),
+            num_draft_tokens=speculative_num_draft_tokens,
+            conv_window_shapes=tuple(
+                tuple(int(x) for x in s) for s in cp.shape.conv
+            ),
+            conv_dtype=cp.dtype.conv,
+            ssm_state_shape=tuple(int(x) for x in cp.shape.temporal),
+            ssm_dtype=cp.dtype.temporal,
+        )
+        sub_pool_specs.append(spec_state_spec)
+        total_bytes += (spec_state_size + 1) * spec_state_spec.entry_bytes()
+    else:
+        spec_state_size = max_num_reqs
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
-        sub_pool_specs=[full_spec, mamba_spec],
+        sub_pool_specs=sub_pool_specs,
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
@@ -1001,7 +1021,7 @@ def init_unified_mamba_pools(
         unified_buffer=shared_pool,
         mamba_sub_pool_name="mamba",
         size=max_num_reqs,
-        mamba_spec_state_size=max_num_reqs,  # outer dim of spec-decode intermediates
+        mamba_spec_state_size=spec_state_size,  # outer dim of spec-decode intermediates
         max_context_len=model_context_len + extra_max_context_len,
         device=device,
         enable_memory_saver=enable_memory_saver,
@@ -1011,6 +1031,7 @@ def init_unified_mamba_pools(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
+        spec_state_sub_pool=spec_state_sub_pool,
     )
     unified_full_kv_pool = UnifiedMHATokenToKVPool(
         unified_buffer=shared_pool,
@@ -1044,6 +1065,7 @@ def init_unified_mamba_pools(
         need_sort=need_sort,
         forward_stream=forward_stream,
         lazy_compaction=lazy_compaction,
+        spec_state_sub_pool=spec_state_sub_pool,
     )
 
     # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
