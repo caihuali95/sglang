@@ -559,15 +559,36 @@ class ModelRunnerKVCacheMixin:
             if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 self._init_unified_swa_pools(max_num_reqs)
                 return
-            # Fail loud, not silently fall through to the normal pools (which would
-            # leave the flag a no-op). The feature replaces the HYBRID pools only.
-            raise ValueError(
-                "--enable-unified-memory only supports hybrid Mamba and "
-                "hybrid sliding-window-attention models (DeepSeek-V4 excluded); "
-                f"the current model ({self.model_config.hf_config.architectures}) "
-                "is neither, so the unified memory pool cannot be built. Drop "
-                "--enable-unified-memory for this model."
+            if (
+                self.use_mla_backend
+                or is_deepseek_v4(self.model_config.hf_config)
+            ):
+                # MLA-family / DSV4: their pool stacks (latent KV,
+                # compress-state rings) have no unified layout yet — fail
+                # loud, not silently fall through.
+                raise ValueError(
+                    "--enable-unified-memory does not support MLA-family or "
+                    "DeepSeek-V4 models yet; the current model "
+                    f"({self.model_config.hf_config.architectures}) is one. "
+                    "Drop --enable-unified-memory for this model."
+                )
+            # NON-HYBRID dense model: a single KV pool has nothing to share, so
+            # the unified machinery (virtual-id translation) would be pure
+            # overhead. Gracefully fall back to the standard pools/allocators —
+            # keeping the page-major envelope KV layout, which works for a
+            # single pool with identity addressing
+            # (enable_page_major_kv_layout stays True; the standard path picks
+            # PageMajorMHATokenToKVPool). Flip the flag so the scheduler's
+            # unified-only allocator hooks (flush_opportunistic /
+            # set_inflight_forward) see the real mode.
+            logger.warning(
+                "[unified-memory-pool] %s is not a hybrid model; falling back "
+                "to standard pools/allocators with the page-major envelope KV "
+                "layout (no virtual-id translation). Speculative decoding uses "
+                "the standard path.",
+                self.model_config.hf_config.architectures,
             )
+            self.server_args.enable_unified_memory = False
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:

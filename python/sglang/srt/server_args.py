@@ -6320,10 +6320,26 @@ class ServerArgs:
         assert self.disaggregation_mode == "null", (
             "--enable-unified-memory is not yet compatible with PD " "disaggregation."
         )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        # Speculative decoding: positive allow-list. EAGLE / EAGLE3 (incl.
+        # GDN/Qwen3-Next MTP, which runs under EAGLE) and NGRAM (target-only)
+        # share the validated prepare/commit choke points that drive the
+        # spec-state band. Everything else stays a loud error:
+        # - FROZEN_KV_MTP hides inside is_eagle() — excluded by identity: its
+        #   draft aliases the TARGET pool, which the unified draft rule
+        #   (virtual-indexed private pool) has not been validated against.
+        # - DFLASH commits mamba states outside commit_mamba_states_after_verify
+        #   (dflash_worker_v2 calls the backend hook directly), bypassing the
+        #   band pin/unpin window.
+        # - STANDALONE runs a full-model draft; its pool sizing/translation
+        #   story is unvalidated.
+        if self.speculative_algorithm is not None:
+            _allowed_spec_algos = ("EAGLE", "EAGLE3", "NGRAM")
+            if self.speculative_algorithm.upper() not in _allowed_spec_algos:
+                raise ValueError(
+                    "--enable-unified-memory supports speculative decoding "
+                    f"only for {_allowed_spec_algos}; got "
+                    f"{self.speculative_algorithm!r}. Drop one of the two flags."
+                )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
