@@ -519,6 +519,32 @@ class ModelRunnerKVCacheMixin:
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
+        # DRAFT worker under a unified-pool TARGET: the shared allocator mints
+        # VIRTUAL token ids in [0, max_slots) — larger than
+        # max_total_num_tokens because the byte budget also covers the
+        # mamba/spec bands. The draft's PRIVATE KV pool is virtual-indexed
+        # (its attention backends skip the v2p translate; see
+        # TritonAttnBackend), so it must span the whole virtual-id space.
+        if self.is_draft_worker and self.token_to_kv_pool_allocator is not None:
+            full_mea = getattr(
+                self.token_to_kv_pool_allocator, "full_attn_allocator", None
+            )
+            if full_mea is not None:
+                virtual_capacity = full_mea.num_pages * full_mea.page_size
+                if virtual_capacity > self.max_total_num_tokens:
+                    logger.info(
+                        "[unified-memory-pool] draft worker: sizing the private "
+                        "KV pool to the shared virtual-id capacity %d "
+                        "(was max_total_num_tokens=%d; overshoot %.1f%% on the "
+                        "draft's few layers).",
+                        virtual_capacity,
+                        self.max_total_num_tokens,
+                        100.0
+                        * (virtual_capacity - self.max_total_num_tokens)
+                        / max(1, self.max_total_num_tokens),
+                    )
+                    self.max_total_num_tokens = virtual_capacity
+
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).

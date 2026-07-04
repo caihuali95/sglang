@@ -152,8 +152,16 @@ class TritonAttnBackend(AttentionBackend):
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
         # kernels need PHYSICAL. Applied eagerly so the captured graph has no translate.
-        self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc", None
+        # DRAFT worker: hook stays None even though the allocator is the shared
+        # unified composite — the draft's PRIVATE KV pool is indexed by VIRTUAL
+        # token ids (relocation-stable; compaction moves TARGET-pool bytes only,
+        # so translating to target-physical here would read the wrong draft
+        # slots). The draft's mamba states live in the SHARED pool and keep
+        # their own translate (_translate_mamba_indices).
+        self._translate_kv_loc = (
+            None
+            if model_runner.is_draft_worker
+            else getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
         )
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
@@ -472,6 +480,12 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     token_to_kv_pool=self.token_to_kv_pool,
                     window_kv_indices=window_kv_indices,
+                    # Unified pool: leave the window VIRTUAL here — the deferred
+                    # cuda-graph translate (_translate_cuda_graph_shared_pool_locs)
+                    # applies full->swa exactly once. Without this the window
+                    # would be translated TWICE (here + deferred), reading wrong
+                    # slots. Mirrors _update_decode_kv_buffers.
+                    skip_full_to_swa_translation=(self._translate_kv_loc is not None),
                 )
             )
         custom_mask = self.cuda_graph_custom_mask
@@ -795,6 +809,11 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 kv_indices,
             )
+            # Unified pool read path: req_to_token rows hold VIRTUAL ids;
+            # translate to physical for the verify attention read (mirrors the
+            # decode/extend branches — this branch was the missing one).
+            if self._translate_kv_loc is not None:
+                kv_indices = self._translate_kv_loc(kv_indices)
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 # window_kv_offsets gives the start position in custom mask
