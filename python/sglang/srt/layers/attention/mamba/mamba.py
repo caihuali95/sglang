@@ -647,9 +647,12 @@ class MambaMixer2(torch.nn.Module):
                     layer_cache, MambaPool.SpeculativeState
                 ), "layer_cache must be SpeculativeState for speculative decoding"
                 draft_token_num = metadata.draft_token_num
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes, dtype=torch.int32, device=state_indices_tensor_d.device
-                )
+                # Per-verify-row intermediate indices from the metadata's static
+                # buffer (identity rows for the dense pool; translated physical
+                # band slots under the unified pool).
+                self.intermediate_state_indices = metadata.intermediate_state_indices[
+                    :num_decodes
+                ]
 
                 # Reshape for batch processing
                 hidden_states_B_C_d_reshaped = hidden_states_B_C_d.view(

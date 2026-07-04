@@ -284,9 +284,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
-        self.verify_intermediate_state_indices = torch.arange(
-            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
-        )
+        # Per-verify-row intermediate indices now come from the metadata's
+        # static buffer (identity rows for the dense pool; translated physical
+        # band slots under the unified pool).
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -421,7 +421,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = self.verify_intermediate_state_indices
+            intermediate_state_indices = forward_metadata.intermediate_state_indices
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 

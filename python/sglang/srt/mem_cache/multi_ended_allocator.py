@@ -2218,9 +2218,12 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.mamba_allocator.max_slots - 1
 
     def debug_print(self) -> str:
+        band = ""
+        if self.spec_state_allocator is not None:
+            band = f", spec-band=({self.spec_state_allocator.allocator_state_str()})"
         return (
             f"#full-available={self.full_attn_allocator.available_size()}, "
-            f"#mamba-available={self.mamba_allocator.available_size()}"
+            f"#mamba-available={self.mamba_allocator.available_size()}" + band
         )
 
     def get_kvcache(self):
@@ -2233,7 +2236,14 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "place_spec_state_band: composite was built without a spec-state "
             "sub-pool (spec decoding off)"
         )
-        return self.spec_state_allocator.place_band(num_slots, prefer_side)
+        ok = self.spec_state_allocator.place_band(num_slots, prefer_side)
+        if not ok and self.lazy_compaction:
+            # The inter-frontier region may be fragmented by lazy holes; one
+            # urgent end-pool flush retreats the frontiers, then retry once.
+            self.full_attn_allocator._flush(urgent=True)
+            self.mamba_allocator._flush(urgent=True)
+            ok = self.spec_state_allocator.place_band(num_slots, prefer_side)
+        return ok
 
     def pin_spec_state_band(self) -> None:
         if self.spec_state_allocator is not None:
@@ -2404,9 +2414,12 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free. Composite empty-set
-        fast-path skips both calls when neither side has work.
+        fast-path skips both calls when neither side has work. Also parks an
+        unpinned spec-state band (I-SPEC-3: on_idle leaves the band empty so
+        its bytes flow back to the ends between decode phases).
         """
         with record_function("UnifiedMambaAlloc.flush_opportunistic"):
+            self._reclaim_spec_state_band()
             fa = self.full_attn_allocator
             ma = self.mamba_allocator
             if (

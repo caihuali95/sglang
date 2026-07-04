@@ -37,6 +37,21 @@ class MambaAttnBackendBase(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = model_runner.server_args.enable_unified_memory
         self.forward_metadata: ForwardMetadata = None
+        # Spec-decode intermediate index plumbing. Static max-rows int32 buffer
+        # of per-verify-row indices into the intermediate_ssm /
+        # intermediate_conv_window buffers: identity rows for the dense pool
+        # (never rewritten), translated physical band slots under the unified
+        # pool (refreshed in-place each verify — captured graphs read the
+        # POINTER). getattr probe: only the unified mamba composite defines
+        # spec_state_allocator.
+        self._spec_state_allocator = getattr(
+            model_runner.token_to_kv_pool_allocator, "spec_state_allocator", None
+        )
+        self.intermediate_state_indices_buf = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=self.device
+        )
+        self._intermediate_row_arange: Optional[torch.Tensor] = None
+        self._intermediate_translate_staging: Optional[torch.Tensor] = None
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
         # each replay; the captured track-save reads this, not the InputBuffer slot.
@@ -99,12 +114,42 @@ class MambaAttnBackendBase(AttentionBackend):
         state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
         return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
 
+    def _refresh_intermediate_state_indices(self, num_rows: int) -> torch.Tensor:
+        """Refresh + return the static per-verify-row intermediate index buffer.
+
+        Dense pool: the buffer holds identity rows permanently — return as-is.
+        Unified pool: rows [0, num_rows) get the band's translated PHYSICAL
+        slots (band_start + row via the standard v2p gather); the tail is
+        zeroed so padded cuda-graph rows write into the reserved slot-0 sink.
+        Dummy verifies (warmup / capture warm-runs, band unplaced) translate to
+        all-sink — harmless by the `min_slot_index` invariant.
+        """
+        buf = self.intermediate_state_indices_buf
+        band = self._spec_state_allocator
+        if band is None:
+            return buf
+        if self._intermediate_translate_staging is None:
+            self._intermediate_row_arange = torch.arange(
+                buf.shape[0], dtype=torch.int64, device=self.device
+            )
+            self._intermediate_translate_staging = torch.empty(
+                buf.shape[0], dtype=torch.int64, device=self.device
+            )
+        n = min(int(num_rows), buf.shape[0])
+        if n > 0:
+            staging = self._intermediate_translate_staging[:n]
+            band.translate_kv_loc(self._intermediate_row_arange[:n], out=staging)
+            buf[:n].copy_(staging)  # int64 -> int32 cast copy
+        buf[n:].zero_()  # padded rows -> physical sink slot 0
+        return buf
+
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
 
         retrieve_next_token = None
         retrieve_next_sibling = None
         retrieve_parent_token = None
+        intermediate_state_indices = None
         track_conv_indices = None
         track_ssm_h_src = None
         track_ssm_h_dst = None
@@ -196,6 +241,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     dtype=torch.int32,
                     device=forward_batch.input_ids.device,
                 )
+                intermediate_state_indices = self._refresh_intermediate_state_indices(
+                    bs
+                )
 
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
@@ -245,6 +293,7 @@ class MambaAttnBackendBase(AttentionBackend):
             retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
+            intermediate_state_indices=intermediate_state_indices,
             track_conv_indices=track_conv_indices,
             track_ssm_h_src=track_ssm_h_src,
             track_ssm_h_dst=track_ssm_h_dst,
@@ -497,6 +546,15 @@ class MambaAttnBackendBase(AttentionBackend):
             else None
         )
 
+        # Capture records the POINTER to the static intermediate-index buffer;
+        # contents are refreshed in-place by _replay_metadata before each
+        # replay (identity/sink during the capture warm-run — harmless).
+        intermediate_state_indices = (
+            self.intermediate_state_indices_buf
+            if forward_mode.is_target_verify()
+            else None
+        )
+
         if forward_mode.is_target_verify() and self.topk > 1:
             # retrieve_* are None during capture, so skip the copy.
             return ForwardMetadata(
@@ -505,6 +563,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                intermediate_state_indices=intermediate_state_indices,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -512,6 +571,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                intermediate_state_indices=intermediate_state_indices,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -638,6 +698,15 @@ class MambaAttnBackendBase(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
+        # Refresh the static intermediate-index buffer in-place (the captured
+        # verify kernels read it by pointer): real rows get translated band
+        # slots (identity for the dense pool), padded rows route to the sink.
+        intermediate_state_indices = None
+        if forward_mode.is_target_verify():
+            intermediate_state_indices = self._refresh_intermediate_state_indices(
+                bs - int(num_padding)
+            )
+
         if forward_mode.is_target_verify() and self.topk > 1:
             if (
                 spec_info is not None
@@ -657,6 +726,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                intermediate_state_indices=intermediate_state_indices,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -665,6 +735,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_track_indices=track_buf,
+                intermediate_state_indices=intermediate_state_indices,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -1065,6 +1136,21 @@ class HybridLinearAttnBackend(AttentionBackend):
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
+
+        # Unified pool: the scatter kernels hardcode src row == verify row
+        # (src_idx = pid_req), so hand them the BAND SLICE of the full-span
+        # intermediate views — row r of the slice IS physical slot
+        # band_start + r. Legal because this runs OUTSIDE the captured verify
+        # graph (fresh base pointer per eager launch), unlike the in-graph
+        # write kernels which use the translated-indices path instead.
+        band = self.linear_attn_backend._spec_state_allocator
+        if band is not None:
+            start = band.band_start_page
+            stop = start + band.placed_num_slots
+            intermediate_state_cache = intermediate_state_cache[:, start:stop]
+            intermediate_conv_window_cache = intermediate_conv_window_cache[
+                :, start:stop
+            ]
 
         fused_mamba_state_scatter_with_mask(
             ssm_states,

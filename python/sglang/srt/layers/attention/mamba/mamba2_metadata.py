@@ -59,6 +59,13 @@ class ForwardMetadata:
     is_target_verify: bool = False
     draft_token_num: int = 1
 
+    # Spec-decode intermediate-state row indices (PHYSICAL, max-rows-sized;
+    # rows [0, verify bs) valid, tail routed to the slot-0 sink). Identity rows
+    # for the dense pool; translated band slots (band_start + row) under the
+    # unified pool. Backend-owned static buffer — captured verify graphs read
+    # it by pointer, refreshed in-place each build/replay.
+    intermediate_state_indices: Optional[torch.Tensor] = None
+
     has_mamba_track_mask: bool = False
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
@@ -194,6 +201,7 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
+            intermediate_state_indices=forward_metadata.intermediate_state_indices,
             num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
             num_prefills=0,
             num_prefill_tokens=0,
@@ -290,6 +298,7 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_final_src=forward_metadata.track_ssm_final_src,
             track_ssm_final_dst=forward_metadata.track_ssm_final_dst,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
+            intermediate_state_indices=forward_metadata.intermediate_state_indices,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,

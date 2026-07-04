@@ -301,12 +301,11 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 metadata,
             )
         elif self.linear_backend == "seg_la":
+            # Per-verify-row intermediate indices from the metadata's static
+            # buffer (identity rows for the dense pool; translated physical
+            # band slots under the unified pool).
             intermediate_state_indices = (
-                torch.arange(
-                    cache_indices.shape[0],
-                    dtype=torch.int32,
-                    device=cache_indices.device,
-                )
+                metadata.intermediate_state_indices[: cache_indices.shape[0]]
                 if forward_batch.forward_mode.is_target_verify()
                 else None
             )

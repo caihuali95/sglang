@@ -558,6 +558,38 @@ def move_accept_tokens_to_target_kvcache(
     )
 
 
+def _spec_state_band(batch: ScheduleBatch):
+    """The unified pool's spec-state band allocator, or None (non-unified
+    allocators / spec-off). getattr probe: only the unified mamba composite
+    defines it."""
+    return getattr(batch.token_to_kv_pool_allocator, "spec_state_allocator", None)
+
+
+def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
+    """Scheduler-side, per decode step: size the spec-state band to exactly
+    this batch's bs, place it at its best position (zero-copy; see
+    SpecStateBandAllocator.place_band), and PIN it. The pin window (invariant
+    I-SPEC-2) spans [here, commit_mamba_states_after_verify's finally] —
+    pinning at placement (not at verify prep) closes the gap where an
+    interleaved flush_opportunistic could park the freshly placed band and
+    silently route the verify to the sink. Runs post-retract in
+    prepare_for_decode, before the worker launch — the verify forward's bs
+    equals this bs. No-op for non-unified pools."""
+    band = _spec_state_band(batch)
+    if band is None:
+        return
+    bs = batch.batch_size()
+    if not batch.token_to_kv_pool_allocator.place_spec_state_band(bs):
+        raise RuntimeError(
+            f"spec-state band placement failed: bs={bs} slots do not fit "
+            "between the full/mamba frontiers even after an urgent flush. "
+            "The token/state pools have over-grown into the spec budget — "
+            "reduce --max-running-requests or increase --mem-fraction-static. "
+            f"Allocator: {batch.token_to_kv_pool_allocator.debug_print()}"
+        )
+    band.pin_band()
+
+
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """Rebuild mamba track indices from reqs before a TARGET_VERIFY forward.
 
@@ -592,6 +624,26 @@ def commit_mamba_states_after_verify(
     No-op for models without mamba-style state or backends without the
     commit hook.
     """
+    try:
+        _commit_mamba_states_after_verify_impl(
+            target_worker, batch, accept_lens, accept_index, draft_token_num
+        )
+    finally:
+        # End of the pin window (I-SPEC-2): the commit scatter is enqueued, so
+        # the band becomes movable again. Runs on every exit path, incl. the
+        # non-mamba early returns (unpin is a no-op when never pinned).
+        band = _spec_state_band(batch)
+        if band is not None:
+            band.unpin_band()
+
+
+def _commit_mamba_states_after_verify_impl(
+    target_worker: TpModelWorker,
+    batch: ScheduleBatch,
+    accept_lens: torch.Tensor,
+    accept_index: torch.Tensor,
+    draft_token_num: int,
+) -> None:
     model_runner = target_worker.model_runner
     if model_runner.mambaish_config is None:
         return
