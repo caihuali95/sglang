@@ -583,17 +583,30 @@ def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
     interleaved flush_opportunistic could park the freshly placed band and
     silently route the verify to the sink. Runs post-retract in
     prepare_for_decode, before the worker launch — the verify forward's bs
-    equals this bs. No-op for non-unified pools."""
+    equals this bs. No-op for non-unified pools.
+
+    Failure should be unreachable by construction: admission charges every
+    request's band slot via mamba_slot_full_token_cost, so the ends cannot
+    legally out-grow the band's budget. The RuntimeError is a fail-loud
+    backstop for accounting bugs, not a flow-control path.
+    """
     band = _spec_state_band(batch)
     if band is None:
         return
+    # A pin surviving to this point is provably stale (the scheduler thread is
+    # sequential, so no batch is in flight here): the previous iteration
+    # crashed between placement and commit. Recover instead of wedging every
+    # subsequent decode step on the place_band pin assert.
+    band.recover_stale_pin()
     bs = batch.batch_size()
     if not batch.token_to_kv_pool_allocator.place_spec_state_band(bs):
         raise RuntimeError(
             f"spec-state band placement failed: bs={bs} slots do not fit "
-            "between the full/mamba frontiers even after an urgent flush. "
-            "The token/state pools have over-grown into the spec budget — "
-            "reduce --max-running-requests or increase --mem-fraction-static. "
+            "between the full/mamba frontiers even after an urgent flush — "
+            "this indicates an admission-accounting bug "
+            "(mamba_slot_full_token_cost should reserve every request's band "
+            "slot). Workarounds: reduce --max-running-requests or increase "
+            "--mem-fraction-static. "
             f"Allocator: {batch.token_to_kv_pool_allocator.debug_print()}"
         )
     band.pin_band()
@@ -651,7 +664,9 @@ def _commit_mamba_states_after_verify_impl(
     batch: ScheduleBatch,
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
-    draft_token_num: int,
+    # num_X form per speculative-naming Rule 4; the public wrapper keeps its
+    # grandfathered `draft_token_num` name for API compatibility.
+    num_draft_tokens: int,
 ) -> None:
     model_runner = target_worker.model_runner
     if model_runner.mambaish_config is None:
@@ -665,8 +680,8 @@ def _commit_mamba_states_after_verify_impl(
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
         accept_indices_offset = torch.arange(
             0,
-            bs * draft_token_num,
-            step=draft_token_num,
+            bs * num_draft_tokens,
+            step=num_draft_tokens,
             dtype=accept_lens.dtype,
             device=accept_lens.device,
         )
@@ -717,6 +732,12 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
+    # Unified pool: place + pin the spec-state band for this step's verify.
+    # Lives HERE (the algorithm-agnostic dispatcher) rather than inside
+    # eagle_prepare_for_decode so every current and future spec algorithm's
+    # decode prepare gets the placement by construction — a verify without a
+    # placed band silently routes its intermediate states to the sink.
+    place_spec_state_band_for_decode(batch)
     if batch.spec_algorithm.is_dflash():
         batch.spec_info.prepare_for_decode(batch)
     else:

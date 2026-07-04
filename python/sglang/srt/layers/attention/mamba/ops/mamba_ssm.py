@@ -97,9 +97,8 @@ def _selective_scan_update_kernel(
     state_batch_indices_ptr,
     pad_slot_id,
     intermediate_states_buffer,
-    cache_steps,
     # (slot, step) strides of intermediate_states_buffer, in elements. Dense
-    # layouts have slot == cache_steps*nheads*dim*dstate and step ==
+    # layouts have slot == num_steps*nheads*dim*dstate and step ==
     # nheads*dim*dstate; the unified pool's envelope view is slot-strided, so
     # the wrapper passes the real strides.
     stride_inter_slot,
@@ -517,9 +516,10 @@ def selective_state_update(
             state_batch_indices,
             pad_slot_id,
             intermediate_states_buffer,
-            cache_steps if cache_steps is not None else 0,
             # Real (slot, step) strides: identical to the old hardcoded dense
             # math for contiguous buffers; required for unified envelope views.
+            # (`cache_steps` stays a wrapper param for API compat but no longer
+            # feeds the kernel — the strides carry the layout.)
             (
                 intermediate_states_buffer.stride(0)
                 if intermediate_states_buffer is not None

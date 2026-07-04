@@ -50,8 +50,11 @@ class MambaAttnBackendBase(AttentionBackend):
         self.intermediate_state_indices_buf = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=self.device
         )
-        self._intermediate_row_arange: Optional[torch.Tensor] = None
-        self._intermediate_translate_staging: Optional[torch.Tensor] = None
+        # High-water mark of rows the last unified refresh wrote: rows in
+        # [n, high) hold stale ids and must be re-routed to the sink on shrink.
+        # Starts at the full buffer (the initial identity contents are NOT
+        # sink-safe under the unified pool).
+        self._intermediate_rows_high = self.intermediate_state_indices_buf.shape[0]
         self.state_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
         # each replay; the captured track-save reads this, not the InputBuffer slot.
@@ -118,29 +121,44 @@ class MambaAttnBackendBase(AttentionBackend):
         """Refresh + return the static per-verify-row intermediate index buffer.
 
         Dense pool: the buffer holds identity rows permanently — return as-is.
-        Unified pool: rows [0, num_rows) get the band's translated PHYSICAL
-        slots (band_start + row via the standard v2p gather); the tail is
-        zeroed so padded cuda-graph rows write into the reserved slot-0 sink.
-        Dummy verifies (warmup / capture warm-runs, band unplaced) translate to
-        all-sink — harmless by the `min_slot_index` invariant.
+        Unified pool: rows [0, num_rows) get the band's PHYSICAL slots. The
+        band mapping is a CPU-known affine (`v2p[r] == band_start_page + r`,
+        both plain ints from `place_band`), so the refresh is ONE
+        `torch.arange(out=)` launch — no gather, no staging buffers. Rows
+        beyond the band (shrink tail, padded cuda-graph rows, dummy verifies
+        with an unplaced band) route to the physical slot-0 sink; the
+        `_intermediate_rows_high` high-water mark bounds the tail zeroing to
+        the actually-stale range (kernel-free in the steady-bs case).
         """
         buf = self.intermediate_state_indices_buf
         band = self._spec_state_allocator
         if band is None:
             return buf
-        if self._intermediate_translate_staging is None:
-            self._intermediate_row_arange = torch.arange(
-                buf.shape[0], dtype=torch.int64, device=self.device
-            )
-            self._intermediate_translate_staging = torch.empty(
-                buf.shape[0], dtype=torch.int64, device=self.device
-            )
         n = min(int(num_rows), buf.shape[0])
-        if n > 0:
-            staging = self._intermediate_translate_staging[:n]
-            band.translate_kv_loc(self._intermediate_row_arange[:n], out=staging)
-            buf[:n].copy_(staging)  # int64 -> int32 cast copy
-        buf[n:].zero_()  # padded rows -> physical sink slot 0
+        # I-SPEC-1: a PINNED band is a real verify placement and must cover
+        # every real row; a mismatch means the bs changed after
+        # place_spec_state_band_for_decode — fail loud, not silent sink
+        # corruption. Unpinned (dummy/warmup/capture) verifies legitimately
+        # run against an unplaced band: their rows go to the sink by design.
+        num_placed = band.num_placed_slots
+        assert not band._band_pinned or n <= num_placed, (
+            f"I-SPEC-1 violated: verify rows n={n} exceed the pinned band's "
+            f"num_placed_slots={num_placed} ({band.allocator_state_str()}); "
+            "the batch size changed between band placement and the verify "
+            "metadata build."
+        )
+        k = min(n, num_placed)
+        if k > 0:
+            torch.arange(
+                band.band_start_page,
+                band.band_start_page + k,
+                dtype=torch.int32,
+                device=self.device,
+                out=buf[:k],
+            )
+        if self._intermediate_rows_high > k:
+            buf[k : self._intermediate_rows_high].zero_()  # stale rows -> sink
+        self._intermediate_rows_high = k
         return buf
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
@@ -1146,7 +1164,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         band = self.linear_attn_backend._spec_state_allocator
         if band is not None:
             start = band.band_start_page
-            stop = start + band.placed_num_slots
+            stop = start + band.num_placed_slots
             intermediate_state_cache = intermediate_state_cache[:, start:stop]
             intermediate_conv_window_cache = intermediate_conv_window_cache[
                 :, start:stop

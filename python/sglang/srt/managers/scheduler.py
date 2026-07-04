@@ -3510,6 +3510,14 @@ class Scheduler(
 
         if self.server_args.enable_unified_memory:
             try:
+                # Park an unpinned spec-state band while fully idle (I-SPEC-3):
+                # its bytes flow back to the end pools until the next decode
+                # step re-places it. Mamba composite only (SWA has no band).
+                park_spec_state_band = getattr(
+                    self.token_to_kv_pool_allocator, "park_spec_state_band", None
+                )
+                if park_spec_state_band is not None:
+                    park_spec_state_band()
                 self.token_to_kv_pool_allocator.flush_opportunistic()
             except Exception:
                 pass

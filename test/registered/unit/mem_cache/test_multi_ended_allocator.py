@@ -3139,7 +3139,7 @@ class TestUnifiedMambaCompositeWithBand(unittest.TestCase):
         self.assertEqual((band.low_wm_page, band.high_wm_page), (low0, high0))
         comp.clear()
         self.assertEqual(band.allocated_count(), 0)
-        self.assertEqual(band.placed_num_slots, 0)
+        self.assertEqual(band.num_placed_slots, 0)
 
     def test_move_accept_kv_moves_full_physical(self):
         _, comp, kvcache = self._make()
@@ -3154,6 +3154,119 @@ class TestUnifiedMambaCompositeWithBand(unittest.TestCase):
         self.assertTrue(
             torch.equal(kvcache.full_kv_pool.buf[tgt_phys], src_v)
         )
+
+    def test_mamba_slot_cost_reserves_band_entry(self):
+        # Admission must charge each request's band slot alongside its mamba
+        # slot, or the ends out-grow the band's budget (review finding #1).
+        _, comp_spec, _ = self._make(spec_on=True)
+        _, comp_off, _ = self._make(spec_on=False)
+        full_entry = comp_off.full_attn_allocator.entry_bytes
+        mamba_entry = comp_off.mamba_allocator.entry_bytes_per_page
+        spec_entry = comp_spec.spec_state_allocator.entry_bytes_per_page
+        self.assertEqual(
+            comp_off.mamba_slot_full_token_cost(),
+            -(-mamba_entry // full_entry),
+        )
+        self.assertEqual(
+            comp_spec.mamba_slot_full_token_cost(),
+            -(-(mamba_entry + spec_entry) // full_entry),
+        )
+
+    def test_flush_opportunistic_does_not_park_band(self):
+        # Per-loop flushes must not churn a live band (review finding #5);
+        # parking is the explicit on_idle hook.
+        _, comp, _ = self._make()
+        self.assertTrue(comp.place_spec_state_band(4))
+        comp.flush_opportunistic()
+        self.assertEqual(comp.spec_state_allocator.num_placed_slots, 4)
+        comp.park_spec_state_band()
+        self.assertEqual(comp.spec_state_allocator.num_placed_slots, 0)
+        # A pinned band survives even the explicit park.
+        self.assertTrue(comp.place_spec_state_band(3))
+        comp.pin_spec_state_band()
+        comp.park_spec_state_band()
+        self.assertEqual(comp.spec_state_allocator.num_placed_slots, 3)
+
+
+class TestBandPlacementSemantics(unittest.TestCase):
+    def test_identity_placement_is_stable(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band.place_band(4))
+        start = band.band_start_page
+        v2p_before = band.virtual_to_physical.clone()
+        self.assertTrue(band.place_band(4))  # identical -> no-op fast path
+        self.assertEqual(band.band_start_page, start)
+        self.assertTrue(torch.equal(band.virtual_to_physical, v2p_before))
+
+    def test_shrink_tombstones_only_the_tail(self):
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band.place_band(5))
+        self.assertTrue(band.place_band(3))
+        rows = torch.arange(5, dtype=torch.int64)
+        phys = band.translate_kv_loc(rows)
+        expected = band.band_start_page + torch.arange(3, dtype=torch.int64)
+        self.assertTrue(torch.equal(phys[:3], expected))
+        self.assertTrue(torch.all(phys[3:] == 0))  # tombstone -> sink clamp
+
+    def test_recover_stale_pin_allows_next_placement(self):
+        # Review finding #3: a pin leaked by a crash between placement and
+        # commit must not wedge every subsequent decode step.
+        pool, ma, band, fa, _ = _make_3pool_chain()
+        self.assertTrue(band.place_band(2))
+        band.pin_band()  # simulate a crash: commit's unpin never ran
+        with self.assertRaises(AssertionError):
+            band.place_band(3)
+        band.recover_stale_pin()  # the sanctioned placement-point recovery
+        self.assertTrue(band.place_band(3))
+
+    def test_pinned_band_blocks_peer_hole_credit(self):
+        # Review finding #4: schedulable credit must not see through a pinned
+        # band to the far peer's drainable holes.
+        pool, ma, band, fa, fake = _make_3pool_chain()
+        # Rebuild the ends as LAZY allocators so hole credit is in play.
+        fa_lazy = MultiEndedAllocator(
+            kvcache=fake,
+            unified_buffer=pool,
+            sub_pool_name="full",
+            device=_DEV,
+            is_id_owner=True,
+            lazy_compaction=True,
+        )
+        ma_lazy = MultiEndedAllocator(
+            kvcache=fake,
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            device=_DEV,
+            is_id_owner=True,
+            lazy_compaction=True,
+        )
+        band2 = SpecStateBandAllocator(
+            kvcache=fake,
+            unified_buffer=pool,
+            sub_pool_name="spec_state",
+            device=_DEV,
+        )
+        ma_lazy.bind_high_peer(band2)
+        fa_lazy.bind_low_peer(band2)
+        ma_lazy.bind_peer(fa_lazy)
+        fa_lazy.bind_peer(ma_lazy)
+        band2.bind_low_peer(ma_lazy)
+        band2.bind_high_peer(fa_lazy)
+        # Give the mamba peer some drainable holes.
+        ma_lazy._free_phys_pages = torch.tensor([5, 6, 7], dtype=torch.int64)
+        credit_no_band = fa_lazy._peer_drainable_hole_bytes()
+        self.assertGreater(credit_no_band, 0)
+        # A placed UNPINNED band: credit includes peer holes + band bytes
+        # (both realizable: reclaim + urgent flush).
+        self.assertTrue(band2.place_band(4))
+        credit_unpinned = fa_lazy._peer_drainable_hole_bytes()
+        self.assertEqual(
+            credit_unpinned,
+            credit_no_band + 4 * band2.entry_bytes_per_page,
+        )
+        # PINNED band: nothing beyond it is reachable.
+        band2.pin_band()
+        self.assertEqual(fa_lazy._peer_drainable_hole_bytes(), 0)
 
 
 if __name__ == "__main__":

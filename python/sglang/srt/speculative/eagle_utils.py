@@ -606,16 +606,11 @@ def eagle_sample(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    from sglang.srt.speculative.spec_utils import (
-        assign_req_to_token_pool_func,
-        place_spec_state_band_for_decode,
-    )
+    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
     bs = batch.batch_size()
-    # Unified pool: size + place the spec-state band for this step's verify
-    # (exact-fit bs slots, freely relocated, zero-copy; no-op for non-unified
-    # pools). Scheduler-side, post-retract, before the worker launch.
-    place_spec_state_band_for_decode(batch)
+    # Spec-state band placement happens one level up in spec_prepare_for_decode
+    # (algorithm-agnostic).
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.

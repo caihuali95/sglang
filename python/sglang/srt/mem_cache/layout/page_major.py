@@ -27,6 +27,16 @@ def _prod(shape: Sequence[int]) -> int:
     return out
 
 
+def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
+    """Row-major strides (in elements) for a contiguous tensor of `shape`."""
+    strides = []
+    acc = 1
+    for s in reversed(shape):
+        strides.append(acc)
+        acc *= int(s)
+    return tuple(reversed(strides))
+
+
 def mha_entry_bytes(
     *, layer_num: int, head_num: int, head_dim: int, v_head_dim: int, itemsize: int
 ) -> int:
@@ -176,14 +186,6 @@ def build_spec_state_views(
         ssm_dtype=ssm_dtype,
     )
 
-    def contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
-        strides = []
-        acc = 1
-        for s in reversed(shape):
-            strides.append(acc)
-            acc *= int(s)
-        return tuple(reversed(strides))
-
     conv_itemsize = conv_dtype.itemsize
     assert entry_bytes % conv_itemsize == 0, (
         f"misaligned spec-state spec: per-slot entry_bytes={entry_bytes} is not "
@@ -206,7 +208,7 @@ def build_spec_state_views(
             num_draft_tokens * inner_elems,  # next layer
             entry_stride_conv_elems,  # next slot
             inner_elems,  # next draft step
-        ) + contiguous_strides(shape)
+        ) + _contiguous_strides(shape)
         conv_window_views.append(
             torch.as_strided(
                 as_conv_dtype,
@@ -243,7 +245,7 @@ def build_spec_state_views(
         num_draft_tokens * inner_elems,  # next layer
         entry_bytes // itemsize,  # next slot
         inner_elems,  # next draft step
-    ) + contiguous_strides(ssm_state_shape)
+    ) + _contiguous_strides(ssm_state_shape)
     ssm_view = torch.as_strided(
         as_ssm_dtype,
         size=(layer_num, max_slots, num_draft_tokens) + tuple(ssm_state_shape),
@@ -279,14 +281,6 @@ def build_page_major_mamba_views(
         temporal_dtype=temporal_dtype,
     )
 
-    def contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
-        strides = []
-        acc = 1
-        for s in reversed(shape):
-            strides.append(acc)
-            acc *= int(s)
-        return tuple(reversed(strides))
-
     conv_itemsize = conv_dtype.itemsize
     assert entry_bytes % conv_itemsize == 0, (
         f"misaligned mamba spec: per-slot entry_bytes={entry_bytes} is not a "
@@ -308,7 +302,7 @@ def build_page_major_mamba_views(
         stride = (
             inner_shape_bytes // conv_itemsize,
             conv_slot_stride_elems,
-        ) + contiguous_strides(shape)
+        ) + _contiguous_strides(shape)
         conv_views.append(
             torch.as_strided(
                 as_conv_dtype,
@@ -348,7 +342,7 @@ def build_page_major_mamba_views(
     stride = (
         inner_shape_bytes // itemsize,
         entry_bytes // itemsize,
-    ) + contiguous_strides(temporal_state_shape)
+    ) + _contiguous_strides(temporal_state_shape)
     temporal_view = torch.as_strided(
         as_temporal_dtype,
         size=(layer_num, max_slots) + tuple(temporal_state_shape),

@@ -452,11 +452,31 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def _peer_drainable_hole_bytes(self) -> int:
         """Gap bytes a peer urgent flush would release. Only `_free_phys_pages`
         count — NOT `_pending_reuse` (awaiting an event) — so the credit is realizable.
+
+        Chain-aware: a NON-transparent float band between us and the peer blocks
+        contiguous growth into the peer's territory. A PINNED band makes the
+        peer's holes unreachable (credit 0); an unpinned band is itself
+        reclaimable on the alloc-shortfall path (`_reclaim_spec_state_band`), so
+        its live bytes are credited alongside the peer's holes.
         """
         peer = self._peer
         if peer is None or not peer.lazy_compaction:
             return 0
-        return len(peer._free_phys_pages) * peer.entry_bytes_per_page
+        peer_hole_bytes = len(peer._free_phys_pages) * peer.entry_bytes_per_page
+        # Walk toward the peer; collect any float band standing in between.
+        blocker = self.high_peer if self.grow_direction == "up" else self.low_peer
+        band_bytes = 0
+        while blocker is not None and blocker is not peer:
+            if not blocker._is_frontier_transparent():
+                if getattr(blocker, "_band_pinned", False):
+                    return 0  # pinned band: nothing beyond it is reachable
+                band_bytes += (
+                    blocker._allocated_pages() * blocker.entry_bytes_per_page
+                )
+            blocker = (
+                blocker.high_peer if self.grow_direction == "up" else blocker.low_peer
+            )
+        return peer_hole_bytes + band_bytes
 
     def schedulable_available_size(self) -> int:
         """Tokens allocatable AFTER a peer urgent-flush (realizable-with-compaction).
@@ -1960,7 +1980,6 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
         # stay tombstoned; `translate_kv_loc` clamps them to physical 0 (sink).
         self.virtual_to_physical.fill_(-1)
         self.physical_to_virtual.fill_(-1)
-        self.placed_num_slots = 0
         self._band_pinned = False
 
     # -- band lifecycle --
@@ -1969,18 +1988,41 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
     def band_start_page(self) -> int:
         return self.low_wm_page
 
+    @property
+    def num_placed_slots(self) -> int:
+        """The band's current slot count — DERIVED from the watermarks (single
+        source of truth; a stored copy could desync under future mutators)."""
+        return self.high_wm_page - self.low_wm_page
+
     def pin_band(self) -> None:
         self._band_pinned = True
 
     def unpin_band(self) -> None:
         self._band_pinned = False
 
+    def recover_stale_pin(self) -> None:
+        """Clear a pin leaked by a previous iteration that crashed between
+        placement and commit. ONLY legal at the sanctioned scheduler-side
+        placement point (by then no batch is in flight — the scheduler thread
+        is sequential), so a surviving pin is provably stale. Everything else
+        keeps honoring the pin (I-SPEC-2)."""
+        if self._band_pinned:
+            logger.warning(
+                "SpecStateBandAllocator(%r): clearing a STALE pin at placement "
+                "time — the previous iteration likely failed between placement "
+                "and commit.",
+                self.sub_pool_name,
+            )
+            self._band_pinned = False
+
     def place_band(self, num_slots: int, prefer_side: str = "low") -> bool:
         """Size the band to exactly `num_slots` and place it in the current
         inter-frontier region, flush against the `prefer_side` neighbor
         (default "low": leaves maximal contiguous room for the grow-down end —
         the token pool, the fastest-growing in practice). Zero-copy: only
-        watermarks and `v2p[0..num_slots)` are rewritten. Returns False (state
+        watermarks and `v2p[0..num_slots)` are rewritten; an identical
+        placement (same start, same count) is a CPU-only no-op, and the
+        tombstone write covers only the shrink tail. Returns False (state
         unchanged) when the region cannot fit `num_slots` — the caller's
         decode-retract path handles it.
         """
@@ -1997,20 +2039,26 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
         lo, hi = self._region_bounds_pages()
         if num_slots > hi - lo:
             return False  # fail with state unchanged; caller retracts
-        if self.placed_num_slots > 0:
-            self.virtual_to_physical[: self.placed_num_slots] = -1
-        if num_slots == 0:
-            # Park empty at the region top; transparent to neighbors.
-            self.low_wm_page = self.high_wm_page = hi
-            self.placed_num_slots = 0
-            return True
-        start = lo if prefer_side == "low" else hi - num_slots
+        prev_num_slots = self.num_placed_slots
+        start = (
+            (lo if prefer_side == "low" else hi - num_slots) if num_slots > 0 else hi
+        )
+        if start == self.low_wm_page and num_slots == prev_num_slots:
+            return True  # identical placement (steady-state decode): no-op
+        # Tombstone only the SHRINK tail; rows [0, num_slots) are overwritten
+        # below (or the whole previous binding when parking to 0).
+        if prev_num_slots > num_slots:
+            self.virtual_to_physical[num_slots:prev_num_slots] = -1
         self.low_wm_page = start
         self.high_wm_page = start + num_slots
-        self.virtual_to_physical[:num_slots] = torch.arange(
-            start, start + num_slots, dtype=torch.int64, device=self.device
-        )
-        self.placed_num_slots = num_slots
+        if num_slots > 0:
+            torch.arange(
+                start,
+                start + num_slots,
+                dtype=torch.int64,
+                device=self.device,
+                out=self.virtual_to_physical[:num_slots],
+            )
         return True
 
     # -- band contract: no per-slot lifecycle --
@@ -2043,7 +2091,7 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
         return (
             f"sub_pool={self.sub_pool_name!r} (band-mode), "
             f"band=[{self.low_wm_page}, {self.high_wm_page}), "
-            f"placed_num_slots={self.placed_num_slots}, "
+            f"num_placed_slots={self.num_placed_slots}, "
             f"pinned={self._band_pinned}"
         )
 
@@ -2203,11 +2251,17 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         stays inside the JOINT budget. = mamba bytes/slot ÷ full bytes/token, rounded
         UP (conservative). Only on the shared composite (non-shared pools are separate,
         so the planner sources this via `getattr(..., None)`).
+
+        With spec decoding on, every admitted request ALSO occupies one
+        spec-state band slot at each verify step, so the band's per-request
+        entry is folded into the same admission charge — otherwise the ends
+        grow into the band's reserved region and `place_band(bs)` fails at the
+        next decode step (the eval_146 over-admission class).
         """
-        return -(
-            -self.mamba_allocator.entry_bytes_per_page
-            // self.full_attn_allocator.entry_bytes
-        )
+        per_req_bytes = self.mamba_allocator.entry_bytes_per_page
+        if self.spec_state_allocator is not None:
+            per_req_bytes += self.spec_state_allocator.entry_bytes_per_page
+        return -(-per_req_bytes // self.full_attn_allocator.entry_bytes)
 
     @property
     def size_full(self) -> int:
@@ -2263,12 +2317,27 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return False
         return band.place_band(0)
 
+    def park_spec_state_band(self) -> None:
+        """Idle housekeeping (I-SPEC-3): park an unpinned band so its bytes
+        flow back to the end pools while nothing is running. Called from
+        `Scheduler.on_idle` — NOT per scheduler loop, or a continuously
+        decoding band would churn park→re-place every step."""
+        self._reclaim_spec_state_band()
+
+    def _alloc_with_spec_band_reclaim(self, alloc_fn):
+        """Run `alloc_fn`; on shortfall, park an unpinned spec-state band
+        (zero-copy) and retry exactly once. One helper so every composite
+        alloc entry point shares identical shortfall-recovery behavior."""
+        out = alloc_fn()
+        if out is None and self._reclaim_spec_state_band():
+            out = alloc_fn()
+        return out
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedMambaAlloc.alloc"):
-            out = self.full_attn_allocator.alloc(need_size)
-            if out is None and self._reclaim_spec_state_band():
-                out = self.full_attn_allocator.alloc(need_size)
-            return out
+            return self._alloc_with_spec_band_reclaim(
+                lambda: self.full_attn_allocator.alloc(need_size)
+            )
 
     def alloc_extend(
         self,
@@ -2283,17 +2352,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Paged extend. Mamba state is per-request (doesn't advance per-token),
         so forward only to the full sub-allocator."""
         with record_function("UnifiedMambaAlloc.alloc_extend"):
-            out = self.full_attn_allocator.alloc_extend(
-                prefix_lens,
-                prefix_lens_cpu,
-                seq_lens,
-                seq_lens_cpu,
-                last_loc,
-                extend_num_tokens,
-                num_new_pages=num_new_pages,
-            )
-            if out is None and self._reclaim_spec_state_band():
-                out = self.full_attn_allocator.alloc_extend(
+            return self._alloc_with_spec_band_reclaim(
+                lambda: self.full_attn_allocator.alloc_extend(
                     prefix_lens,
                     prefix_lens_cpu,
                     seq_lens,
@@ -2302,7 +2362,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     extend_num_tokens,
                     num_new_pages=num_new_pages,
                 )
-            return out
+            )
 
     def alloc_decode(
         self,
@@ -2312,14 +2372,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ) -> Optional[torch.Tensor]:
         """Paged decode. Mamba side stays untouched per-decode."""
         with record_function("UnifiedMambaAlloc.alloc_decode"):
-            out = self.full_attn_allocator.alloc_decode(
-                seq_lens, seq_lens_cpu, last_loc
-            )
-            if out is None and self._reclaim_spec_state_band():
-                out = self.full_attn_allocator.alloc_decode(
+            return self._alloc_with_spec_band_reclaim(
+                lambda: self.full_attn_allocator.alloc_decode(
                     seq_lens, seq_lens_cpu, last_loc
                 )
-            return out
+            )
 
     def move_accept_kv(self, tgt_locs: torch.Tensor, src_locs: torch.Tensor) -> None:
         """Relocate accepted spec tokens' KV inside the full pool: VIRTUAL token
@@ -2414,12 +2471,13 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free. Composite empty-set
-        fast-path skips both calls when neither side has work. Also parks an
-        unpinned spec-state band (I-SPEC-3: on_idle leaves the band empty so
-        its bytes flow back to the ends between decode phases).
+        fast-path skips both calls when neither side has work. Does NOT touch
+        the spec-state band: this runs every scheduler loop, and parking a
+        continuously-decoding band here would churn park→re-place per step —
+        idle parking is `park_spec_state_band` (Scheduler.on_idle), and
+        under-pressure parking is the alloc-shortfall reclaim.
         """
         with record_function("UnifiedMambaAlloc.flush_opportunistic"):
-            self._reclaim_spec_state_band()
             fa = self.full_attn_allocator
             ma = self.mamba_allocator
             if (
@@ -2527,13 +2585,6 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             swa_allocator=self.swa_attn_allocator,
         )
 
-        # Ordered chain (low byte end -> high byte end), for uniformity with the
-        # mamba composite's N-way lifecycle ops. No float middles here (hybrid
-        # SWA has no spec-state band).
-        self.sub_allocators: List[MultiEndedAllocator] = sorted(
-            (self.full_attn_allocator, self.swa_attn_allocator),
-            key=lambda a: a.grow_direction != "up",
-        )
 
         self.is_not_in_free_group = True
         self.free_group: List[torch.Tensor] = []

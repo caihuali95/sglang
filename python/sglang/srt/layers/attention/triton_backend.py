@@ -651,12 +651,23 @@ class TritonAttnBackend(AttentionBackend):
         if self._translate_kv_loc is None:
             return None
         # Full-attention read path. kv_indptr[bs] == sum(padded seq_lens) ==
-        # forward_batch.seq_lens_sum, a CPU int the replay batch already carries;
-        # read it instead of a per-step D2H `.item()` sync. The `.item()` fallback
-        # covers only the gpu_only path where seq_lens_sum is None.
+        # forward_batch.seq_lens_sum, a CPU int the replay batch already carries
+        # (the replay wrapper adds the padded rows' fill contribution, keeping
+        # it equal to kv_indptr[bs]); read it instead of a per-step D2H
+        # `.item()` sync.
+        #
+        # The `.item()` fallbacks below CANNOT become asserts: gpu_only batches
+        # legitimately leave seq_lens_sum None AND seq_lens_cpu unset
+        # (forward_batch_info keeps them sync-free, see #26738). Worse, the
+        # replay wrapper hands out `buffers.seq_lens_cpu[:bs]` unconditionally
+        # while the buffer is only REFRESHED when the batch carries a CPU
+        # mirror — so under gpu_only the tensor is non-None but STALE. Use
+        # `seq_lens_sum is not None` as the single freshness signal for BOTH
+        # CPU-derived counts (the two fields are set/unset together).
+        cpu_mirrors_fresh = forward_batch.seq_lens_sum is not None
         n_kv = (
             forward_batch.seq_lens_sum
-            if forward_batch.seq_lens_sum is not None
+            if cpu_mirrors_fresh
             else int(self.kv_indptr[bs].item())
         )
         if n_kv > 0:
@@ -665,9 +676,9 @@ class TritonAttnBackend(AttentionBackend):
             )
         # SWA window read path (hybrid-SWA unified pools only). window_kv_indptr[bs]
         # == sum(min(seq_len, window)); compute it from the CPU seq_lens mirror
-        # instead of a D2H `.item()` (same fallback as n_kv above).
+        # when fresh, else fall back to the authoritative device counter.
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            if forward_batch.seq_lens_cpu is not None:
+            if cpu_mirrors_fresh and forward_batch.seq_lens_cpu is not None:
                 n_win = int(
                     forward_batch.seq_lens_cpu[:bs]
                     .clamp(max=self.sliding_window_size)

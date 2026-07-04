@@ -834,9 +834,8 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     scale,
     intermediate_states_buffer,
     intermediate_state_indices,
-    cache_steps,
     # (slot, step) strides of intermediate_states_buffer, in elements. Dense
-    # layouts have slot == cache_steps*HV*K*V and step == HV*K*V; the unified
+    # layouts have slot == num_steps*HV*K*V and step == HV*K*V; the unified
     # pool's envelope view is slot-strided, so the wrapper passes real strides.
     stride_inter_slot,
     stride_inter_step,
@@ -1060,9 +1059,10 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
-        cache_steps=0 if cache_steps is None else cache_steps,
         # Real (slot, step) strides: identical to the old hardcoded dense math
         # for contiguous buffers; required for the unified envelope views.
+        # (`cache_steps` stays a wrapper param for API compat but no longer
+        # feeds the kernel — the strides carry the layout.)
         stride_inter_slot=(
             intermediate_states_buffer.stride(0)
             if intermediate_states_buffer is not None
