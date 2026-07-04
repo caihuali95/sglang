@@ -163,6 +163,17 @@ class TritonAttnBackend(AttentionBackend):
             if model_runner.is_draft_worker
             else getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
         )
+        if self._translate_kv_loc is not None:
+            # Unified pool: the CG replay-prep translate needs the exact filled
+            # counts (kv_indptr[bs] / the window sum), sourced from
+            # seq_lens_sum / seq_lens_cpu. Triton normally opts OUT of the
+            # FutureMap's CPU-mirror publication (class attr False), which
+            # under sync-free spec-v2 overlap would leave both unset and push
+            # EVERY replay onto the blocking `.item()` fallback. Opting in
+            # routes the mirror through the FutureMap's overlapped pinned-D2H
+            # publication (event-gated private stream) instead — the designed
+            # low-cost path (see overlap_utils.resolve_seq_lens_cpu).
+            self.needs_cpu_seq_lens = True
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -664,6 +675,11 @@ class TritonAttnBackend(AttentionBackend):
         # mirror — so under gpu_only the tensor is non-None but STALE. Use
         # `seq_lens_sum is not None` as the single freshness signal for BOTH
         # CPU-derived counts (the two fields are set/unset together).
+        # Steady state never falls back: with the unified pool the backend
+        # opts into needs_cpu_seq_lens (see __init__), so the FutureMap
+        # publishes fresh mirrors even under sync-free spec-v2 overlap; the
+        # fallback covers only mirror-less direct constructions (bench-style
+        # gpu_only batches).
         cpu_mirrors_fresh = forward_batch.seq_lens_sum is not None
         n_kv = (
             forward_batch.seq_lens_sum
