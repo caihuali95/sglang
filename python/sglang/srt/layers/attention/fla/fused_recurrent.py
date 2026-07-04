@@ -835,6 +835,11 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     intermediate_states_buffer,
     intermediate_state_indices,
     cache_steps,
+    # (slot, step) strides of intermediate_states_buffer, in elements. Dense
+    # layouts have slot == cache_steps*HV*K*V and step == HV*K*V; the unified
+    # pool's envelope view is slot-strided, so the wrapper passes real strides.
+    stride_inter_slot,
+    stride_inter_step,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
@@ -923,11 +928,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
                 parent_step_idx = tl.sum(
                     tl.where(token_indices == step_idx, parent_idx_tokens, 0)
                 )
-                step_offset = parent_step_idx * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
+                    + cache_idx * stride_inter_slot
+                    + parent_step_idx * stride_inter_step
                     + i_hv * K * V
                     + o_v[:, None] * K
                     + o_k[None, :]
@@ -964,11 +968,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         if CACHE_INTERMEDIATE_STATES:
             if cache_idx >= 0:
                 # Compute cache pointer for this step
-                step_offset = step_idx * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
+                    + cache_idx * stride_inter_slot
+                    + step_idx * stride_inter_step
                     + i_hv * K * V
                     + o_v[:, None] * K
                     + o_k[None, :]
@@ -1058,6 +1061,18 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
         cache_steps=0 if cache_steps is None else cache_steps,
+        # Real (slot, step) strides: identical to the old hardcoded dense math
+        # for contiguous buffers; required for the unified envelope views.
+        stride_inter_slot=(
+            intermediate_states_buffer.stride(0)
+            if intermediate_states_buffer is not None
+            else 0
+        ),
+        stride_inter_step=(
+            intermediate_states_buffer.stride(1)
+            if intermediate_states_buffer is not None
+            else 0
+        ),
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
