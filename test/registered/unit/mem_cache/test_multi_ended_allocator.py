@@ -3044,5 +3044,117 @@ class TestFloatMultiEndedAllocator(unittest.TestCase):
         self.assertEqual(fl.available_size(), min(max(gap_low, gap_high), index_room))
 
 
+class _FakeHybridLinearKVPool:
+    """Duck-typed HybridLinearKVPool: full/mamba pure stores with a physical
+    move marker buffer on the full side."""
+
+    def __init__(self, full_slots: int):
+        self.full_kv_pool = _FakeKVCache(full_slots)
+        self.mamba_pool = _FakeKVCache(full_slots)
+
+
+class TestUnifiedMambaCompositeWithBand(unittest.TestCase):
+    def _make(self, spec_on=True, total_bytes=6336):
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+
+        full = _make_mha_spec("full", "down", layer_num=2, head_num=2, head_dim=4)
+        mamba = _make_mamba_spec2("mamba", "up")
+        specs = [full, mamba]
+        if spec_on:
+            specs.append(_make_spec_state_spec())
+        pool = UnifiedKVPool(
+            total_bytes=total_bytes,
+            sub_pool_specs=specs,
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        kvcache = _FakeHybridLinearKVPool(pool.max_slots("full"))
+        comp = UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            spec_state_sub_pool="spec_state" if spec_on else None,
+        )
+        return pool, comp, kvcache
+
+    def test_band_created_and_wired(self):
+        _, comp, _ = self._make()
+        band = comp.spec_state_allocator
+        self.assertIsNotNone(band)
+        self.assertEqual(len(comp.sub_allocators), 3)
+        self.assertIs(comp.sub_allocators[1], band)
+        # Chain: band's low peer is the up end, high peer the down end.
+        self.assertEqual(band.low_peer.grow_direction, "up")
+        self.assertEqual(band.high_peer.grow_direction, "down")
+        # End-pool lazy peers still point end-to-end.
+        self.assertIs(comp.full_attn_allocator.peer, comp.mamba_allocator)
+
+    def test_spec_off_has_no_band(self):
+        _, comp, _ = self._make(spec_on=False)
+        self.assertIsNone(comp.spec_state_allocator)
+        self.assertEqual(len(comp.sub_allocators), 2)
+
+    def test_place_pin_unpin_via_composite(self):
+        _, comp, _ = self._make()
+        self.assertTrue(comp.place_spec_state_band(4))
+        comp.pin_spec_state_band()
+        with self.assertRaises(AssertionError):
+            comp.place_spec_state_band(2)
+        comp.unpin_spec_state_band()
+        self.assertTrue(comp.place_spec_state_band(2))
+
+    def test_alloc_shortfall_reclaims_unpinned_band(self):
+        _, comp, _ = self._make()
+        # Park the band flush against the full end, eating most of its gap.
+        lo, hi = comp.spec_state_allocator._region_bounds_pages()
+        big = hi - lo - 2
+        self.assertTrue(comp.place_spec_state_band(big, prefer_side="high"))
+        want = comp.full_attn_allocator.available_size() + 8
+        got = comp.alloc(want)
+        # The reclaim hook must have parked the band and satisfied the alloc.
+        self.assertIsNotNone(got)
+        self.assertEqual(comp.spec_state_allocator.allocated_count(), 0)
+
+    def test_pinned_band_blocks_reclaim(self):
+        _, comp, _ = self._make()
+        lo, hi = comp.spec_state_allocator._region_bounds_pages()
+        big = hi - lo - 2
+        self.assertTrue(comp.place_spec_state_band(big, prefer_side="high"))
+        comp.pin_spec_state_band()
+        want = comp.full_attn_allocator.available_size() + 8
+        self.assertIsNone(comp.alloc(want))
+        self.assertEqual(comp.spec_state_allocator.allocated_count(), big)
+
+    def test_backup_restore_clear_are_n_way(self):
+        _, comp, _ = self._make()
+        self.assertTrue(comp.place_spec_state_band(3))
+        snap = comp.backup_state()
+        self.assertEqual(len(snap), 3)
+        band = comp.spec_state_allocator
+        low0, high0 = band.low_wm_page, band.high_wm_page
+        self.assertTrue(comp.place_spec_state_band(5, prefer_side="high"))
+        comp.restore_state(snap)
+        self.assertEqual((band.low_wm_page, band.high_wm_page), (low0, high0))
+        comp.clear()
+        self.assertEqual(band.allocated_count(), 0)
+        self.assertEqual(band.placed_num_slots, 0)
+
+    def test_move_accept_kv_moves_full_physical(self):
+        _, comp, kvcache = self._make()
+        vs = comp.alloc(6)
+        self.assertIsNotNone(vs)
+        phys = comp.full_attn_allocator.translate_kv_loc(vs)
+        kvcache.full_kv_pool.buf[phys] = vs  # mark each physical with its vid
+        tgt, src = vs[:2], vs[4:6]
+        comp.move_accept_kv(tgt, src)
+        tgt_phys = comp.full_attn_allocator.translate_kv_loc(tgt)
+        src_v = src
+        self.assertTrue(
+            torch.equal(kvcache.full_kv_pool.buf[tgt_phys], src_v)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2067,6 +2067,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        spec_state_sub_pool: Optional[str] = None,
     ):
         full_max = unified_buffer.max_slots("full")
         super().__init__(
@@ -2108,6 +2109,37 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         self.full_attn_allocator.bind_peer(self.mamba_allocator)
         self.mamba_allocator.bind_peer(self.full_attn_allocator)
+
+        # Spec-decode intermediate-state band: a float MIDDLE sub-pool between
+        # the two ends, placed per decode step by `place_spec_state_band(bs)`.
+        # None when spec decoding is off — direct attribute access downstream,
+        # no defensive getattr.
+        self.spec_state_allocator: Optional[SpecStateBandAllocator] = None
+        if spec_state_sub_pool is not None:
+            self.spec_state_allocator = SpecStateBandAllocator(
+                kvcache=kvcache.mamba_pool,  # never moves data; for API parity
+                unified_buffer=unified_buffer,
+                sub_pool_name=spec_state_sub_pool,
+                device=device,
+            )
+            ends = (self.full_attn_allocator, self.mamba_allocator)
+            up_end = next(a for a in ends if a.grow_direction == "up")
+            down_end = next(a for a in ends if a.grow_direction == "down")
+            up_end.bind_high_peer(self.spec_state_allocator)
+            down_end.bind_low_peer(self.spec_state_allocator)
+            self.spec_state_allocator.bind_low_peer(up_end)
+            self.spec_state_allocator.bind_high_peer(down_end)
+
+        # Ordered chain (low byte end -> high byte end) for N-way lifecycle ops
+        # (clear / backup / restore / clear_inverse_history).
+        chain_ends = sorted(
+            (self.full_attn_allocator, self.mamba_allocator),
+            key=lambda a: a.grow_direction != "up",  # up end first
+        )
+        self.sub_allocators: List[MultiEndedAllocator] = [chain_ends[0]]
+        if self.spec_state_allocator is not None:
+            self.sub_allocators.append(self.spec_state_allocator)
+        self.sub_allocators.append(chain_ends[1])
 
         # The mamba slot allocator (PHYSICAL view) is built later by
         # `init_unified_mamba_pools`, which wraps `self.mamba_allocator` in a
@@ -2194,9 +2226,39 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def get_kvcache(self):
         return self._kvcache
 
+    # -- spec-state band lifecycle (verify-batch scratch; see place_band docs) --
+
+    def place_spec_state_band(self, num_slots: int, prefer_side: str = "low") -> bool:
+        assert self.spec_state_allocator is not None, (
+            "place_spec_state_band: composite was built without a spec-state "
+            "sub-pool (spec decoding off)"
+        )
+        return self.spec_state_allocator.place_band(num_slots, prefer_side)
+
+    def pin_spec_state_band(self) -> None:
+        if self.spec_state_allocator is not None:
+            self.spec_state_allocator.pin_band()
+
+    def unpin_spec_state_band(self) -> None:
+        if self.spec_state_allocator is not None:
+            self.spec_state_allocator.unpin_band()
+
+    def _reclaim_spec_state_band(self) -> bool:
+        """Movable-under-pressure: between pin windows the band's contents are
+        dead, so a neighbor alloc that would fail may park it (zero-copy) and
+        retry once. The next decode step's `place_spec_state_band(bs)` re-places
+        it anyway. Returns whether any bytes were reclaimed."""
+        band = self.spec_state_allocator
+        if band is None or band._band_pinned or band._allocated_pages() == 0:
+            return False
+        return band.place_band(0)
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("UnifiedMambaAlloc.alloc"):
-            return self.full_attn_allocator.alloc(need_size)
+            out = self.full_attn_allocator.alloc(need_size)
+            if out is None and self._reclaim_spec_state_band():
+                out = self.full_attn_allocator.alloc(need_size)
+            return out
 
     def alloc_extend(
         self,
@@ -2211,7 +2273,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Paged extend. Mamba state is per-request (doesn't advance per-token),
         so forward only to the full sub-allocator."""
         with record_function("UnifiedMambaAlloc.alloc_extend"):
-            return self.full_attn_allocator.alloc_extend(
+            out = self.full_attn_allocator.alloc_extend(
                 prefix_lens,
                 prefix_lens_cpu,
                 seq_lens,
@@ -2220,6 +2282,17 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 extend_num_tokens,
                 num_new_pages=num_new_pages,
             )
+            if out is None and self._reclaim_spec_state_band():
+                out = self.full_attn_allocator.alloc_extend(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    seq_lens,
+                    seq_lens_cpu,
+                    last_loc,
+                    extend_num_tokens,
+                    num_new_pages=num_new_pages,
+                )
+            return out
 
     def alloc_decode(
         self,
@@ -2229,9 +2302,23 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ) -> Optional[torch.Tensor]:
         """Paged decode. Mamba side stays untouched per-decode."""
         with record_function("UnifiedMambaAlloc.alloc_decode"):
-            return self.full_attn_allocator.alloc_decode(
+            out = self.full_attn_allocator.alloc_decode(
                 seq_lens, seq_lens_cpu, last_loc
             )
+            if out is None and self._reclaim_spec_state_band():
+                out = self.full_attn_allocator.alloc_decode(
+                    seq_lens, seq_lens_cpu, last_loc
+                )
+            return out
+
+    def move_accept_kv(self, tgt_locs: torch.Tensor, src_locs: torch.Tensor) -> None:
+        """Relocate accepted spec tokens' KV inside the full pool: VIRTUAL token
+        ids in, physical move via the pure-store pool API (which is
+        physical-only by design)."""
+        with record_function("UnifiedMambaAlloc.move_accept_kv"):
+            tgt_phys = self.full_attn_allocator.translate_kv_loc(tgt_locs)
+            src_phys = self.full_attn_allocator.translate_kv_loc(src_locs)
+            self.full_attn_allocator._kvcache.move_kv_cache(tgt_phys, src_phys)
 
     def translate_kv_loc(
         self,
@@ -2260,8 +2347,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.free_group.append(free_index)
                 return
             self.full_attn_allocator.free(free_index)
-            self.full_attn_allocator.clear_inverse_history()
-            self.mamba_allocator.clear_inverse_history()
+            for a in self.sub_allocators:
+                a.clear_inverse_history()
 
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
@@ -2273,24 +2360,22 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             merged = torch.cat(self.free_group)
             self.free_group = []
             self.full_attn_allocator.free(merged)
-            self.full_attn_allocator.clear_inverse_history()
-            self.mamba_allocator.clear_inverse_history()
+            for a in self.sub_allocators:
+                a.clear_inverse_history()
 
     def backup_state(self):
-        return [
-            self.full_attn_allocator.backup_state(),
-            self.mamba_allocator.backup_state(),
-        ]
+        return [a.backup_state() for a in self.sub_allocators]
 
     def restore_state(self, state):
-        assert len(state) == 2
-        full_rollback = self.full_attn_allocator.restore_state(state[0])
-        mamba_rollback = self.mamba_allocator.restore_state(state[1])
-        return full_rollback + mamba_rollback
+        assert len(state) == len(self.sub_allocators)
+        rollback = []
+        for a, s in zip(self.sub_allocators, state):
+            rollback += a.restore_state(s)
+        return rollback
 
     def clear(self) -> None:
-        self.full_attn_allocator.clear()
-        self.mamba_allocator.clear()
+        for a in self.sub_allocators:
+            a.clear()
         self.is_not_in_free_group = True
         self.free_group = []
 
@@ -2427,6 +2512,14 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kvcache.attach_allocators(
             full_allocator=self.full_attn_allocator,
             swa_allocator=self.swa_attn_allocator,
+        )
+
+        # Ordered chain (low byte end -> high byte end), for uniformity with the
+        # mamba composite's N-way lifecycle ops. No float middles here (hybrid
+        # SWA has no spec-state band).
+        self.sub_allocators: List[MultiEndedAllocator] = sorted(
+            (self.full_attn_allocator, self.swa_attn_allocator),
+            key=lambda a: a.grow_direction != "up",
         )
 
         self.is_not_in_free_group = True
@@ -2622,6 +2715,23 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             out.copy_(result)
             return out
         return result
+
+    def move_accept_kv(self, tgt_locs: torch.Tensor, src_locs: torch.Tensor) -> None:
+        """Relocate accepted spec tokens' KV: VIRTUAL token ids in; full-physical
+        move + swa-physical move (mirrors the non-unified
+        ``SWAKVPool.move_kv_cache`` full+window delegation). Tombstoned window
+        slots translate to the slot-0 sink, so aged-out moves land in reserved
+        padding — same clamp semantics as the read path."""
+        with record_function("UnifiedSWAAlloc.move_accept_kv"):
+            fa = self.full_attn_allocator
+            fa._kvcache.move_kv_cache(
+                fa.translate_kv_loc(tgt_locs), fa.translate_kv_loc(src_locs)
+            )
+            sa = self.swa_attn_allocator
+            sa._kvcache.move_kv_cache(
+                self.translate_loc_from_full_to_swa(tgt_locs).to(torch.int64),
+                self.translate_loc_from_full_to_swa(src_locs).to(torch.int64),
+            )
 
     # -- alloc --
 
