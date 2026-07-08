@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -76,6 +76,13 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
+# Unified-pool + spec admission (_handle_max_mamba_cache_unified): the
+# per-request token floor charged by the joint hard-floor solve. It bounds how
+# far short-context concurrency can squeeze the token pool at boot; requests
+# with longer contexts draw on the shared gap and, under pressure, the
+# existing retract machinery.
+UNIFIED_SPEC_MIN_TOKENS_PER_REQ = 2048
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,45 +150,67 @@ class ModelRunnerKVCacheMixin:
         server_args = self.server_args
         assert config is not None
 
-        has_spec_dec = not self.spec_algorithm.is_none()
-        if has_spec_dec:
+        # Consumed by _init_unified_mamba_pools (spec-state band row count) and
+        # _resolve_max_num_reqs (admission bypass). None on every non-unified /
+        # spec-off path.
+        self.mamba_spec_state_size: Optional[int] = None
+        self._unified_max_num_reqs: Optional[int] = None
+
+        # Unified pool + spec decoding (target worker): admission and the spec
+        # reservations are solved JOINTLY against the shared buffer's byte
+        # budget instead of the static-split worst case below — see
+        # _handle_max_mamba_cache_unified. Spec-OFF unified deliberately keeps
+        # the upstream sizing (certified byte-identical vs the static-partition
+        # baseline); draft workers never reach here (they inherit the target's
+        # MemoryPoolConfig).
+        if (
+            server_args.enable_unified_memory
+            and not self.spec_algorithm.is_none()
+            and not self.is_draft_worker
+            and server_args.disaggregation_mode == "null"
+        ):
+            return self._handle_max_mamba_cache_unified(total_rest_memory)
+
+        # -------------------------------------------------------------------
+        # Non-unified path: UPSTREAM-VERBATIM sizing, deliberately un-fixed.
+        #
+        # TODO(upstream bugfix PR): the spec-decode intermediate reservation
+        # below is sized by the RAW requested max_running_requests (the spec
+        # hook forces 48 when unset), but the mamba clamp in
+        # _resolve_max_num_reqs (max_mamba_cache_size // ratio) makes most of
+        # those rows unreachable — the reservation defeats itself. Concretely
+        # (Falcon-H1-7B @ mfs0.45, D=4): 24.9 GiB reserved to support 48
+        # concurrent verifies, after which only 1-2 requests are admittable
+        # (radix branch), and the disable-radix branch's unchecked
+        # demand-derived slot count goes budget-negative -> "no GPU memory for
+        # KV cache" at boot. The reservation and the cap must be solved
+        # JOINTLY (the closed form of their fixed point). Kept verbatim so
+        # this branch's diff vs upstream stays empty; the fix is slated as a
+        # standalone upstream PR. The unified path above does not have this
+        # problem.
+        # -------------------------------------------------------------------
+        # reserve the memory for the intermediate mamba states used for spec dec
+        if not self.spec_algorithm.is_none():
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
-        # Reserve the band's per-verify-row slots PLUS alignment headroom so the
-        # deduction here matches the unified buffer's band reservation exactly
-        # (both add SPEC_BAND_ALIGNMENT_MARGIN_SLOTS). mamba_spec_state_size stays
-        # the true per-row count — only the reserved BYTES carry the margin.
-        from sglang.srt.mem_cache.multi_ended_allocator import (
-            SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
-        )
-
-        # The spec-decode intermediate reservation below is sized by a
-        # capped-request count; record it so the unified pool's spec-state
-        # band uses the SAME count (accounting must not drift — the deduction
-        # and the sub-pool budget describe the same bytes).
-        self.mamba_spec_state_size: Optional[int] = None
+            max_running_requests = server_args.max_running_requests // (
+                self.dp_size if server_args.enable_dp_attention else 1
+            )
+            mamba_state_intermediate_size = (
+                config.mamba2_cache_params.mamba_cache_per_req
+                * max_running_requests
+                * server_args.speculative_num_draft_tokens
+            )
+            total_rest_memory = total_rest_memory - (
+                mamba_state_intermediate_size / (1 << 30)
+            )
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
-                capped_reqs = min(
-                    server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // ratio,
-                )
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * (capped_reqs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS)
-                    * server_args.speculative_num_draft_tokens
-                )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
-                self.mamba_spec_state_size = capped_reqs
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
@@ -190,98 +219,23 @@ class ModelRunnerKVCacheMixin:
             server_args.max_mamba_cache_size = server_args.max_running_requests // (
                 server_args.dp_size if server_args.enable_dp_attention else 1
             )
-            # Reserve intermediate memory based on capped max_num_reqs
-            if has_spec_dec:
-                # Cap by what this branch's own deduction can afford: taking
-                # max_running(48) verbatim reserved (48+margin) band slots
-                # ~= 28GB of intermediates at mfs0.45 against a ~13GB mamba
-                # share -> total_rest went negative -> "no GPU memory for KV
-                # cache" at boot (eval_233 chunk cells). Solve the INTERMEDIATE
-                # reservation (the only thing this branch deducts; states are
-                # budgeted later in the factory) against the mamba share:
-                #   (cap + MARGIN) * per_req * D <= rest * mfr/(1+mfr)
-                # At mfs0.85 this stays unbinding (48 provably fits there).
-                per_req = config.mamba2_cache_params.mamba_cache_per_req
-                D = server_args.speculative_num_draft_tokens
-                mamba_budget_bytes = (
-                    total_rest_memory
-                    * server_args.mamba_full_memory_ratio
-                    / (1 + server_args.mamba_full_memory_ratio)
-                ) * (1 << 30)
-                budget_cap = max(
-                    1,
-                    int(mamba_budget_bytes // (per_req * D))
-                    - SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
-                )
-                if budget_cap < server_args.max_mamba_cache_size:
-                    logger.warning(
-                        "[unified-memory-pool] chunk-mode mamba sizing capped by "
-                        "memory budget: max_mamba_cache_size %d -> %d "
-                        "(spec reservations would not fit at this mem fraction).",
-                        server_args.max_mamba_cache_size,
-                        budget_cap,
-                    )
-                    server_args.max_mamba_cache_size = budget_cap
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * (server_args.max_mamba_cache_size + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS)
-                    * server_args.speculative_num_draft_tokens
-                )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
-                self.mamba_spec_state_size = server_args.max_mamba_cache_size
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
-            per_req = config.mamba2_cache_params.mamba_cache_per_req
 
-            # Solve jointly for max_mamba_cache_size accounting for intermediate memory.
-            # The mamba budget (from the ratio split) must cover both:
-            #   1. main mamba state: max_mamba_cache_size * per_req
-            #   2. intermediate states: (max_mamba_cache_size / ratio) * D * per_req
-            # So: max_mamba_cache_size * per_req * (1 + D/ratio) = mamba_budget_bytes
-            mamba_budget = (
+            # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
+            # solve the equations:
+            # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
+            # 2. mamba_state_memory / full_kv_cache_memory == server_args.mamba_full_memory_ratio
+            mamba_state_memory_raw = (
                 total_rest_memory
                 * server_args.mamba_full_memory_ratio
                 / (1 + server_args.mamba_full_memory_ratio)
             )
-            mamba_budget_bytes = mamba_budget * (1 << 30)
-
-            if has_spec_dec:
-                ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
-                # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
-                )
-                # Intermediate memory is included in mamba_budget, subtract it
-                # so the return value only has main_state subtracted from total
-                capped_reqs = min(
-                    server_args.max_running_requests
-                    // (self.dp_size if server_args.enable_dp_attention else 1),
-                    server_args.max_mamba_cache_size // ratio,
-                )
-                intermediate_size = (
-                    per_req * (capped_reqs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * D
-                )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
-                self.mamba_spec_state_size = capped_reqs
-            else:
-                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
-
-        # Validate: max_mamba_cache_size must be positive after memory allocation.
-        # A non-positive value means GPU memory is insufficient for the requested
-        # configuration. Fail fast with actionable advice instead of silently
-        # producing garbled output at runtime.
-        if server_args.max_mamba_cache_size <= 0:
-            raise RuntimeError(
-                f"Not enough GPU memory for hybrid (mamba/linear-attention) state cache. "
-                f"Computed max_mamba_cache_size={server_args.max_mamba_cache_size} "
-                f"(total_rest_memory={total_rest_memory:.2f} GB, "
-                f"mamba_cache_per_req={config.mamba2_cache_params.mamba_cache_per_req / (1 << 20):.2f} MB). "
-                f"Try: (1) reduce --max-running-requests, "
-                f"(2) increase --mem-fraction-static, "
-                f"(3) reduce --speculative-num-draft-tokens, or "
-                f"(4) use GPUs with more memory."
+            # calculate the max_mamba_cache_size based on the given total mamba memory
+            server_args.max_mamba_cache_size = int(
+                (mamba_state_memory_raw * (1 << 30))
+                // config.mamba2_cache_params.mamba_cache_per_req
             )
 
         mamba_state_memory = (
@@ -290,6 +244,136 @@ class ModelRunnerKVCacheMixin:
             / (1 << 30)
         )
         return total_rest_memory - mamba_state_memory
+
+    def _handle_max_mamba_cache_unified(self: ModelRunner, total_rest_memory):
+        """Unified-pool (spec-ON, target) sizing: solve admission and the spec
+        reservations JOINTLY against the shared buffer's byte budget.
+
+        The static-partition model (upstream path above) charges every request
+        its worst case FOREVER — `ratio` mamba slots + D intermediate rows —
+        then splits bytes by `mamba_full_memory_ratio`. At Falcon-7B/mfs0.45/
+        D=4 that admits 11 requests against a 313k-token pool the workload
+        cannot fill (3% peak usage with 189 requests queued). Under the
+        unified pool all partitions share one byte buffer with floating
+        frontiers, so boot-time admission only needs each request's
+        IRREDUCIBLE floor:
+
+            hard mamba slots (1 active + extra_buffer ping-pong)   x per_req
+          + D spec-band rows (worst case: all N verify together)   x per_req
+          + UNIFIED_SPEC_MIN_TOKENS_PER_REQ tokens                 x cell_size
+
+        The base ratio's remaining slots are radix-cache HEADROOM — evictable
+        under pressure — so they are granted from leftover bytes, never
+        charged at admission. Runtime pressure lands on the existing
+        machinery: per-request band/mamba charges in admission
+        (schedule_policy), check_decode_mem's probe->place->retract, and
+        radix eviction.
+
+        Sets `self._unified_max_num_reqs` (consumed by _resolve_max_num_reqs,
+        which then skips the static ratio clamp), `self.mamba_spec_state_size`
+        (band rows = N), and `server_args.max_mamba_cache_size` (hard slots +
+        headroom grant); returns the token-pool budget in GiB, mirroring the
+        upstream path's contract.
+        """
+        config = self.mambaish_config
+        server_args = self.server_args
+        assert config is not None
+        assert server_args.speculative_num_draft_tokens is not None
+        assert server_args.max_running_requests is not None
+        assert config.mamba2_cache_params.mamba_cache_per_req > 0
+
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
+        )
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        dp = self.dp_size if server_args.enable_dp_attention else 1
+        requested = server_args.max_running_requests // dp
+        per_req = config.mamba2_cache_params.mamba_cache_per_req
+        D = server_args.speculative_num_draft_tokens
+        ratio = self._calculate_mamba_ratio()
+        # 1 active slot + the extra_buffer ping-pong track slots; the base
+        # ratio's remaining slots are the evictable radix-cache allowance.
+        hard_slots = 1 + max(0, ratio - MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO)
+
+        # Per-token full-KV bytes from the SAME configurator class that sizes
+        # the token pool right after this returns (includes the EAGLE/DFLASH
+        # draft-KV cell scaling). Private attr, but both instances are built
+        # at the same boot phase, so the values cannot drift.
+        cell_size = create_memory_pool_configurator(self)._cell_size
+        token_floor_bytes = UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
+
+        rest_bytes = int(total_rest_memory * (1 << 30))
+        # Band constant overhead: reserved slot 0 + band-page alignment margin.
+        band_const_bytes = (1 + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * D * per_req
+        per_req_bytes = (hard_slots + D) * per_req + token_floor_bytes
+        n = (rest_bytes - band_const_bytes) // per_req_bytes
+        n = min(requested, n)
+        explicit_mamba_slots = (
+            server_args.max_mamba_cache_size // dp
+            if server_args.max_mamba_cache_size is not None
+            else None
+        )
+        if explicit_mamba_slots is not None:
+            # An explicit --max-mamba-cache-size caps both the slot grant and
+            # the hard-floor admission it can back.
+            n = min(n, explicit_mamba_slots // hard_slots)
+        if n <= 0:
+            raise RuntimeError(
+                f"Not enough GPU memory for unified-pool speculative decoding: "
+                f"joint hard-floor solve admits {n} requests "
+                f"(rest={total_rest_memory:.2f} GiB, per-request floor="
+                f"{per_req_bytes / (1 << 30):.2f} GiB: {hard_slots} mamba slots "
+                f"+ {D} band rows x {per_req / (1 << 20):.1f} MiB "
+                f"+ {UNIFIED_SPEC_MIN_TOKENS_PER_REQ} tokens). "
+                f"Try: (1) increase --mem-fraction-static, "
+                f"(2) reduce --speculative-num-draft-tokens, or "
+                f"(3) use GPUs with more memory."
+            )
+
+        band_bytes = (n + 1 + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * D * per_req
+        hard_mamba_slots = n * hard_slots
+        # Radix-cache headroom: leftover bytes beyond the band + hard slots +
+        # the token floor, capped at the base ratio's allowance. The grant is
+        # itemization, not a fence — at runtime the frontiers share bytes
+        # freely; it keeps the profile deduction equal to the factory's
+        # max_mamba_cache_size byte contribution (accounting must not drift).
+        leftover = (
+            rest_bytes
+            - band_bytes
+            - hard_mamba_slots * per_req
+            - n * token_floor_bytes
+        )
+        headroom_slots = min(
+            max(0, leftover) // per_req, n * ratio - hard_mamba_slots
+        )
+        mamba_slots = int(hard_mamba_slots + headroom_slots)
+        if explicit_mamba_slots is not None:
+            mamba_slots = min(mamba_slots, explicit_mamba_slots)
+        server_args.max_mamba_cache_size = mamba_slots
+        self.mamba_spec_state_size = int(n)
+        self._unified_max_num_reqs = int(n)
+
+        deducted_bytes = band_bytes + mamba_slots * per_req
+        logger.info(
+            "[unified-memory-pool] joint admission solve: max_num_reqs=%d "
+            "(requested %d), hard_slots/req=%d, D=%d, mamba slots=%d "
+            "(hard %d + radix headroom %d), band %.2f GiB, "
+            "token floor %d tok/req, token-pool budget %.2f GiB.",
+            n,
+            requested,
+            hard_slots,
+            D,
+            mamba_slots,
+            hard_mamba_slots,
+            int(headroom_slots),
+            band_bytes / (1 << 30),
+            UNIFIED_SPEC_MIN_TOKENS_PER_REQ,
+            (rest_bytes - deducted_bytes) / (1 << 30),
+        )
+        return total_rest_memory - deducted_bytes / (1 << 30)
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
@@ -1348,20 +1432,29 @@ class ModelRunnerKVCacheMixin:
             max_num_reqs = min(estimated, token_capacity // 2)
 
         if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
-            )
-
-            if max_num_reqs <= 0:
-                raise RuntimeError(
-                    f"Hybrid (mamba/linear-attention) state cache is too small to serve "
-                    f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
-                    f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
-                    f"Try: (1) reduce --max-running-requests, "
-                    f"(2) increase --mem-fraction-static, or "
-                    f"(3) use GPUs with more memory."
+            unified_n = getattr(self, "_unified_max_num_reqs", None)
+            if unified_n is not None:
+                # Unified + spec: admission was solved jointly against the
+                # shared buffer's byte budget (_handle_max_mamba_cache_unified,
+                # hard-floor per-request charge; radix headroom is evictable).
+                # The static ratio clamp below would re-impose the worst-case
+                # partition model the unified pool replaces.
+                max_num_reqs = min(max_num_reqs, unified_n)
+            else:
+                ratio = self._calculate_mamba_ratio()
+                max_num_reqs = min(
+                    max_num_reqs, self.server_args.max_mamba_cache_size // ratio
                 )
+
+                if max_num_reqs <= 0:
+                    raise RuntimeError(
+                        f"Hybrid (mamba/linear-attention) state cache is too small to serve "
+                        f"any requests. max_mamba_cache_size={self.server_args.max_mamba_cache_size}, "
+                        f"mamba_ratio={ratio}, resulting max_num_reqs={max_num_reqs}. "
+                        f"Try: (1) reduce --max-running-requests, "
+                        f"(2) increase --mem-fraction-static, or "
+                        f"(3) use GPUs with more memory."
+                    )
         if requested_per_worker is not None and max_num_reqs < requested_per_worker:
             logger.warning(
                 "max_running_requests was reduced from the requested %d to %d "
