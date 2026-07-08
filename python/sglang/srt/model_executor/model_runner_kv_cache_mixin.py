@@ -4,6 +4,7 @@ import logging
 import math
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.configs.model_config import (
@@ -82,6 +83,131 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 # with longer contexts draw on the shared gap and, under pressure, the
 # existing retract machinery.
 UNIFIED_SPEC_MIN_TOKENS_PER_REQ = 2048
+
+# Unified-pool + spec admission ceiling used when --max-running-requests was
+# NOT set by the user (the speculative hook's default of 48 is a static-
+# partition tuning; under the unified pool the joint byte solve is the real
+# bound). Matches the default decode CUDA-graph max_bs; batches beyond the
+# captured sizes fall back to eager, and runtime pressure lands on the
+# admission charges + check_decode_mem probe->retract machinery.
+UNIFIED_SPEC_MAX_RUNNING_REQUESTS_CEILING = 256
+
+
+class UnifiedSpecAdmission(msgspec.Struct):
+    """Result of `solve_unified_spec_admission` (pure arithmetic; unit-tested
+    in test/registered/unit/model_executor/test_unified_spec_admission.py)."""
+
+    max_num_reqs: int
+    hard_mamba_slots: int
+    headroom_slots: int
+    mamba_slots: int  # hard + radix headroom (possibly explicit-capped)
+    band_bytes: int  # spec-state band at max_num_reqs (raw, un-inflated)
+    draft_reserve_bytes: int  # draft-pool backing for mamba+band bytes (D8)
+    deducted_bytes: int  # profile deduction: band + mamba, draft-inflated
+    token_budget_bytes: int  # rest - deducted (converted by the SCALED cell)
+
+
+def solve_unified_spec_admission(
+    *,
+    rest_bytes: int,
+    requested: int,
+    mamba_bytes_per_req: int,
+    num_draft_tokens: int,
+    hard_slots: int,
+    mamba_ratio: int,
+    cell_size: int,
+    base_cell_size: int,
+    margin_slots: int,
+    explicit_mamba_slots: Optional[int] = None,
+) -> UnifiedSpecAdmission:
+    """Joint hard-floor admission solve for unified-pool speculative decoding.
+
+    Every byte granted to the mamba slots or the spec-state band extends the
+    unified buffer, and the DFLASH/EAGLE draft worker's PRIVATE KV pool is
+    sized to the buffer's full VIRTUAL-id capacity (D8 zero-translate:
+    total_bytes // base_cell_size ids x draft bytes/token). The configurator's
+    draft-scaled `cell_size` (= base + draft bytes/token) already reserves the
+    draft share of every TOKEN; the mamba/band bytes' share is charged here by
+    inflating those terms with cell_size/base_cell_size.
+
+    LIMITATION (deliberate, documented in shared_memory_pool_design.md §33):
+    the D8 virtual-id sizing makes the draft pool span ids that mostly back
+    mamba/band bytes and can never hold draft KV — at DFLASH mfs0.8 ~94% of
+    the draft pool (37.7 GiB) is dead weight, and this reserve makes the waste
+    honest rather than removing it. Reclaiming it needs either a draft-side
+    v2p translate with a compact draft allocator (Design A) or fusing the
+    draft KV into the full-KV slot layout (Design B).
+    """
+    assert cell_size >= base_cell_size > 0
+
+    def with_draft_backing(nbytes: int) -> int:
+        # Draft-pool bytes backing the virtual ids that `nbytes` of buffer
+        # occupies: nbytes/base ids x (cell - base) draft bytes each.
+        return nbytes * cell_size // base_cell_size
+
+    token_floor_bytes = UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
+    band_const_bytes = with_draft_backing(
+        (1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
+    )
+    per_req_bytes = (
+        with_draft_backing((hard_slots + num_draft_tokens) * mamba_bytes_per_req)
+        + token_floor_bytes
+    )
+    n = (rest_bytes - band_const_bytes) // per_req_bytes
+    n = min(requested, n)
+    if explicit_mamba_slots is not None:
+        # An explicit --max-mamba-cache-size caps both the slot grant and
+        # the hard-floor admission it can back.
+        n = min(n, explicit_mamba_slots // hard_slots)
+    if n <= 0:
+        return UnifiedSpecAdmission(
+            max_num_reqs=int(n),
+            hard_mamba_slots=0,
+            headroom_slots=0,
+            mamba_slots=0,
+            band_bytes=0,
+            draft_reserve_bytes=0,
+            deducted_bytes=0,
+            token_budget_bytes=0,
+        )
+
+    band_bytes = (n + 1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
+    hard_mamba_slots = n * hard_slots
+    # Radix-cache headroom: leftover bytes beyond the band + hard slots +
+    # the token floor, capped at the base ratio's allowance. The grant is
+    # itemization, not a fence — at runtime the frontiers share bytes
+    # freely. Accounting invariant vs the factory: the factory re-adds the
+    # RAW band + mamba bytes into total_bytes; this solve deducts them
+    # INFLATED (x cell/base). The difference — the draft-pool backing —
+    # therefore never enters the unified buffer and stays free for the D8
+    # draft allocation (accounting must not drift on either side).
+    leftover = (
+        rest_bytes
+        - with_draft_backing(band_bytes)
+        - with_draft_backing(hard_mamba_slots * mamba_bytes_per_req)
+        - n * token_floor_bytes
+    )
+    headroom_slots = min(
+        max(0, leftover) // with_draft_backing(mamba_bytes_per_req),
+        n * mamba_ratio - hard_mamba_slots,
+    )
+    mamba_slots = int(hard_mamba_slots + headroom_slots)
+    if explicit_mamba_slots is not None:
+        mamba_slots = min(mamba_slots, explicit_mamba_slots)
+
+    mamba_band_bytes = band_bytes + mamba_slots * mamba_bytes_per_req
+    deducted_bytes = with_draft_backing(mamba_band_bytes)
+    return UnifiedSpecAdmission(
+        max_num_reqs=int(n),
+        hard_mamba_slots=int(hard_mamba_slots),
+        headroom_slots=int(headroom_slots),
+        mamba_slots=mamba_slots,
+        band_bytes=band_bytes,
+        draft_reserve_bytes=deducted_bytes - mamba_band_bytes,
+        deducted_bytes=deducted_bytes,
+        token_budget_bytes=rest_bytes - deducted_bytes,
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +395,23 @@ class ModelRunnerKVCacheMixin:
         (schedule_policy), check_decode_mem's probe->place->retract, and
         radix eviction.
 
+        DRAFT-POOL RESERVE (D8 virtual-index waste — see the LIMITATION note
+        on `solve_unified_spec_admission`): the EAGLE/DFLASH draft worker's
+        private KV pool is sized to the unified buffer's VIRTUAL-id capacity,
+        so every mamba/band byte granted here drags `draft_cell/base_cell`
+        extra draft-pool bytes with it (~0.75x for DFLASH Qwen3.5 — a 40 GiB
+        pool of which ~94% backs ids that can never hold draft KV). The solve
+        charges that backing so the combined footprint fits by construction
+        (previously the draft pool silently landed in the 1-mfs headroom and
+        OOMed at high mfs); reclaiming the waste itself is design-doc §33
+        (Design A: draft-side v2p translate; Design B: fused slot layout).
+
+        ADMISSION CEILING: when --max-running-requests was NOT set by the
+        user, the speculative hook's default of 48 (a static-partition tuning)
+        is lifted to UNIFIED_SPEC_MAX_RUNNING_REQUESTS_CEILING and the byte
+        solve becomes the binding constraint; the solved value is written back
+        to server_args so the draft worker and downstream consumers see it.
+
         Sets `self._unified_max_num_reqs` (consumed by _resolve_max_num_reqs,
         which then skips the static ratio clamp), `self.mamba_spec_state_size`
         (band rows = N), and `server_args.max_mamba_cache_size` (hard slots +
@@ -290,7 +433,16 @@ class ModelRunnerKVCacheMixin:
         )
 
         dp = self.dp_size if server_args.enable_dp_attention else 1
-        requested = server_args.max_running_requests // dp
+        # Fix (2): the hook's 48 is a default, not a user decision — under the
+        # unified pool let the byte solve bound admission instead (retract is
+        # the runtime backstop). An explicit --max-running-requests binds.
+        requested_defaulted = getattr(
+            server_args, "_max_running_requests_spec_defaulted", False
+        )
+        if requested_defaulted:
+            requested = UNIFIED_SPEC_MAX_RUNNING_REQUESTS_CEILING // dp
+        else:
+            requested = server_args.max_running_requests // dp
         per_req = config.mamba2_cache_params.mamba_cache_per_req
         D = server_args.speculative_num_draft_tokens
         ratio = self._calculate_mamba_ratio()
@@ -299,81 +451,116 @@ class ModelRunnerKVCacheMixin:
         hard_slots = 1 + max(0, ratio - MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO)
 
         # Per-token full-KV bytes from the SAME configurator class that sizes
-        # the token pool right after this returns (includes the EAGLE/DFLASH
-        # draft-KV cell scaling). Private attr, but both instances are built
-        # at the same boot phase, so the values cannot drift.
-        cell_size = create_memory_pool_configurator(self)._cell_size
-        token_floor_bytes = UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
+        # the token pool right after this returns. `_cell_size` includes the
+        # EAGLE/DFLASH draft-KV per-token scaling; `_base_cell_size` is the
+        # target-only pool entry — their difference is the draft's per-token
+        # KV cost, which prices the D8 virtual-id draft-pool reserve.
+        configurator = create_memory_pool_configurator(self)
+        cell_size = configurator._cell_size
+        base_cell_size = getattr(configurator, "_base_cell_size", None)
+        assert base_cell_size is not None, (
+            "mambaish models must use DefaultPoolConfigurator "
+            f"(got {type(configurator).__name__})"
+        )
 
         rest_bytes = int(total_rest_memory * (1 << 30))
-        # Band constant overhead: reserved slot 0 + band-page alignment margin.
-        band_const_bytes = (1 + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * D * per_req
-        per_req_bytes = (hard_slots + D) * per_req + token_floor_bytes
-        n = (rest_bytes - band_const_bytes) // per_req_bytes
-        n = min(requested, n)
         explicit_mamba_slots = (
             server_args.max_mamba_cache_size // dp
             if server_args.max_mamba_cache_size is not None
             else None
         )
-        if explicit_mamba_slots is not None:
-            # An explicit --max-mamba-cache-size caps both the slot grant and
-            # the hard-floor admission it can back.
-            n = min(n, explicit_mamba_slots // hard_slots)
+        admission = solve_unified_spec_admission(
+            rest_bytes=rest_bytes,
+            requested=requested,
+            mamba_bytes_per_req=per_req,
+            num_draft_tokens=D,
+            hard_slots=hard_slots,
+            mamba_ratio=ratio,
+            cell_size=cell_size,
+            base_cell_size=base_cell_size,
+            margin_slots=SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
+            explicit_mamba_slots=explicit_mamba_slots,
+        )
+        n = admission.max_num_reqs
         if n <= 0:
+            per_req_floor_bytes = (
+                (hard_slots + D) * per_req * cell_size // base_cell_size
+                + UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
+            )
             raise RuntimeError(
                 f"Not enough GPU memory for unified-pool speculative decoding: "
                 f"joint hard-floor solve admits {n} requests "
                 f"(rest={total_rest_memory:.2f} GiB, per-request floor="
-                f"{per_req_bytes / (1 << 30):.2f} GiB: {hard_slots} mamba slots "
-                f"+ {D} band rows x {per_req / (1 << 20):.1f} MiB "
-                f"+ {UNIFIED_SPEC_MIN_TOKENS_PER_REQ} tokens). "
+                f"{per_req_floor_bytes / (1 << 30):.2f} GiB: {hard_slots} mamba "
+                f"slots + {D} band rows x {per_req / (1 << 20):.1f} MiB "
+                f"(x{cell_size / base_cell_size:.2f} draft-pool backing) "
+                f"+ {UNIFIED_SPEC_MIN_TOKENS_PER_REQ} tokens x {cell_size} B). "
                 f"Try: (1) increase --mem-fraction-static, "
                 f"(2) reduce --speculative-num-draft-tokens, or "
                 f"(3) use GPUs with more memory."
             )
 
-        band_bytes = (n + 1 + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * D * per_req
-        hard_mamba_slots = n * hard_slots
-        # Radix-cache headroom: leftover bytes beyond the band + hard slots +
-        # the token floor, capped at the base ratio's allowance. The grant is
-        # itemization, not a fence — at runtime the frontiers share bytes
-        # freely; it keeps the profile deduction equal to the factory's
-        # max_mamba_cache_size byte contribution (accounting must not drift).
-        leftover = (
-            rest_bytes
-            - band_bytes
-            - hard_mamba_slots * per_req
-            - n * token_floor_bytes
-        )
-        headroom_slots = min(
-            max(0, leftover) // per_req, n * ratio - hard_mamba_slots
-        )
-        mamba_slots = int(hard_mamba_slots + headroom_slots)
-        if explicit_mamba_slots is not None:
-            mamba_slots = min(mamba_slots, explicit_mamba_slots)
-        server_args.max_mamba_cache_size = mamba_slots
+        server_args.max_mamba_cache_size = admission.mamba_slots
         self.mamba_spec_state_size = int(n)
         self._unified_max_num_reqs = int(n)
+        if requested_defaulted:
+            # Write the solved cap back so every downstream consumer — the
+            # draft worker (via memory_pool_config), _resolve_max_num_reqs,
+            # scheduler — sees one consistent value. Explicit user values are
+            # never overwritten (_resolve_max_num_reqs min's + warns instead).
+            server_args.max_running_requests = int(n * dp)
 
-        deducted_bytes = band_bytes + mamba_slots * per_req
         logger.info(
             "[unified-memory-pool] joint admission solve: max_num_reqs=%d "
-            "(requested %d), hard_slots/req=%d, D=%d, mamba slots=%d "
+            "(requested %d%s), hard_slots/req=%d, D=%d, mamba slots=%d "
             "(hard %d + radix headroom %d), band %.2f GiB, "
+            "draft-KV reserve %.2f GiB (cell %d/%d B/token), "
             "token floor %d tok/req, token-pool budget %.2f GiB.",
             n,
             requested,
+            " = unified ceiling, hook default lifted" if requested_defaulted else "",
             hard_slots,
             D,
-            mamba_slots,
-            hard_mamba_slots,
-            int(headroom_slots),
-            band_bytes / (1 << 30),
+            admission.mamba_slots,
+            admission.hard_mamba_slots,
+            admission.headroom_slots,
+            admission.band_bytes / (1 << 30),
+            admission.draft_reserve_bytes / (1 << 30),
+            cell_size,
+            base_cell_size,
             UNIFIED_SPEC_MIN_TOKENS_PER_REQ,
-            (rest_bytes - deducted_bytes) / (1 << 30),
+            admission.token_budget_bytes / (1 << 30),
         )
-        return total_rest_memory - deducted_bytes / (1 << 30)
+        # Warn only when the config is DRAFT-WASTE-bound, not merely
+        # spec-heavy. The band (∝ N) is large by design but is a runtime
+        # SHARED gap (exact-fit at bs, ceded to full/mamba between verifies),
+        # so a low token-pool *fraction* is normal for the hard-floor solve
+        # and is NOT a warning. The D8 draft pool, by contrast, is a fixed
+        # private allocation that is truly lost: draft_pool = q/(1+q) x rest
+        # where q = (cell/base − 1). Fire when it exceeds the usable token
+        # pool — then the mostly-wasted draft KV (§33) outweighs the cache
+        # it protects, and only a reclaim (Design A/B) or fewer draft tokens
+        # helps (a lower mfs does not — the pool scales with the budget).
+        draft_pool_bytes = rest_bytes - rest_bytes * base_cell_size // cell_size
+        if draft_pool_bytes > admission.token_budget_bytes:
+            logger.warning(
+                "[unified-memory-pool] draft-waste-bound config: the D8 "
+                "virtual-index draft pool (~%.1f GiB, q=draft/target per-token "
+                "= %.2f) exceeds the token pool it backs (%.1f GiB) at "
+                "mem-fraction-static=%.2f, D=%d — most of the draft pool can "
+                "never hold draft KV (design doc §33). A higher/lower mfs "
+                "does NOT help (the pool scales with the budget); consider "
+                "(1) fewer --speculative-num-draft-tokens, (2) an explicit "
+                "--max-running-requests below %d, or (3) the §33 reclaim "
+                "(draft-side translate / fused slot) to recover it.",
+                draft_pool_bytes / (1 << 30),
+                (cell_size / base_cell_size) - 1.0,
+                admission.token_budget_bytes / (1 << 30),
+                server_args.mem_fraction_static,
+                D,
+                n,
+            )
+        return total_rest_memory - admission.deducted_bytes / (1 << 30)
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
@@ -649,6 +836,13 @@ class ModelRunnerKVCacheMixin:
         # mamba/spec bands. The draft's PRIVATE KV pool is virtual-indexed
         # (its attention backends skip the v2p translate; see
         # TritonAttnBackend), so it must span the whole virtual-id space.
+        # KNOWN WASTE (design doc §33): only max_total_num_tokens of these ids
+        # ever hold draft KV — the rest back mamba/band bytes (~94% of a
+        # 40 GiB pool at DFLASH mfs0.8). The target's admission solve charges
+        # this full footprint (_handle_max_mamba_cache_unified draft-KV
+        # reserve) so it can't OOM, but the bytes are dead weight until the
+        # draft pool gets its own v2p translate + compact allocator (Design A)
+        # or is fused into the full-KV slot layout (Design B).
         if self.is_draft_worker and self.token_to_kv_pool_allocator is not None:
             from sglang.srt.mem_cache.multi_ended_allocator import (
                 MultiEndedAllocator,

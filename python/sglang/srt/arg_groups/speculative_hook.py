@@ -51,6 +51,27 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
+def _default_spec_max_running_requests(server_args: ServerArgs) -> None:
+    """Apply the speculative default of 48 when the user did not set
+    --max-running-requests, and mark it as a DEFAULT rather than a user
+    decision: the unified-memory-pool admission solve
+    (`_handle_max_mamba_cache_unified`) replaces a defaulted 48 with its joint
+    byte-budget bound and writes the solved value back, while an explicit user
+    value always binds. Non-unified paths ignore the marker (48 stays the
+    upstream static-partition tuning).
+    """
+    if server_args.max_running_requests is not None:
+        return
+    server_args.max_running_requests = 48
+    # Dynamic attribute, deliberately NOT a dataclass field (it must not
+    # become a CLI arg); survives the pickle to the scheduler subprocess via
+    # the instance __dict__. Readers use getattr(..., False).
+    server_args._max_running_requests_spec_defaulted = True
+    logger.warning(
+        "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+    )
+
+
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         server_args.speculative_draft_model_path is not None
@@ -229,11 +250,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _default_spec_max_running_requests(server_args)
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -243,11 +260,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _default_spec_max_running_requests(server_args)
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
@@ -267,11 +280,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             "Currently standalone speculative decoding does not support dp attention."
         )
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _default_spec_max_running_requests(server_args)
 
     if server_args.disable_overlap_schedule:
         logger.warning(
@@ -409,11 +418,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
     if not server_args.device.startswith("cuda"):
         raise ValueError("Ngram speculative decoding only supports CUDA device.")
 
-    if server_args.max_running_requests is None:
-        server_args.max_running_requests = 48
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-        )
+    _default_spec_max_running_requests(server_args)
 
     server_args.enable_mixed_chunk = False
     server_args.speculative_eagle_topk = server_args.speculative_ngram_max_bfs_breadth

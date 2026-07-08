@@ -129,6 +129,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
+        # Target-only bytes/token (the physical pool entry), BEFORE the spec
+        # draft scalings below. The unified-pool spec admission solve
+        # (_handle_max_mamba_cache_unified) uses `_cell_size - _base_cell_size`
+        # as the draft's per-token KV cost to reserve the draft-private pool's
+        # bytes (which the scaled cell only covers for the TOKEN share, not the
+        # virtual-id overshoot backing mamba/band bytes).
+        self._base_cell_size = self._cell_size
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
