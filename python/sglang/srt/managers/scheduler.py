@@ -2842,7 +2842,7 @@ class Scheduler(
             # mamba slot is ~139MB of the SHARED byte buffer, so a queue-sized
             # prefetch (100+ deep) transiently claims most of the shared gap
             # while the admission gates evaluate, starving full-KV admission
-            # (eval_232 mfs0.45 stall). Dense pools hand out byte-decoupled
+            # (a stall at small mem fractions). Dense pools hand out byte-decoupled
             # slot IDs and are indifferent to the smaller hint.
             mamba_allocator.alloc_group_begin(
                 min(
@@ -3522,7 +3522,7 @@ class Scheduler(
 
         if self.server_args.enable_unified_memory:
             try:
-                # Park an unpinned spec-state band while fully idle (I-SPEC-3):
+                # Park an unpinned spec-state band while fully idle:
                 # its bytes flow back to the end pools until the next decode
                 # step re-places it. Mamba composite only (SWA has no band).
                 park_spec_state_band = getattr(

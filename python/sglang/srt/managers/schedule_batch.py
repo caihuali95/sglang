@@ -2457,7 +2457,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # margin) between the pool frontiers. Reserving it here — in the same
         # check the retract loop converges on — makes a band shortfall retract
         # gracefully instead of tripping the fail-loud RuntimeError at
-        # place_spec_state_band_for_decode (eval_223). 0 / absent everywhere else.
+        # place_spec_state_band_for_decode. 0 / absent everywhere else.
         band_reserve_fn = getattr(
             self.token_to_kv_pool_allocator, "spec_band_reserve_full_tokens", None
         )

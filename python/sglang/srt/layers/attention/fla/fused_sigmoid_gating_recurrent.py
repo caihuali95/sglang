@@ -38,7 +38,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # hard-coded to the contiguous values (`HV*K*V` / `cache_steps*HV*K*V`),
     # which silently mis-addresses the page-major envelope's strided pool
     # views (slot stride = entry_bytes // itemsize, layer-interleaved) — the
-    # GDN spec-verify state corruption (design doc §30.3 tail; eval_248/251).
+    # GDN spec-verify state corruption.
     # Inner (within-slot / within-step) layout stays contiguous either way.
     stride_h0_slot,
     stride_cache_slot,
@@ -326,8 +326,8 @@ def fused_sigmoid_gating_delta_rule_update(
     # to exactly the old values (bit-identical); for the page-major envelope's
     # strided views (slot stride = entry_bytes // itemsize, layer-interleaved)
     # they are the ONLY correct addressing — the hard-coded versions silently
-    # read/wrote the wrong slot (GDN spec-verify corruption, design §30.3
-    # tail, eval_248/251). Inner (per-slot / per-step) layout must remain
+    # read/wrote the wrong slot (GDN spec-verify corruption). Inner
+    # (per-slot / per-step) layout must remain
     # contiguous: the kernel's within-slot addressing assumes it.
     if initial_state_source is not None:
         stride_h0_slot = initial_state_source.stride(0)

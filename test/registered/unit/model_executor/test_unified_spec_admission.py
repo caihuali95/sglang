@@ -3,11 +3,11 @@
 only, pure integer arithmetic.
 
 The solve charges, per admitted request: hard mamba slots + D spec-band rows
-(both inflated by cell/base to back the D8 virtual-id draft pool) + a token
+(both inflated by cell/base to back the virtual-id draft pool) + a token
 floor priced at the draft-scaled cell. These tests pin:
   1. d=0 (no separate draft pool, e.g. NGRAM) is byte-identical to the
      legacy formula the solve replaced,
-  2. the fit-by-construction guarantee: target buffer + D8 draft pool
+  2. the fit-by-construction guarantee: target buffer + draft pool
      (sized to the buffer's virtual-id capacity) never exceeds rest,
   3. boundary behavior (requested cap, explicit mamba slots, infeasible).
 """
@@ -39,8 +39,8 @@ def _legacy_solve(
     margin_slots,
     explicit_mamba_slots=None,
 ):
-    """The pre-draft-reserve solve (commit 477f67d57b), transcribed verbatim.
-    With cell == base the new solve must reproduce it byte-for-byte."""
+    """The pre-draft-reserve solve, transcribed verbatim. With cell == base the
+    new solve must reproduce it byte-for-byte."""
     token_floor_bytes = UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
     band_const_bytes = (1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
     per_req_bytes = (
@@ -124,15 +124,15 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
                             self.assertEqual(a.draft_reserve_bytes, 0)
 
     def test_draft_pool_fits_by_construction(self):
-        """The core Fix-(1) guarantee: reconstruct the factory's buffer
-        (tokens x base + band + mamba) and the D8 draft pool (virtual-id
-        capacity x draft bytes/token); their sum must fit in rest.
-        Pre-fix, the DFLASH draft pool (~0.75 x buffer) overflowed by ~13 GiB
-        at mfs0.8."""
+        """The core draft-reserve guarantee: reconstruct the factory's buffer
+        (tokens x base + band + mamba) and the draft pool (virtual-id
+        capacity x draft bytes/token); their sum must fit in rest. Without the
+        reserve, a heavy DFLASH draft pool (a large fraction of the buffer)
+        overflows and OOMs."""
         for params, rest_gib, requested in (
-            (QWEN_EAGLE, 35, 256),  # EAGLE mfs0.8-shaped
-            (QWEN_DFLASH, 55, 256),  # DFLASH mfs0.8-shaped (the OOM case)
-            (QWEN_DFLASH, 36, 48),  # DFLASH mfs0.6-shaped
+            (QWEN_EAGLE, 35, 256),  # EAGLE high-mfs-shaped
+            (QWEN_DFLASH, 55, 256),  # DFLASH high-mfs-shaped (the OOM case)
+            (QWEN_DFLASH, 36, 48),  # DFLASH mid-mfs-shaped
             (QWEN_EAGLE, 6, 48),  # tight budget
         ):
             rest_bytes = rest_gib * GIB

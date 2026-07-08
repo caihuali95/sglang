@@ -711,8 +711,8 @@ class UnifiedMambaPool(MambaPool):
         #
         # PER-LAYER, not the parent's all-layer `copy_from`: advanced indexing
         # materializes the gathered result, so a batched urgent flush moving
-        # 100+ mamba states allocates (layers x n x inner) transiently — 13-15
-        # GiB in eval_225, OOMing the probe-triggered flush. Looping layers
+        # 100+ mamba states allocates (layers x n x inner) transiently — tens of
+        # GiB, OOMing the probe-triggered flush. Looping layers
         # bounds the transient to 1/num_layers of the move while KEEPING the
         # batched gather-first semantics over the full src/dst sets per layer
         # (correct even when one move's dst page equals another's src —
@@ -832,8 +832,8 @@ class UnifiedMambaSlotAllocator:
         # shared buffer (~139MB each); the scheduler calls this with
         # len(waiting_queue), which can be 100+ — an uncapped prefetch
         # transiently claims most of the shared gap during every admission
-        # pass at small mem fractions (eval_232: 128-deep queue x 139MB
-        # ~= 17.8GB at mfs0.45), starving full-KV admission. Upstream's dense
+        # pass at small mem fractions (a deep queue x the per-state size can reach
+        # tens of GiB), starving full-KV admission. Upstream's dense
         # pool hands out byte-decoupled slot IDs where over-prefetch was free;
         # here it is not. Surplus is returned at alloc_group_end; a shortfall
         # falls through to per-request alloc(1) — the cap never changes WHAT

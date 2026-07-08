@@ -479,13 +479,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             # MTP / NEXTN self-draft (no --speculative-draft-model-path): the
             # target's own MTP head runs as the draft, but it STILL allocates a
-            # private, virtual-index-sized draft KV pool (D8) — for Qwen3.5 EAGLE
-            # this was 6.74 GiB. Its per-token cost is `num_nextn_predict_layers`
-            # of attention KV, so surface it as eagle_draft_num_layers to scale
-            # the configurator's cell_size and let the unified admission solve
-            # reserve it (eval_256: cell==base left `draft-KV reserve 0.00`, so
-            # the pool was unreserved — it fit the 1-mfs slack at mfs0.8 but
-            # would OOM at higher N / lower mfs, like DFLASH pre-Fix-1).
+            # private, virtual-index-sized draft KV pool. Its per-token cost is
+            # `num_nextn_predict_layers` of attention KV, so surface it as
+            # eagle_draft_num_layers to scale the configurator's cell_size and
+            # let the unified admission solve reserve it. Without this, cell ==
+            # base leaves the pool unreserved — it fits the 1-mfs slack at
+            # moderate mfs but OOMs at higher N / lower mfs.
             nnpl = self.model_config.num_nextn_predict_layers
             if nnpl is not None and int(nnpl) > 0:
                 self.eagle_draft_num_layers = int(nnpl)

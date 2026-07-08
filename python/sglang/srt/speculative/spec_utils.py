@@ -577,8 +577,7 @@ def _spec_state_band(batch: ScheduleBatch):
 def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
     """Scheduler-side, per decode step: size the spec-state band to exactly
     this batch's bs, place it at its best position (zero-copy; see
-    SpecStateBandAllocator.place_band), and PIN it. The pin window (invariant
-    I-SPEC-2) spans [here, commit_mamba_states_after_verify's finally] —
+    SpecStateBandAllocator.place_band), and PIN it. The pin window spans [here, commit_mamba_states_after_verify's finally] —
     pinning at placement (not at verify prep) closes the gap where an
     interleaved flush_opportunistic could park the freshly placed band and
     silently route the verify to the sink. Runs post-retract in
@@ -615,7 +614,7 @@ def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
 
 
 def unpin_spec_state_band(batch: ScheduleBatch) -> None:
-    """End of the pin window (I-SPEC-2): the commit scatter for this verify
+    """End of the pin window: the commit scatter for this verify
     step is enqueued (or provably not coming), so the band becomes movable
     again. No-op when the band is absent or not pinned. Every spec worker's
     verify path must reach this on its commit exit — EAGLE/NGRAM via
@@ -665,7 +664,7 @@ def commit_mamba_states_after_verify(
             target_worker, batch, accept_lens, accept_index, draft_token_num
         )
     finally:
-        # End of the pin window (I-SPEC-2): the commit scatter is enqueued, so
+        # End of the pin window: the commit scatter is enqueued, so
         # the band becomes movable again. Runs on every exit path, incl. the
         # non-mamba early returns (unpin is a no-op when never pinned).
         unpin_spec_state_band(batch)
@@ -755,22 +754,22 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
 
     # Algorithm prepare runs FIRST — it performs this step's full-KV extend
     # allocation — and the spec-state band is placed+pinned AFTER it. Ordering
-    # rationale (eval_256 EAGLE ps256 wedge, over-admission N=133): the extend
-    # alloc has built-in shortfall recovery (`_alloc_with_spec_band_reclaim`
-    # parks an UNPINNED band zero-copy + an urgent peer flush reaches the mamba
-    # pool's holes) — which is exactly the reachability `check_decode_mem`
-    # verified before admitting this step. Placing+PINNING the band BEFORE the
-    # alloc (the old order) walled the alloc off from the mamba peer holes AND
-    # disabled the reclaim (a pinned band cannot be parked), so a shortfall
-    # hard-crashed with "Prefill out of memory" instead of recovering, even
-    # with ~14 GiB physically free behind the pinned band. Allocating first
-    # lets the tokens claim their retract-reserved space (the band is still
-    # movable), then the band takes the reserved remainder. Safe: neither
-    # eagle_prepare_for_decode nor dflash's prepare reads the band — its v2p is
-    # consumed only at the verify metadata build, during the forward — so the
-    # placement still precedes every band reader, and place+pin stay atomic
-    # (I-SPEC-2 pin window opens at placement, with nothing between it and the
-    # forward that could park the freshly placed band).
+    # rationale: the extend alloc has built-in shortfall recovery
+    # (`_alloc_with_spec_band_reclaim` parks an UNPINNED band zero-copy + an
+    # urgent peer flush reaches the mamba pool's holes) — which is exactly the
+    # reachability `check_decode_mem` verified before admitting this step.
+    # Placing+PINNING the band BEFORE the alloc walls the alloc off from the
+    # mamba peer holes AND disables the reclaim (a pinned band cannot be
+    # parked), so at high concurrency a shortfall hard-crashes with "Prefill
+    # out of memory" instead of recovering, even with plenty of buffer free
+    # behind the pinned band. Allocating first lets the tokens claim their
+    # retract-reserved space (the band is still movable), then the band takes
+    # the reserved remainder. Safe: neither eagle_prepare_for_decode nor
+    # dflash's prepare reads the band — its v2p is consumed only at the verify
+    # metadata build, during the forward — so the placement still precedes
+    # every band reader, and place+pin stay atomic (the pin window opens
+    # at placement, with nothing between it and the forward that could park the
+    # freshly placed band).
     if batch.spec_algorithm.is_dflash():
         batch.spec_info.prepare_for_decode(batch)
     else:

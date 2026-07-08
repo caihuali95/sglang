@@ -102,7 +102,7 @@ class UnifiedSpecAdmission(msgspec.Struct):
     headroom_slots: int
     mamba_slots: int  # hard + radix headroom (possibly explicit-capped)
     band_bytes: int  # spec-state band at max_num_reqs (raw, un-inflated)
-    draft_reserve_bytes: int  # draft-pool backing for mamba+band bytes (D8)
+    draft_reserve_bytes: int  # draft-pool backing for mamba+band bytes
     deducted_bytes: int  # profile deduction: band + mamba, draft-inflated
     token_budget_bytes: int  # rest - deducted (converted by the SCALED cell)
 
@@ -124,19 +124,18 @@ def solve_unified_spec_admission(
 
     Every byte granted to the mamba slots or the spec-state band extends the
     unified buffer, and the DFLASH/EAGLE draft worker's PRIVATE KV pool is
-    sized to the buffer's full VIRTUAL-id capacity (D8 zero-translate:
+    sized to the buffer's full VIRTUAL-id capacity (zero-translate:
     total_bytes // base_cell_size ids x draft bytes/token). The configurator's
     draft-scaled `cell_size` (= base + draft bytes/token) already reserves the
     draft share of every TOKEN; the mamba/band bytes' share is charged here by
     inflating those terms with cell_size/base_cell_size.
 
-    LIMITATION (deliberate, documented in shared_memory_pool_design.md §33):
-    the D8 virtual-id sizing makes the draft pool span ids that mostly back
-    mamba/band bytes and can never hold draft KV — at DFLASH mfs0.8 ~94% of
-    the draft pool (37.7 GiB) is dead weight, and this reserve makes the waste
-    honest rather than removing it. Reclaiming it needs either a draft-side
-    v2p translate with a compact draft allocator (Design A) or fusing the
-    draft KV into the full-KV slot layout (Design B).
+    LIMITATION (deliberate): the virtual-id sizing makes the draft pool span
+    ids that mostly back mamba/band bytes and can never hold draft KV (the vast
+    majority of the pool for a heavy draft like DFLASH), so this reserve makes
+    the waste honest rather than removing it. TODO: reclaim it via either a
+    draft-side v2p translate with a compact draft allocator, or by fusing the
+    draft KV into the full-KV slot layout.
     """
     assert cell_size >= base_cell_size > 0
 
@@ -179,7 +178,7 @@ def solve_unified_spec_admission(
     # freely. Accounting invariant vs the factory: the factory re-adds the
     # RAW band + mamba bytes into total_bytes; this solve deducts them
     # INFLATED (x cell/base). The difference — the draft-pool backing —
-    # therefore never enters the unified buffer and stays free for the D8
+    # therefore never enters the unified buffer and stays free for the
     # draft allocation (accounting must not drift on either side).
     leftover = (
         rest_bytes
@@ -395,16 +394,14 @@ class ModelRunnerKVCacheMixin:
         (schedule_policy), check_decode_mem's probe->place->retract, and
         radix eviction.
 
-        DRAFT-POOL RESERVE (D8 virtual-index waste — see the LIMITATION note
+        DRAFT-POOL RESERVE (virtual-index waste — see the LIMITATION note
         on `solve_unified_spec_admission`): the EAGLE/DFLASH draft worker's
         private KV pool is sized to the unified buffer's VIRTUAL-id capacity,
         so every mamba/band byte granted here drags `draft_cell/base_cell`
-        extra draft-pool bytes with it (~0.75x for DFLASH Qwen3.5 — a 40 GiB
-        pool of which ~94% backs ids that can never hold draft KV). The solve
-        charges that backing so the combined footprint fits by construction
-        (previously the draft pool silently landed in the 1-mfs headroom and
-        OOMed at high mfs); reclaiming the waste itself is design-doc §33
-        (Design A: draft-side v2p translate; Design B: fused slot layout).
+        extra draft-pool bytes with it (large for a heavy DFLASH draft, most of
+        which backs ids that can never hold draft KV). The solve charges that
+        backing so the combined footprint fits by construction — otherwise the
+        draft pool silently lands in the 1-mfs headroom and OOMs at high mfs.
 
         ADMISSION CEILING: when --max-running-requests was NOT set by the
         user, the speculative hook's default of 48 (a static-partition tuning)
@@ -433,9 +430,9 @@ class ModelRunnerKVCacheMixin:
         )
 
         dp = self.dp_size if server_args.enable_dp_attention else 1
-        # Fix (2): the hook's 48 is a default, not a user decision — under the
-        # unified pool let the byte solve bound admission instead (retract is
-        # the runtime backstop). An explicit --max-running-requests binds.
+        # The hook's default of 48 is a default, not a user decision — under
+        # the unified pool let the byte solve bound admission instead (retract
+        # is the runtime backstop). An explicit --max-running-requests binds.
         requested_defaulted = getattr(
             server_args, "_max_running_requests_spec_defaulted", False
         )
@@ -454,7 +451,7 @@ class ModelRunnerKVCacheMixin:
         # the token pool right after this returns. `_cell_size` includes the
         # EAGLE/DFLASH draft-KV per-token scaling; `_base_cell_size` is the
         # target-only pool entry — their difference is the draft's per-token
-        # KV cost, which prices the D8 virtual-id draft-pool reserve.
+        # KV cost, which prices the virtual-id draft-pool reserve.
         configurator = create_memory_pool_configurator(self)
         cell_size = configurator._cell_size
         base_cell_size = getattr(configurator, "_base_cell_size", None)
@@ -535,24 +532,23 @@ class ModelRunnerKVCacheMixin:
         # spec-heavy. The band (∝ N) is large by design but is a runtime
         # SHARED gap (exact-fit at bs, ceded to full/mamba between verifies),
         # so a low token-pool *fraction* is normal for the hard-floor solve
-        # and is NOT a warning. The D8 draft pool, by contrast, is a fixed
+        # and is NOT a warning. The draft pool, by contrast, is a fixed
         # private allocation that is truly lost: draft_pool = q/(1+q) x rest
         # where q = (cell/base − 1). Fire when it exceeds the usable token
-        # pool — then the mostly-wasted draft KV (§33) outweighs the cache
-        # it protects, and only a reclaim (Design A/B) or fewer draft tokens
-        # helps (a lower mfs does not — the pool scales with the budget).
+        # pool — then the mostly-wasted draft KV outweighs the cache it
+        # protects, and only a reclaim or fewer draft tokens helps (a lower
+        # mfs does not — the pool scales with the budget).
         draft_pool_bytes = rest_bytes - rest_bytes * base_cell_size // cell_size
         if draft_pool_bytes > admission.token_budget_bytes:
             logger.warning(
-                "[unified-memory-pool] draft-waste-bound config: the D8 "
-                "virtual-index draft pool (~%.1f GiB, q=draft/target per-token "
-                "= %.2f) exceeds the token pool it backs (%.1f GiB) at "
-                "mem-fraction-static=%.2f, D=%d — most of the draft pool can "
-                "never hold draft KV (design doc §33). A higher/lower mfs "
-                "does NOT help (the pool scales with the budget); consider "
-                "(1) fewer --speculative-num-draft-tokens, (2) an explicit "
-                "--max-running-requests below %d, or (3) the §33 reclaim "
-                "(draft-side translate / fused slot) to recover it.",
+                "[unified-memory-pool] draft-waste-bound config: the "
+                "virtual-index draft KV pool (~%.1f GiB, q=draft/target "
+                "per-token = %.2f) exceeds the token pool it backs (%.1f GiB) "
+                "at mem-fraction-static=%.2f, D=%d — most of the draft pool "
+                "can never hold draft KV. A higher/lower mfs does NOT help "
+                "(the pool scales with the budget); consider (1) fewer "
+                "--speculative-num-draft-tokens or (2) an explicit "
+                "--max-running-requests below %d.",
                 draft_pool_bytes / (1 << 30),
                 (cell_size / base_cell_size) - 1.0,
                 admission.token_budget_bytes / (1 << 30),
@@ -836,13 +832,13 @@ class ModelRunnerKVCacheMixin:
         # mamba/spec bands. The draft's PRIVATE KV pool is virtual-indexed
         # (its attention backends skip the v2p translate; see
         # TritonAttnBackend), so it must span the whole virtual-id space.
-        # KNOWN WASTE (design doc §33): only max_total_num_tokens of these ids
-        # ever hold draft KV — the rest back mamba/band bytes (~94% of a
-        # 40 GiB pool at DFLASH mfs0.8). The target's admission solve charges
-        # this full footprint (_handle_max_mamba_cache_unified draft-KV
-        # reserve) so it can't OOM, but the bytes are dead weight until the
-        # draft pool gets its own v2p translate + compact allocator (Design A)
-        # or is fused into the full-KV slot layout (Design B).
+        # KNOWN WASTE: only max_total_num_tokens of these ids ever hold draft
+        # KV — the rest back mamba/band bytes (most of the pool for a heavy
+        # DFLASH draft). The target's admission solve charges this full
+        # footprint (_handle_max_mamba_cache_unified draft-KV reserve) so it
+        # can't OOM, but the bytes are dead weight. TODO: give the draft pool
+        # its own v2p translate + compact allocator, or fuse the draft KV into
+        # the full-KV slot layout, to reclaim it.
         if self.is_draft_worker and self.token_to_kv_pool_allocator is not None:
             from sglang.srt.mem_cache.multi_ended_allocator import (
                 MultiEndedAllocator,

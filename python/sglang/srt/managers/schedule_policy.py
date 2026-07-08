@@ -498,10 +498,10 @@ class PrefillAdder:
             # `place_band`'s region ceils its low bound and floors its high bound,
             # losing up to 2 band slots of the byte gap; admission must keep that
             # headroom free ON TOP of the per-request band charges, or a full-bs
-            # placement fails exactly at the reserve boundary (eval_223: gap
-            # 26.54 slots, need 26, aligned region held 25). Charged to BOTH
+            # placement fails exactly at the reserve boundary when band-page
+            # rounding eats the last slot of the aligned region. Charged to BOTH
             # budgets — capacity-side margin alone provably cannot widen the
-            # runtime gap (eval_222 vs 223: capacity shifted, gap byte-identical).
+            # runtime gap (a capacity shift leaves the runtime gap identical).
             _align_reserve = (
                 SPEC_BAND_ALIGNMENT_MARGIN_SLOTS * self._spec_band_slot_cost
             )
@@ -572,7 +572,7 @@ class PrefillAdder:
         # slot at every verify step, so each pass's budget must keep its band
         # bytes free. Charging only at admission is insufficient — offsets are
         # per-pass, so later passes would admit new requests into the running
-        # requests' band reserve (eval_223 class).
+        # requests' band reserve.
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -674,8 +674,8 @@ class PrefillAdder:
         multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
         # Spec-state band: EVERY verify-row occupies a band slot when spec is on,
         # whether the mamba state is fresh or radix-reused — so charge it
-        # unconditionally (eval_219: radix cache hits skipped it, over-admitted,
-        # and `place_band(bs)` failed). `_update_prefill_budget` decrements the
+        # unconditionally — radix cache hits must not skip it, or admission
+        # over-admits and `place_band(bs)` fails. `_update_prefill_budget` decrements the
         # mamba-slot count only for the fresh-mamba portion.
         reserve = self._spec_band_slot_cost
         if self._mamba_slot_cost and req.mamba_pool_idx is None:

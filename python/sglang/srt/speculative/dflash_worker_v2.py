@@ -1698,7 +1698,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     commit_lens=commit_lens,
                 )
         finally:
-            # End of the unified pool's spec-state band pin window (I-SPEC-2).
+            # End of the unified pool's spec-state band pin window.
             # DFLASH commits mamba states through its own chain-only path
             # rather than commit_mamba_states_after_verify (whose finally
             # normally releases the pin), so the release lives here. A band

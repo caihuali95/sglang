@@ -186,9 +186,9 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Source index is just the request index itself. MUST be int64 before it
     # multiplies src_req_stride: the band-slice slot stride is ~1.4e8 ELEMENTS,
     # so an i32 product wraps negative from src_idx >= 16 — an illegal address
-    # when the band sits low in the buffer (eval_228 eager+chunk crash) and
+    # when the band sits low in the buffer (an illegal-address crash) and
     # SILENT state corruption when it sits high enough that the wrapped
-    # address stays inside the allocation (the eval_224 accept-len anomaly).
+    # address stays inside the allocation.
     src_idx = pid_req.to(tl.int64)
 
     # Bounds check to avoid illegal memory access

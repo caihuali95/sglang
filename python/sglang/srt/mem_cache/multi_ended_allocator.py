@@ -50,8 +50,8 @@ logger = logging.getLogger(__name__)
 # low frontier and floors the high frontier, losing up to 2 band slots of the byte
 # gap. The reserve is enforced where it actually bounds the RUNTIME gap — the
 # admission/decode token budgets (schedule_policy / check_decode_mem) — since a
-# capacity-side margin provably cannot widen the runtime gap (eval_222 vs 223:
-# capacity shifted 3 slots, gap byte-identical).
+# capacity-side margin provably cannot widen the runtime gap (a capacity
+# shift leaves the runtime gap byte-identical).
 SPEC_BAND_ALIGNMENT_MARGIN_SLOTS = 3
 
 # OFF (default): cat unsorted, `_flush` sorts once. ON: sort after each cat.
@@ -179,7 +179,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self.num_virtual_ids = self.num_pages
 
         self._peer: Optional[MultiEndedAllocator] = None
-        # N-pool chain neighbors (§6.4): the nearest sub-pool below/above this
+        # N-pool chain neighbors: the nearest sub-pool below/above this
         # one in the byte buffer. For 2-pool configs `bind_peer` mirrors `_peer`
         # into the matching side; float middles are wired explicitly via
         # `bind_low_peer` / `bind_high_peer` (which override the mirror).
@@ -291,7 +291,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     def peer(self) -> Optional[MultiEndedAllocator]:
         return self._peer
 
-    # -- chain frontier walk (§6.4) --
+    # -- chain frontier walk --
 
     def _is_frontier_transparent(self) -> bool:
         """Whether neighbors' frontier checks may see through this pool.
@@ -1768,7 +1768,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
 
 class FloatMultiEndedAllocator(MultiEndedAllocator):
-    """§6.4 float MIDDLE pool: one contiguous live band of physical pages
+    """Float MIDDLE pool: one contiguous live band of physical pages
     `[low_wm_page, high_wm_page)` between two chain neighbors.
 
     - `alloc` extends toward the roomier gap (smart direction); from empty it
@@ -1984,7 +1984,7 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
     lifecycle operation, and it is zero-copy because nothing persists between
     steps. The band is pinned inside `run_batch` (metadata build → commit);
     `pin_band`/`unpin_band` enforce that placement only happens outside the
-    pin window (invariant I-SPEC-2).
+    pin window.
     """
 
     def __init__(self, *, kvcache, unified_buffer, sub_pool_name: str, device: str):
@@ -2031,7 +2031,7 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
         placement and commit. ONLY legal at the sanctioned scheduler-side
         placement point (by then no batch is in flight — the scheduler thread
         is sequential), so a surviving pin is provably stale. Everything else
-        keeps honoring the pin (I-SPEC-2)."""
+        keeps honoring the pin."""
         if self._band_pinned:
             logger.warning(
                 "SpecStateBandAllocator(%r): clearing a STALE pin at placement "
@@ -2055,7 +2055,7 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
         assert not self._band_pinned, (
             f"place_band({self.sub_pool_name!r}): band is pinned (a verify "
             "batch is in flight); placement is only legal outside the "
-            "[metadata build, commit] window (I-SPEC-2)"
+            "[metadata build, commit] window"
         )
         assert prefer_side in ("low", "high"), prefer_side
         assert 0 <= num_slots <= self.num_pages - self.min_page_index, (
@@ -2334,7 +2334,8 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         slot whether its mamba state is fresh or radix-reused, so charging it only
         for fresh-mamba requests (as folding it into `mamba_slot_full_token_cost`
         did) under-reserves the band under radix cache and `place_band(bs)` fails
-        at the next decode step (the eval_219 over-admission class).
+        at the next decode step (an over-admission class: radix cache hits let the
+        band reservation be skipped).
         """
         if self.spec_state_allocator is None:
             return 0
@@ -2411,7 +2412,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return band.place_band(0)
 
     def park_spec_state_band(self) -> None:
-        """Idle housekeeping (I-SPEC-3): park an unpinned band so its bytes
+        """Idle housekeeping: park an unpinned band so its bytes
         flow back to the end pools while nothing is running. Called from
         `Scheduler.on_idle` — NOT per scheduler loop, or a continuously
         decoding band would churn park→re-place every step."""

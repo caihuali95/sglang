@@ -206,14 +206,14 @@ class MambaAttnBackendBase(AttentionBackend):
         if band is None:
             return buf
         n = min(int(num_rows), buf.shape[0])
-        # I-SPEC-1: a PINNED band is a real verify placement and must cover
+        # Pinned-band coverage: a PINNED band is a real verify placement and must cover
         # every real row; a mismatch means the bs changed after
         # place_spec_state_band_for_decode — fail loud, not silent sink
         # corruption. Unpinned (dummy/warmup/capture) verifies legitimately
         # run against an unplaced band: their rows go to the sink by design.
         num_placed = band.num_placed_slots
         assert not band._band_pinned or n <= num_placed, (
-            f"I-SPEC-1 violated: verify rows n={n} exceed the pinned band's "
+            f"pinned-band coverage violated: verify rows n={n} exceed the pinned band's "
             f"num_placed_slots={num_placed} ({band.allocator_state_str()}); "
             "the batch size changed between band placement and the verify "
             "metadata build."
@@ -1115,7 +1115,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # and the cuda-graph replay copy then overflows Triton's
         # cuda_graph_custom_mask (sized max_num_tokens*max_context_len) by
         # bs*draft_token_num**2 — a boot-time RuntimeError on hybrid models
-        # with EAGLE + cuda graphs (Qwen3.5 NEXTN, eval_239).
+        # with EAGLE + cuda graphs (Qwen3.5 NEXTN).
         return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
 
     def update_verify_buffers_to_fill_after_draft(
@@ -1258,7 +1258,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         # reaches this call. Identity for the non-unified pool. Untranslated
         # ids are in-range physical slots, so the miss is SILENT: track states
         # land in the wrong slot once eviction/compaction makes v2p diverge
-        # from identity — the radix×spec×mamba GSM8K collapse (eval_240/249).
+        # from identity — the radix×spec×mamba accuracy collapse.
         if mamba_track_indices is not None:
             mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
                 mamba_track_indices
@@ -1296,14 +1296,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             # wait_stream barrier serializes the copy only with kernels
             # enqueued SO FAR, not with this later commit. A moved/freed
             # commit target = lost state update (the radix-reuse corruption
-            # class). Also assert the pin window (I-SPEC-2) still holds.
+            # class). Also assert the pin window still holds.
             mamba = getattr(band, "low_peer", None)
             if mamba is not None and hasattr(mamba, "physical_to_virtual"):
                 if not band._band_pinned:
                     msg = (
                         "[spec-band] COMMIT OUTSIDE PIN WINDOW: the band was "
                         "unpinned before the commit scatter was enqueued "
-                        f"(I-SPEC-2). {band.allocator_state_str()}"
+                        f"{band.allocator_state_str()}"
                     )
                     logger.error(msg)
                     raise AssertionError(msg)
