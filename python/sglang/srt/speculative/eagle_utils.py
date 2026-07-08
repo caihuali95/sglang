@@ -610,7 +610,9 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     bs = batch.batch_size()
     # Spec-state band placement happens one level up in spec_prepare_for_decode
-    # (algorithm-agnostic).
+    # (algorithm-agnostic), AFTER this function returns: the full-KV extend
+    # alloc below must run with the band still movable so its shortfall-reclaim
+    # path can park the band (a pinned band wedges the alloc — eval_256).
 
     # Accumulate penalty
     # This is a relaxed version of penalties for speculative decoding.

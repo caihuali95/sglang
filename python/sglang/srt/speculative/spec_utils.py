@@ -744,15 +744,42 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    # Unified pool: place + pin the spec-state band for this step's verify.
-    # Lives HERE (the algorithm-agnostic dispatcher) rather than inside
-    # eagle_prepare_for_decode so every current and future spec algorithm's
-    # decode prepare gets the placement by construction — a verify without a
-    # placed band silently routes its intermediate states to the sink.
-    place_spec_state_band_for_decode(batch)
+    # Recover a stale pin from a crashed previous step BEFORE the algorithm
+    # prepare's extend alloc: with placement moved after the alloc (below), a
+    # surviving pin would otherwise wall the alloc off from its own reclaim on
+    # the recovery step. Normally a no-op; place_spec_state_band_for_decode
+    # repeats it idempotently right before it re-places+pins.
+    _stale_band = _spec_state_band(batch)
+    if _stale_band is not None:
+        _stale_band.recover_stale_pin()
+
+    # Algorithm prepare runs FIRST — it performs this step's full-KV extend
+    # allocation — and the spec-state band is placed+pinned AFTER it. Ordering
+    # rationale (eval_256 EAGLE ps256 wedge, over-admission N=133): the extend
+    # alloc has built-in shortfall recovery (`_alloc_with_spec_band_reclaim`
+    # parks an UNPINNED band zero-copy + an urgent peer flush reaches the mamba
+    # pool's holes) — which is exactly the reachability `check_decode_mem`
+    # verified before admitting this step. Placing+PINNING the band BEFORE the
+    # alloc (the old order) walled the alloc off from the mamba peer holes AND
+    # disabled the reclaim (a pinned band cannot be parked), so a shortfall
+    # hard-crashed with "Prefill out of memory" instead of recovering, even
+    # with ~14 GiB physically free behind the pinned band. Allocating first
+    # lets the tokens claim their retract-reserved space (the band is still
+    # movable), then the band takes the reserved remainder. Safe: neither
+    # eagle_prepare_for_decode nor dflash's prepare reads the band — its v2p is
+    # consumed only at the verify metadata build, during the forward — so the
+    # placement still precedes every band reader, and place+pin stay atomic
+    # (I-SPEC-2 pin window opens at placement, with nothing between it and the
+    # forward that could park the freshly placed band).
     if batch.spec_algorithm.is_dflash():
         batch.spec_info.prepare_for_decode(batch)
     else:
         from sglang.srt.speculative.eagle_utils import eagle_prepare_for_decode
 
         eagle_prepare_for_decode(batch)
+    # Unified pool: place + pin the spec-state band for this step's verify.
+    # Lives HERE (the algorithm-agnostic dispatcher) so every current and
+    # future spec algorithm's decode prepare gets the placement by
+    # construction — a verify without a placed band silently routes its
+    # intermediate states to the sink.
+    place_spec_state_band_for_decode(batch)
