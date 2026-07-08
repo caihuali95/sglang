@@ -6323,17 +6323,19 @@ class ServerArgs:
         # Speculative decoding: positive allow-list. EAGLE / EAGLE3 (incl.
         # GDN/Qwen3-Next MTP, which runs under EAGLE) and NGRAM (target-only)
         # share the validated prepare/commit choke points that drive the
-        # spec-state band. Everything else stays a loud error:
+        # spec-state band. DFLASH joins them: its decode prep flows through the
+        # same algorithm-agnostic place/pin in spec_prepare_for_decode, and its
+        # chain-only mamba commit now releases the band pin on every exit path
+        # (unpin_spec_state_band in dflash_worker_v2's verify finally) — the
+        # write/commit band translation is target-side and algorithm-agnostic.
+        # Everything else stays a loud error:
         # - FROZEN_KV_MTP hides inside is_eagle() — excluded by identity: its
         #   draft aliases the TARGET pool, which the unified draft rule
         #   (virtual-indexed private pool) has not been validated against.
-        # - DFLASH commits mamba states outside commit_mamba_states_after_verify
-        #   (dflash_worker_v2 calls the backend hook directly), bypassing the
-        #   band pin/unpin window.
         # - STANDALONE runs a full-model draft; its pool sizing/translation
         #   story is unvalidated.
         if self.speculative_algorithm is not None:
-            _allowed_spec_algos = ("EAGLE", "EAGLE3", "NGRAM")
+            _allowed_spec_algos = ("EAGLE", "EAGLE3", "NGRAM", "DFLASH")
             if self.speculative_algorithm.upper() not in _allowed_spec_algos:
                 raise ValueError(
                     "--enable-unified-memory supports speculative decoding "

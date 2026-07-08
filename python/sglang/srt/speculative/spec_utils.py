@@ -586,9 +586,10 @@ def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
     equals this bs. No-op for non-unified pools.
 
     Failure should be unreachable by construction: admission charges every
-    request's band slot via mamba_slot_full_token_cost, so the ends cannot
-    legally out-grow the band's budget. The RuntimeError is a fail-loud
-    backstop for accounting bugs, not a flow-control path.
+    request's band slot via spec_band_full_token_cost, and the buffer reserves
+    SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of band-page alignment headroom, so the ends
+    cannot legally out-grow the band's placeable region. The RuntimeError is a
+    fail-loud backstop for accounting bugs, not a flow-control path.
     """
     band = _spec_state_band(batch)
     if band is None:
@@ -604,12 +605,25 @@ def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
             f"spec-state band placement failed: bs={bs} slots do not fit "
             "between the full/mamba frontiers even after an urgent flush — "
             "this indicates an admission-accounting bug "
-            "(mamba_slot_full_token_cost should reserve every request's band "
-            "slot). Workarounds: reduce --max-running-requests or increase "
+            "(spec_band_full_token_cost should reserve every request's band slot "
+            "+ SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of alignment headroom). "
+            "Workarounds: reduce --max-running-requests or increase "
             "--mem-fraction-static. "
             f"Allocator: {batch.token_to_kv_pool_allocator.debug_print()}"
         )
     band.pin_band()
+
+
+def unpin_spec_state_band(batch: ScheduleBatch) -> None:
+    """End of the pin window (I-SPEC-2): the commit scatter for this verify
+    step is enqueued (or provably not coming), so the band becomes movable
+    again. No-op when the band is absent or not pinned. Every spec worker's
+    verify path must reach this on its commit exit — EAGLE/NGRAM via
+    commit_mamba_states_after_verify's finally, DFLASH via its own
+    chain-only commit's finally (dflash_worker_v2)."""
+    band = _spec_state_band(batch)
+    if band is not None:
+        band.unpin_band()
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
@@ -654,9 +668,7 @@ def commit_mamba_states_after_verify(
         # End of the pin window (I-SPEC-2): the commit scatter is enqueued, so
         # the band becomes movable again. Runs on every exit path, incl. the
         # non-mamba early returns (unpin is a no-op when never pinned).
-        band = _spec_state_band(batch)
-        if band is not None:
-            band.unpin_band()
+        unpin_spec_state_band(batch)
 
 
 def _commit_mamba_states_after_verify_impl(

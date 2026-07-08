@@ -57,6 +57,11 @@ logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 
+# NOTE: SPEC_BAND_ALIGNMENT_MARGIN_SLOTS lives in multi_ended_allocator (the
+# layer that owns the band geometry). It is imported FUNCTION-LEVEL below —
+# multi_ended_allocator module-level-imports this module, so a module-level
+# import here would be circular.
+
 
 def _prod(iterable) -> int:
     out = 1
@@ -703,7 +708,27 @@ class UnifiedMambaPool(MambaPool):
 
     def _copy_from_physical(self, src_index: torch.Tensor, dst_index: torch.Tensor):
         # Physical-slot copy used by the allocator's `_compact_pending`.
-        MambaPool.copy_from(self, src_index, dst_index)
+        #
+        # PER-LAYER, not the parent's all-layer `copy_from`: advanced indexing
+        # materializes the gathered result, so a batched urgent flush moving
+        # 100+ mamba states allocates (layers x n x inner) transiently — 13-15
+        # GiB in eval_225, OOMing the probe-triggered flush. Looping layers
+        # bounds the transient to 1/num_layers of the move while KEEPING the
+        # batched gather-first semantics over the full src/dst sets per layer
+        # (correct even when one move's dst page equals another's src —
+        # slot-chunking would silently assume an ordering invariant instead).
+        if src_index.numel() == 0:
+            return
+        for conv in self.mamba_cache.conv:
+            for layer in range(conv.shape[0]):
+                conv[layer][dst_index] = conv[layer][src_index]
+        temporal = self.mamba_cache.temporal
+        for layer in range(temporal.shape[0]):
+            temporal[layer][dst_index] = temporal[layer][src_index]
+        if self.replayssm_write_pos is not None:
+            # Mirror MambaPool.copy_from: a copied checkpoint has no pending
+            # ReplaySSM ring entries.
+            self.replayssm_write_pos[dst_index] = 0
 
 
 class UnifiedMambaSlotAllocator:
@@ -714,11 +739,31 @@ class UnifiedMambaSlotAllocator:
     NOT clear state — clearing is deferred to ``UnifiedMambaPool.clear_slots``.
     """
 
-    def __init__(self, mea, max_size: int, device: str):
+    def __init__(
+        self, mea, max_size: int, device: str, reclaim_band=None, prefetch_cap=None
+    ):
         self._multi_ended_allocator = mea
         self._max_size = max_size  # excludes reserved slot 0
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
+        # Byte-budgeted slot count (max_mamba_cache_size) bounding the
+        # alloc_group prefetch. NOT _max_size: that is the INDEX-space size
+        # (total_bytes // entry, ~4x larger), which would let a deep-queue
+        # prefetch legally claim most of the shared gap anyway.
+        self._prefetch_cap = prefetch_cap if prefetch_cap is not None else max_size
+        # Composite's zero-copy band-park (`_reclaim_spec_state_band`), or None
+        # when spec is off. On a mamba-slot alloc shortfall the mamba frontier can
+        # be blocked by the (unpinned) spec band even though `available_size()`
+        # counts the band-transparent gap; park the band and retry once, mirroring
+        # the full-KV alloc paths' `_alloc_with_spec_band_reclaim`.
+        self._reclaim_band = reclaim_band
+
+    def _alloc_with_band_reclaim(self, need_size: int):
+        """Call the MEA alloc; on shortfall, park an unpinned band and retry once."""
+        out = self._multi_ended_allocator.alloc(need_size)
+        if out is None and self._reclaim_band is not None and self._reclaim_band():
+            out = self._multi_ended_allocator.alloc(need_size)
+        return out
 
     # -- translation (owns the v<->p mapping) --
 
@@ -770,7 +815,7 @@ class UnifiedMambaSlotAllocator:
             slot = next(self._alloc_iter, None)
             if slot is not None:
                 return slot
-        return self._multi_ended_allocator.alloc(need_size)  # VIRTUAL ids
+        return self._alloc_with_band_reclaim(need_size)  # VIRTUAL ids
 
     def free(self, free_index: torch.Tensor):
         return self._multi_ended_allocator.free(free_index)
@@ -782,8 +827,23 @@ class UnifiedMambaSlotAllocator:
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch that ``alloc(1)`` then draws from."""
         self._alloc_iter = None
+        # Cap the prefetch at the BYTE-BUDGETED remaining capacity
+        # (max_mamba_cache_size − allocated). Mamba slots are BYTES in the
+        # shared buffer (~139MB each); the scheduler calls this with
+        # len(waiting_queue), which can be 100+ — an uncapped prefetch
+        # transiently claims most of the shared gap during every admission
+        # pass at small mem fractions (eval_232: 128-deep queue x 139MB
+        # ~= 17.8GB at mfs0.45), starving full-KV admission. Upstream's dense
+        # pool hands out byte-decoupled slot IDs where over-prefetch was free;
+        # here it is not. Surplus is returned at alloc_group_end; a shortfall
+        # falls through to per-request alloc(1) — the cap never changes WHAT
+        # gets allocated, only the transient's size.
+        num_reqs = min(
+            num_reqs,
+            max(0, self._prefetch_cap - self._multi_ended_allocator.allocated_count()),
+        )
         if num_reqs > 0:
-            result = self._multi_ended_allocator.alloc(num_reqs)
+            result = self._alloc_with_band_reclaim(num_reqs)
             if result is not None:
                 self._alloc_iter = iter(result.split(1))
 
@@ -951,6 +1011,7 @@ def init_unified_mamba_pools(
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
     from sglang.srt.mem_cache.multi_ended_allocator import (
+        SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
         UnifiedMambaTokenToKVPoolAllocator,
     )
 
@@ -987,9 +1048,11 @@ def init_unified_mamba_pools(
     )
     # Spec decoding: insert the intermediate-state float band as a MIDDLE
     # sub-pool and grow the budget by its worst-case band (spec_state_size + 1
-    # slots — one per verify-batch row plus the reserved slot 0). At runtime
-    # the band occupies exactly the current verify bs; the rest of these bytes
-    # sit in the gaps, available to full/mamba growth.
+    # slots — one per verify-batch row plus the reserved slot 0 — plus
+    # SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of alignment headroom so a full-`bs`
+    # placement never fails on band-page rounding). At runtime the band occupies
+    # exactly the current verify bs; the rest of these bytes sit in the gaps,
+    # available to full/mamba growth.
     spec_state_sub_pool: Optional[str] = None
     if speculative_num_draft_tokens is not None:
         if spec_state_size is None:
@@ -1007,7 +1070,9 @@ def init_unified_mamba_pools(
             ssm_dtype=cp.dtype.temporal,
         )
         sub_pool_specs.append(spec_state_spec)
-        total_bytes += (spec_state_size + 1) * spec_state_spec.entry_bytes()
+        total_bytes += (
+            spec_state_size + 1 + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS
+        ) * spec_state_spec.entry_bytes()
     else:
         spec_state_size = max_num_reqs
     shared_pool = UnifiedKVPool(
@@ -1069,10 +1134,16 @@ def init_unified_mamba_pools(
     )
 
     # Wrap the composite's mamba MultiEndedAllocator in a slot allocator (PHYSICAL view).
+    # Share the composite's band-park so a mamba-slot alloc shortfall gets the same
+    # "movable-under-pressure" retry the full-KV alloc paths already have.
     mamba_slot_allocator = UnifiedMambaSlotAllocator(
         allocator.mamba_allocator,
         max_size=req_to_token_pool._shared_mamba_size,
         device=device,
+        reclaim_band=allocator._reclaim_spec_state_band,
+        # Byte-budgeted capacity for the alloc_group prefetch cap; _shared_
+        # mamba_size is INDEX space (~4x this) and must not bound the prefetch.
+        prefetch_cap=max_mamba_cache_size,
     )
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator

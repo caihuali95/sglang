@@ -44,6 +44,16 @@ from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 logger = logging.getLogger(__name__)
 
 
+# Extra spec-state band slots reserved beyond the per-verify-row need (`bs`). The
+# band's per-slot stride (num_draft_tokens x mamba state, ~0.5 GB) forces band-
+# page-aligned placement: `SpecStateBandAllocator._region_bounds_pages` ceils the
+# low frontier and floors the high frontier, losing up to 2 band slots of the byte
+# gap. The reserve is enforced where it actually bounds the RUNTIME gap — the
+# admission/decode token budgets (schedule_policy / check_decode_mem) — since a
+# capacity-side margin provably cannot widen the runtime gap (eval_222 vs 223:
+# capacity shifted 3 slots, gap byte-identical).
+SPEC_BAND_ALIGNMENT_MARGIN_SLOTS = 3
+
 # OFF (default): cat unsorted, `_flush` sorts once. ON: sort after each cat.
 _SORT_FREE_LIST_AFTER_MERGE = envs.SGLANG_SORT_FREE_LIST_AFTER_MERGE.get()
 
@@ -53,6 +63,15 @@ import signal
 import time as _time_mod  # local alias so tests can patch
 import weakref
 
+_DEBUG_SPEC_BAND = envs.SGLANG_DEBUG_SPEC_BAND.get()
+if _DEBUG_SPEC_BAND:
+    # Import-time confirmation: proves BOTH that the flag is set AND that this
+    # (instrumented) source is loaded — grep the server log for this line to
+    # rule out a stale tarball / unset flag when no assert fires.
+    logger.warning(
+        "[spec-band] DIAGNOSTIC ACTIVE (SGLANG_DEBUG_SPEC_BAND=1): band<->mamba "
+        "overlap check at place_band + verify translation-freshness check enabled."
+    )
 _LAZY_COMPACTION_STATS_ENABLED = envs.SGLANG_LOG_LAZY_COMPACTION_STATS.get()
 _LAZY_COMPACTION_STATS_INTERVAL_SEC = float(
     envs.SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC.get()
@@ -458,9 +477,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         peer's holes unreachable (credit 0); an unpinned band is itself
         reclaimable on the alloc-shortfall path (`_reclaim_spec_state_band`), so
         its live bytes are credited alongside the peer's holes.
+
+        MODE-INDEPENDENT: the band credit must apply in EAGER mode too (band
+        parking is zero-copy regardless of compaction mode) — gating the whole
+        walk on `peer.lazy_compaction` made `check_decode_mem`'s band reserve
+        double-count a placed band under eager (spurious retraction). The
+        peer-hole term self-zeroes for an eager peer (`_free_phys_pages` only
+        accumulates in lazy mode).
         """
         peer = self._peer
-        if peer is None or not peer.lazy_compaction:
+        if peer is None:
             return 0
         peer_hole_bytes = len(peer._free_phys_pages) * peer.entry_bytes_per_page
         # Walk toward the peer; collect any float band standing in between.
@@ -2059,7 +2085,48 @@ class SpecStateBandAllocator(FloatMultiEndedAllocator):
                 device=self.device,
                 out=self.virtual_to_physical[:num_slots],
             )
+        if _DEBUG_SPEC_BAND and num_slots > 0:
+            self._assert_band_disjoint_from_mamba(start, num_slots)
         return True
+
+    def _assert_band_disjoint_from_mamba(self, start: int, num_slots: int) -> None:
+        """DIAGNOSTIC (SGLANG_DEBUG_SPEC_BAND): fail loud if the band's physical
+        BYTE range intersects any OCCUPIED slot of the low neighbor (the mamba
+        pool). The band and mamba are distinct sub-pools that share `_raw` with
+        DIFFERENT entry_bytes and a common anchor 0, so overlap must be tested in
+        byte space. Checking the mamba pool's actual occupancy (p2v != -1),
+        NOT its allocation frontier, is the point: the suspected bug is that a
+        radix-cached mamba slot sits ABOVE the frontier the band places against,
+        so a frontier-only check would pass while the band still overwrites it.
+        """
+        mamba = self.low_peer
+        if mamba is None or not hasattr(mamba, "physical_to_virtual"):
+            return
+        p2v = mamba.physical_to_virtual[: mamba.num_pages]
+        occ = (p2v != -1).nonzero(as_tuple=False).flatten()
+        if occ.numel() == 0:
+            return
+        m_lo = occ.to(torch.int64) * int(mamba.entry_bytes_per_page)
+        m_hi = m_lo + int(mamba.entry_bytes_per_page)
+        b_lo = int(start) * int(self.entry_bytes_per_page)
+        b_hi = int(start + num_slots) * int(self.entry_bytes_per_page)
+        overlap = (m_lo < b_hi) & (m_hi > b_lo)
+        if bool(overlap.any().item()):
+            bad = occ[overlap]
+            msg = (
+                f"[spec-band] BAND OVERWRITES OCCUPIED MAMBA STATE: band bytes "
+                f"[{b_lo},{b_hi}) (pages [{start},{start + num_slots}) x "
+                f"{self.entry_bytes_per_page}B) intersect {int(overlap.sum())} "
+                f"occupied mamba slots, e.g. physical {bad[:8].tolist()} "
+                f"(mamba entry {mamba.entry_bytes_per_page}B). The band was "
+                f"placed into live mamba territory — the verify's intermediate "
+                f"writes will corrupt cached mamba states (radix-reuse bug). "
+                f"band={self.allocator_state_str()} mamba={mamba.allocator_state_str()}"
+            )
+            # Log first so the evidence survives even if an upstream retract
+            # try/except swallows the raise.
+            logger.error(msg)
+            raise AssertionError(msg)
 
     # -- band contract: no per-slot lifecycle --
 
@@ -2252,16 +2319,42 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         UP (conservative). Only on the shared composite (non-shared pools are separate,
         so the planner sources this via `getattr(..., None)`).
 
-        With spec decoding on, every admitted request ALSO occupies one
-        spec-state band slot at each verify step, so the band's per-request
-        entry is folded into the same admission charge — otherwise the ends
-        grow into the band's reserved region and `place_band(bs)` fails at the
-        next decode step (the eval_146 over-admission class).
+        Mamba-slot only; the spec-state band's per-request charge is separate
+        (`spec_band_full_token_cost`) because it is owed by EVERY running request,
+        not just those taking a fresh mamba slot.
         """
         per_req_bytes = self.mamba_allocator.entry_bytes_per_page
-        if self.spec_state_allocator is not None:
-            per_req_bytes += self.spec_state_allocator.entry_bytes_per_page
         return -(-per_req_bytes // self.full_attn_allocator.entry_bytes)
+
+    def spec_band_full_token_cost(self) -> int:
+        """Full-token-equivalents of shared-gap bytes ONE spec-state band slot
+        consumes, or 0 when spec is off.
+
+        Charged PER RUNNING REQUEST at admission: every verify-row occupies a band
+        slot whether its mamba state is fresh or radix-reused, so charging it only
+        for fresh-mamba requests (as folding it into `mamba_slot_full_token_cost`
+        did) under-reserves the band under radix cache and `place_band(bs)` fails
+        at the next decode step (the eval_219 over-admission class).
+        """
+        if self.spec_state_allocator is None:
+            return 0
+        return -(
+            -self.spec_state_allocator.entry_bytes_per_page
+            // self.full_attn_allocator.entry_bytes
+        )
+
+    def spec_band_reserve_full_tokens(self, num_reqs: int) -> int:
+        """Full-token-equivalents the NEXT verify step's band placement needs:
+        one band slot per running request plus the band-page alignment margin
+        (`place_band` ceils its low bound and floors its high bound, losing up
+        to 2 slots of the byte gap). 0 when spec is off. Consulted by the
+        decode-side budget (`ScheduleBatch.check_decode_mem`) so decode/retract
+        keep the band's bytes free — placement failure then flows into the
+        existing retract loop instead of the fail-loud RuntimeError."""
+        cost = self.spec_band_full_token_cost()
+        if cost == 0:
+            return 0
+        return (num_reqs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * cost
 
     @property
     def size_full(self) -> int:

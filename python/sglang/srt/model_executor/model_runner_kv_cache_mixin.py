@@ -148,6 +148,14 @@ class ModelRunnerKVCacheMixin:
             assert server_args.speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
 
+        # Reserve the band's per-verify-row slots PLUS alignment headroom so the
+        # deduction here matches the unified buffer's band reservation exactly
+        # (both add SPEC_BAND_ALIGNMENT_MARGIN_SLOTS). mamba_spec_state_size stays
+        # the true per-row count — only the reserved BYTES carry the margin.
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
+        )
+
         # The spec-decode intermediate reservation below is sized by a
         # capped-request count; record it so the unified pool's spec-state
         # band uses the SAME count (accounting must not drift — the deduction
@@ -169,7 +177,7 @@ class ModelRunnerKVCacheMixin:
                 )
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
+                    * (capped_reqs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS)
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -184,9 +192,39 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
+                # Cap by what this branch's own deduction can afford: taking
+                # max_running(48) verbatim reserved (48+margin) band slots
+                # ~= 28GB of intermediates at mfs0.45 against a ~13GB mamba
+                # share -> total_rest went negative -> "no GPU memory for KV
+                # cache" at boot (eval_233 chunk cells). Solve the INTERMEDIATE
+                # reservation (the only thing this branch deducts; states are
+                # budgeted later in the factory) against the mamba share:
+                #   (cap + MARGIN) * per_req * D <= rest * mfr/(1+mfr)
+                # At mfs0.85 this stays unbinding (48 provably fits there).
+                per_req = config.mamba2_cache_params.mamba_cache_per_req
+                D = server_args.speculative_num_draft_tokens
+                mamba_budget_bytes = (
+                    total_rest_memory
+                    * server_args.mamba_full_memory_ratio
+                    / (1 + server_args.mamba_full_memory_ratio)
+                ) * (1 << 30)
+                budget_cap = max(
+                    1,
+                    int(mamba_budget_bytes // (per_req * D))
+                    - SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
+                )
+                if budget_cap < server_args.max_mamba_cache_size:
+                    logger.warning(
+                        "[unified-memory-pool] chunk-mode mamba sizing capped by "
+                        "memory budget: max_mamba_cache_size %d -> %d "
+                        "(spec reservations would not fit at this mem fraction).",
+                        server_args.max_mamba_cache_size,
+                        budget_cap,
+                    )
+                    server_args.max_mamba_cache_size = budget_cap
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
+                    * (server_args.max_mamba_cache_size + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS)
                     * server_args.speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -222,7 +260,9 @@ class ModelRunnerKVCacheMixin:
                     // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = (
+                    per_req * (capped_reqs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * D
+                )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
                 self.mamba_spec_state_size = capped_reqs
             else:
@@ -526,10 +566,18 @@ class ModelRunnerKVCacheMixin:
         # (its attention backends skip the v2p translate; see
         # TritonAttnBackend), so it must span the whole virtual-id space.
         if self.is_draft_worker and self.token_to_kv_pool_allocator is not None:
+            from sglang.srt.mem_cache.multi_ended_allocator import (
+                MultiEndedAllocator,
+            )
+
             full_mea = getattr(
                 self.token_to_kv_pool_allocator, "full_attn_allocator", None
             )
-            if full_mea is not None:
+            # isinstance, not just attribute presence: the NON-unified SWA
+            # composite also exposes `full_attn_allocator`, but as a plain
+            # TokenToKVPoolAllocator (physical ids, no num_pages). Only a
+            # MultiEndedAllocator mints virtual ids the draft must span.
+            if isinstance(full_mea, MultiEndedAllocator):
                 virtual_capacity = full_mea.num_pages * full_mea.page_size
                 if virtual_capacity > self.max_total_num_tokens:
                     logger.info(

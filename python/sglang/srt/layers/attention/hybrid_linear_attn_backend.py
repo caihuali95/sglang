@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
     track_mamba_states_if_needed,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -24,6 +25,8 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_SPEC_BAND = envs.SGLANG_DEBUG_SPEC_BAND.get()
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -116,6 +119,74 @@ class MambaAttnBackendBase(AttentionBackend):
         pool). Must run everywhere mamba ids feed the SSM/conv kernels or mamba-pool
         state ops, incl. the cuda-graph replay-prep copy into ``state_indices_list``."""
         return self.req_to_token_pool.translate_mamba_indices(mamba_indices)
+
+    def _assert_verify_indices_fresh(
+        self,
+        mamba_cache_indices: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        bs: int,
+    ) -> None:
+        """DIAGNOSTIC (SGLANG_DEBUG_SPEC_BAND): at a TARGET_VERIFY metadata build,
+        assert (a) every REAL translated mamba-cache slot points to a LIVE mamba
+        page (mamba p2v != -1) — catches a STALE virtual->physical translation
+        that reads a freed/wrong slot; and (b) the band's physical slots
+        (intermediate_state_indices, which the verify WRITES) are byte-disjoint
+        from the mamba-cache slots it READS this step — catches the band sitting
+        on top of the very states being read/committed. Byte space, because band
+        and mamba are distinct sub-pools with different entry_bytes.
+        """
+        band = self._spec_state_allocator
+        if band is None or not hasattr(band, "low_peer"):
+            return
+        mamba = band.low_peer
+        if mamba is None or not hasattr(mamba, "physical_to_virtual"):
+            return
+        # Real rows only: padded/tombstoned rows carry -1.
+        mci = mamba_cache_indices[:bs]
+        real = mci[mci >= 0].to(torch.int64)
+        if real.numel() == 0:
+            return
+        # (a) freshness: translated physical slots must be occupied.
+        p2v = mamba.physical_to_virtual
+        in_range = (real >= 0) & (real < mamba.num_pages)
+        if not bool(in_range.all().item()):
+            msg = (
+                f"[spec-band] verify mamba index OUT OF RANGE: "
+                f"{real[~in_range][:8].tolist()} vs num_pages={mamba.num_pages}"
+            )
+            logger.error(msg)
+            raise AssertionError(msg)
+        live = p2v[real] != -1
+        if not bool(live.all().item()):
+            msg = (
+                f"[spec-band] STALE mamba translation: verify reads physical slots "
+                f"{real[~live][:8].tolist()} that are FREE (p2v==-1) — the "
+                f"virtual->physical map is stale; the SSM/conv read gets garbage. "
+                f"mamba={mamba.allocator_state_str()}"
+            )
+            logger.error(msg)
+            raise AssertionError(msg)
+        # (b) band-write vs mamba-read disjoint (byte space).
+        isi = intermediate_state_indices[:bs].to(torch.int64)
+        b_lo = isi * int(band.entry_bytes_per_page)
+        b_hi = b_lo + int(band.entry_bytes_per_page)
+        m_lo = real * int(mamba.entry_bytes_per_page)
+        m_hi = m_lo + int(mamba.entry_bytes_per_page)
+        # cross product (bs is small at verify): any band-row byte range hitting
+        # any mamba-read byte range is corruption.
+        overlap = (b_lo.unsqueeze(1) < m_hi.unsqueeze(0)) & (
+            b_hi.unsqueeze(1) > m_lo.unsqueeze(0)
+        )
+        if bool(overlap.any().item()):
+            msg = (
+                f"[spec-band] BAND WRITE ALIASES MAMBA READ: this verify's band slots "
+                f"(intermediate {isi[:8].tolist()}) share bytes with the mamba states "
+                f"it reads/commits (physical {real[:8].tolist()}). The intermediate "
+                f"write will clobber the recurrent state mid-verify. "
+                f"band={band.allocator_state_str()} mamba={mamba.allocator_state_str()}"
+            )
+            logger.error(msg)
+            raise AssertionError(msg)
 
     def _refresh_intermediate_state_indices(self, num_rows: int) -> torch.Tensor:
         """Refresh + return the static per-verify-row intermediate index buffer.
@@ -262,6 +333,10 @@ class MambaAttnBackendBase(AttentionBackend):
                 intermediate_state_indices = self._refresh_intermediate_state_indices(
                     bs
                 )
+                if _DEBUG_SPEC_BAND:
+                    self._assert_verify_indices_fresh(
+                        mamba_cache_indices, intermediate_state_indices, bs
+                    )
 
                 if self.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrieve_next_token
@@ -875,11 +950,19 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         use_triton_causal_conv: bool = False,
     ):
         assert isinstance(self.forward_metadata, Mamba2Metadata)
-        # Page-major stores state strided; only the stride-aware Triton causal-conv
-        # reads it (CUDA causal_conv1d garbles it). A model may also force Triton.
+        # Two independent reasons need the stride-aware Triton causal-conv, either
+        # of which forces it here (a model may also force it per-call):
+        #  1. Page-major stores the conv state strided; the CUDA causal_conv1d
+        #     assumes contiguous and garbles strided reads.
+        #  2. Speculative decoding's target-verify path needs the per-draft-token
+        #     intermediate conv windows to roll back to the last accepted token;
+        #     only the Triton kernel emits them (see mamba.py `is_target_verify`).
+        #     This covers every Mamba2-mixer target model without a per-model force.
+        server_args = get_global_server_args()
         use_triton_causal_conv = (
             use_triton_causal_conv
-            or get_global_server_args().enable_page_major_kv_layout
+            or server_args.enable_page_major_kv_layout
+            or server_args.speculative_algorithm is not None
         )
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         mixer_out, intermediate_states = mixer.forward(
@@ -1022,6 +1105,26 @@ class HybridLinearAttnBackend(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cpu_graph_seq_len_fill_value()
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        # Forward to the full-attn sub-backend (the same non-propagation class
+        # as translate_metadata_in_graph): the tree/chain mask lives in the
+        # FULL-attention verify kernels. Without this forward the base class
+        # returns [None, None], so the EAGLE draft loop falls back to
+        # allocating a worst-case bs*max_context_len mask every step whenever
+        # batch.seq_lens_sum is unavailable (the sync-free spec-overlap path),
+        # and the cuda-graph replay copy then overflows Triton's
+        # cuda_graph_custom_mask (sized max_num_tokens*max_context_len) by
+        # bs*draft_token_num**2 — a boot-time RuntimeError on hybrid models
+        # with EAGLE + cuda graphs (Qwen3.5 NEXTN, eval_239).
+        return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        self.full_attn_backend.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
+
     def forward_decode(
         self,
         layer: RadixAttention,
@@ -1146,6 +1249,21 @@ class HybridLinearAttnBackend(AttentionBackend):
             ]
         )
 
+        # `mamba_track_indices` arrives VIRTUAL: every spec commit caller
+        # (spec_utils + dflash_worker_v2) passes the ScheduleBatch field, which
+        # set_mamba_track_indices_from_reqs rebuilds from allocator-minted
+        # ping-pong track ids. The scatters below address PHYSICAL state views,
+        # so translate at this seam — the forward path's equivalent translate
+        # (init_forward_metadata) only rebinds the ForwardBatch copy and never
+        # reaches this call. Identity for the non-unified pool. Untranslated
+        # ids are in-range physical slots, so the miss is SILENT: track states
+        # land in the wrong slot once eviction/compaction makes v2p diverge
+        # from identity — the radix×spec×mamba GSM8K collapse (eval_240/249).
+        if mamba_track_indices is not None:
+            mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
+                mamba_track_indices
+            )
+
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
@@ -1169,6 +1287,52 @@ class HybridLinearAttnBackend(AttentionBackend):
             intermediate_conv_window_cache = intermediate_conv_window_cache[
                 :, start:stop
             ]
+
+        if _DEBUG_SPEC_BAND and band is not None:
+            # CHECK 3 (commit freshness): the commit scatter targets the
+            # PHYSICAL mamba slots snapshotted at this batch's metadata build.
+            # Under OVERLAP, the scheduler thread may free/compact mamba slots
+            # for the NEXT batch before this commit is enqueued — free()'s
+            # wait_stream barrier serializes the copy only with kernels
+            # enqueued SO FAR, not with this later commit. A moved/freed
+            # commit target = lost state update (the radix-reuse corruption
+            # class). Also assert the pin window (I-SPEC-2) still holds.
+            mamba = getattr(band, "low_peer", None)
+            if mamba is not None and hasattr(mamba, "physical_to_virtual"):
+                if not band._band_pinned:
+                    msg = (
+                        "[spec-band] COMMIT OUTSIDE PIN WINDOW: the band was "
+                        "unpinned before the commit scatter was enqueued "
+                        f"(I-SPEC-2). {band.allocator_state_str()}"
+                    )
+                    logger.error(msg)
+                    raise AssertionError(msg)
+                _commit_phys = state_indices_tensor.to(torch.int64)
+                # Also validate the track-state commit lane (the radix cached-
+                # state writes) — rows that will actually scatter (steps != -1).
+                if mamba_track_indices is not None and mamba_steps_to_track is not None:
+                    _track_phys = mamba_track_indices.to(torch.int64)[
+                        mamba_steps_to_track != -1
+                    ]
+                    _commit_phys = torch.cat([_commit_phys, _track_phys])
+                _real = _commit_phys[
+                    (_commit_phys >= 0) & (_commit_phys < mamba.num_pages)
+                ]
+                if _real.numel() > 0:
+                    _stale = mamba.physical_to_virtual[_real] == -1
+                    if bool(_stale.any().item()):
+                        msg = (
+                            "[spec-band] STALE COMMIT TARGET: the verify commit "
+                            "scatter writes to physical mamba slots "
+                            f"{_real[_stale][:8].tolist()} that are FREE now "
+                            "(p2v==-1) — the slot was freed/compaction-moved "
+                            "between this batch's metadata build and its "
+                            "commit (overlap window). The accepted state is "
+                            "lost / lands in reusable memory. "
+                            f"mamba={mamba.allocator_state_str()}"
+                        )
+                        logger.error(msg)
+                        raise AssertionError(msg)
 
         fused_mamba_state_scatter_with_mask(
             ssm_states,

@@ -2837,7 +2837,19 @@ class Scheduler(
 
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+            # Prefetch at most what this pass could POSSIBLY admit (request-
+            # count bound), not the raw queue depth. Under the unified pool a
+            # mamba slot is ~139MB of the SHARED byte buffer, so a queue-sized
+            # prefetch (100+ deep) transiently claims most of the shared gap
+            # while the admission gates evaluate, starving full-KV admission
+            # (eval_232 mfs0.45 stall). Dense pools hand out byte-decoupled
+            # slot IDs and are indifferent to the smaller hint.
+            mamba_allocator.alloc_group_begin(
+                min(
+                    len(self.waiting_queue),
+                    max(0, self.get_num_allocatable_reqs(len(self.running_batch.reqs))),
+                )
+            )
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):

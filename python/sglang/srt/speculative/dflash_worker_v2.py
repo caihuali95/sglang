@@ -32,7 +32,10 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    unpin_spec_state_band,
+)
 from sglang.srt.speculative.triton_ops.cache_locs import assign_extend_cache_locs_func
 from sglang.srt.speculative.triton_ops.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -1686,13 +1689,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-        if need_mamba_verify_commit:
-            assert seq_lens_pre_verify is not None
-            self._update_target_mamba_state_after_verify(
-                batch=batch,
-                seq_lens_pre_verify=seq_lens_pre_verify,
-                commit_lens=commit_lens,
-            )
+        try:
+            if need_mamba_verify_commit:
+                assert seq_lens_pre_verify is not None
+                self._update_target_mamba_state_after_verify(
+                    batch=batch,
+                    seq_lens_pre_verify=seq_lens_pre_verify,
+                    commit_lens=commit_lens,
+                )
+        finally:
+            # End of the unified pool's spec-state band pin window (I-SPEC-2).
+            # DFLASH commits mamba states through its own chain-only path
+            # rather than commit_mamba_states_after_verify (whose finally
+            # normally releases the pin), so the release lives here. A band
+            # can only exist when the target is hybrid-mamba, in which case
+            # need_mamba_verify_commit is True by construction; the finally
+            # covers the commit-raised paths, and unpin is a no-op when the
+            # band is absent or never pinned.
+            unpin_spec_state_band(batch)
 
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)

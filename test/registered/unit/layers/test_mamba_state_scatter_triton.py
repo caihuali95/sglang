@@ -461,5 +461,51 @@ class TestEnvelopeStridedScatter(unittest.TestCase):
         self.assertFalse(_trailing_dims_contiguous(trail_strided, 2))
 
 
+class TestScatterInt32OverflowRegression(unittest.TestCase):
+    """eval_228 regression: `src_idx * src_req_stride` computed in int32 wraps
+    negative once the product exceeds 2**31 (the band-slice slot stride is
+    ~1.4e8 ELEMENTS in production, so row >= 16 wraps) — an illegal access when
+    the band sits low in the buffer, SILENT state corruption when it sits high
+    enough that the wrapped address stays in-range. The byte-parity test above
+    uses bs=3 and can never reach the wrap threshold; this one uses a
+    production-scale stride so any i32 regression faults or mis-copies loudly."""
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_large_stride_row_ge_16_byte_parity(self):
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+            fused_mamba_state_scatter_with_mask,
+        )
+
+        free, _ = torch.cuda.mem_get_info()
+        # The backing must genuinely span > 2**31 elements to make the wrap
+        # reachable: 24 rows x 140e6 elems x 2B ~= 6.3 GiB.
+        rows, req_stride, inner = 24, 140_000_000, 64
+        need = rows * req_stride * 2 + (1 << 30)
+        if free < need:
+            self.skipTest(f"needs ~{need >> 30} GiB free GPU memory")
+
+        backing = torch.zeros(rows * req_stride, dtype=torch.bfloat16, device="cuda")
+        for r in range(rows):
+            backing[r * req_stride : r * req_stride + inner] = float(r + 1)
+        # src view [layers=1, rows, steps=1, inner] with the production-scale
+        # slot stride; single layer/step so their strides are inert.
+        src = backing.as_strided((1, rows, 1, inner), (0, req_stride, 0, 1))
+        dst = torch.zeros(1, rows + 4, inner, dtype=torch.bfloat16, device="cuda")
+
+        dst_indices = torch.arange(rows, dtype=torch.int64, device="cuda")
+        steps = torch.zeros(rows, dtype=torch.int64, device="cuda")
+        fused_mamba_state_scatter_with_mask(dst, src, dst_indices, steps)
+        torch.cuda.synchronize()
+
+        expect = torch.arange(1, rows + 1, dtype=torch.bfloat16, device="cuda")
+        got = dst[0, :rows, 0]
+        # Rows >= 16 are the wrap territory (16 x 140e6 > 2**31); every row
+        # must carry its marker value, byte-exact.
+        self.assertTrue(
+            torch.equal(got, expect),
+            f"row markers mismatch (i32 wrap regression): got={got.tolist()}",
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

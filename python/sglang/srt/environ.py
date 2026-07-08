@@ -282,6 +282,12 @@ class Envs:
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Unified spec-state band diagnostics (band<->mamba overlap at placement +
+    # translation freshness at verify). Fires loud asserts when the band's
+    # physical bytes intersect an occupied mamba slot, or when a verify's
+    # translated mamba index points to a freed slot — the suspected
+    # radix-reuse mamba-state corruption class. Off in production.
+    SGLANG_DEBUG_SPEC_BAND = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)

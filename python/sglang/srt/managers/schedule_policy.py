@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.multi_ended_allocator import (
+    SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -474,6 +475,39 @@ class PrefillAdder:
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
 
+        # Unified-pool joint budget costs — computed BEFORE the running-batch
+        # loop below because `_get_running_request_total_token_offset` charges
+        # each running request's spec-band slot (see `_spec_band_slot_cost`).
+        self._mamba_slot_cost = 0
+        # Per-running-request spec-state band charge (0 when spec is off). Kept
+        # SEPARATE from `_mamba_slot_cost` because a fresh mamba slot is owed only
+        # by requests with no cached state, whereas a band slot is owed by EVERY
+        # verify-row (see `_mamba_gap_budget_for_req`).
+        self._spec_band_slot_cost = 0
+        if isinstance(
+            self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
+        ):
+            self._mamba_slot_cost = (
+                self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
+            )
+            self._spec_band_slot_cost = (
+                self.token_to_kv_pool_allocator.spec_band_full_token_cost()
+            )
+        if self._spec_band_slot_cost:
+            # Constant (per-pass, NOT per-request) band-page ALIGNMENT reserve.
+            # `place_band`'s region ceils its low bound and floors its high bound,
+            # losing up to 2 band slots of the byte gap; admission must keep that
+            # headroom free ON TOP of the per-request band charges, or a full-bs
+            # placement fails exactly at the reserve boundary (eval_223: gap
+            # 26.54 slots, need 26, aligned region held 25). Charged to BOTH
+            # budgets — capacity-side margin alone provably cannot widen the
+            # runtime gap (eval_222 vs 223: capacity shifted, gap byte-identical).
+            _align_reserve = (
+                SPEC_BAND_ALIGNMENT_MARGIN_SLOTS * self._spec_band_slot_cost
+            )
+            self.rem_total_token_offset += _align_reserve
+            self.cur_rem_token_offset += _align_reserve
+
         if running_batch is not None:
             # Estimate the offset in the remaining token space
             self.rem_total_token_offset += sum(
@@ -496,19 +530,9 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
-        # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
-        # that `rem_total_tokens` (full KV) otherwise counts as free, so reserve
-        # the gap per new mamba slot or admission over-commits. Gate on the
-        # ALLOCATOR being the unified Mamba composite, NOT on `is_hybrid_ssm_cache`
-        # (False for `ChunkCache`, which would skip the reservation on the
-        # chunk-cache path): the gap coupling is a property of the byte buffer.
-        self._mamba_slot_cost = 0
-        if isinstance(
-            self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
-        ):
-            self._mamba_slot_cost = (
-                self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
-            )
+        # (Unified-pool joint-budget costs `_mamba_slot_cost` /
+        # `_spec_band_slot_cost` are computed ABOVE the running-batch offset
+        # loop — running requests carry their band slot in every pass.)
 
         # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
         # `full_evictable_size()` — but `alloc_req_slots` can only recover
@@ -544,12 +568,18 @@ class PrefillAdder:
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        # `_spec_band_slot_cost`: a RUNNING request occupies one spec-state band
+        # slot at every verify step, so each pass's budget must keep its band
+        # bytes free. Charging only at admission is insufficient — offsets are
+        # per-pass, so later passes would admit new requests into the running
+        # requests' band reserve (eval_223 class).
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
                 CLIP_MAX_NEW_TOKENS,
             )
             * self.new_token_ratio
+            + self._spec_band_slot_cost
         )
 
     @property
@@ -642,9 +672,15 @@ class PrefillAdder:
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
         multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
+        # Spec-state band: EVERY verify-row occupies a band slot when spec is on,
+        # whether the mamba state is fresh or radix-reused — so charge it
+        # unconditionally (eval_219: radix cache hits skipped it, over-admitted,
+        # and `place_band(bs)` failed). `_update_prefill_budget` decrements the
+        # mamba-slot count only for the fresh-mamba portion.
+        reserve = self._spec_band_slot_cost
         if self._mamba_slot_cost and req.mamba_pool_idx is None:
-            return self._mamba_slot_cost
-        return 0
+            reserve += self._mamba_slot_cost
+        return reserve
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -696,8 +732,14 @@ class PrefillAdder:
             extend_input_len + page_overhead + mamba_gap_reserve
         )
         # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__).
-        if mamba_gap_reserve and self.rem_mamba_slots is not None:
+        # separately so full_evictable can't cover it — see __init__). Decrement
+        # ONLY when a FRESH mamba slot was taken: `mamba_gap_reserve` exceeding the
+        # band-only charge means the mamba portion is present (a radix-reused state
+        # charges the band alone and consumes no mamba slot).
+        if (
+            mamba_gap_reserve > self._spec_band_slot_cost
+            and self.rem_mamba_slots is not None
+        ):
             self.rem_mamba_slots -= 1
         self.rem_input_tokens -= extend_input_len
 
@@ -857,7 +899,8 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
-        if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
+        _budget_floor = min(self.cur_rem_tokens, self.rem_total_tokens)
+        if paged_input > _budget_floor:
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if self._swa_budget_for_req(cand_extend_input_len) > self.rem_swa_tokens:
