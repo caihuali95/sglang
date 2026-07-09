@@ -528,6 +528,18 @@ class PrefillAdder:
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
+        # Alignment unit for a budget-bound (truncated) prefill chunk. A request
+        # that is still unfinished gets cached mid-prefill, and the paged/SSM
+        # radix cache asserts the cached (page-aligned) length is an exact
+        # multiple of the page. For SSM caches the mamba chunk size (always a
+        # multiple of the page) is the stricter unit, since mamba state is
+        # checkpointed on chunk boundaries. Only meaningful for page_size > 1.
+        self._chunked_prefill_align = (
+            get_global_server_args().mamba_cache_chunk_size
+            if self.is_hybrid_ssm_cache
+            else self.page_size
+        )
+
         self.rem_swa_token_offset = 0
 
         # (Unified-pool joint-budget costs `_mamba_slot_cost` /
@@ -857,6 +869,22 @@ class PrefillAdder:
         )
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
+        if truncated and self.page_size > 1:
+            # A budget-bound chunk must end on an alignment boundary. This request
+            # is still unfinished, so it is cached mid-prefill and the radix cache
+            # asserts the cached length is an exact multiple of the page (for SSM
+            # caches, the mamba chunk). Under tight memory `_rem_tokens` can be a
+            # sub-page sliver; without this floor the fill boundary lands off-page
+            # and caching it crashes the scheduler.
+            aligned_len = (
+                new_len // self._chunked_prefill_align * self._chunked_prefill_align
+            )
+            if aligned_len <= 0:
+                # Less than one aligned unit of headroom this pass: park the chunk
+                # (it stays tracked as `self.chunked_req`) and retry once decode
+                # frees memory. Mirrors the hybrid-SWA `_rem_tokens <= 0` branch.
+                return req
+            new_len = aligned_len
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
         self.can_run_list.append(req)
         self._update_prefill_budget(
