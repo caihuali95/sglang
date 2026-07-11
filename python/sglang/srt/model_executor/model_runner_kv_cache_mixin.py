@@ -72,13 +72,12 @@ def _should_enable_lazy_compaction() -> bool:
 
 
 def _should_enable_fused_draft_kv() -> bool:
-    """Fused draft KV (Stage 4.1, design doc §33.4 Design B) — bring-up
-    opt-in via `SGLANG_ENABLE_FUSED_DRAFT_KV=1`; flips to default-on (with a
-    `SGLANG_DISABLE_FUSED_DRAFT_KV` escape hatch) once GPU-eval-validated.
-    The ONLY env read site — target factory wiring and the draft worker's
-    pool binding both route through here.
+    """Fused draft KV (Stage 4.1, design doc §33.4 Design B) default — ON
+    unless `SGLANG_DISABLE_FUSED_DRAFT_KV=1` (escape hatch for A/B /
+    rollback to the private-pool + reserve path). The ONLY env read site —
+    everything downstream keys on `draft_kv_geometry is not None`.
     """
-    return envs.SGLANG_ENABLE_FUSED_DRAFT_KV.get()
+    return not envs.SGLANG_DISABLE_FUSED_DRAFT_KV.get()
 
 
 # the ratio of mamba cache pool size to max_running_requests

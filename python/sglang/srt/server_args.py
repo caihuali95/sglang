@@ -6328,12 +6328,18 @@ class ServerArgs:
         # chain-only mamba commit now releases the band pin on every exit path
         # (unpin_spec_state_band in dflash_worker_v2's verify finally) — the
         # write/commit band translation is target-side and algorithm-agnostic.
+        # This allow-list is ALSO the fused-draft-KV eligibility set (Stage
+        # 4.1): EAGLE/EAGLE3 (incl. multi-layer) and DFLASH drafts fuse their
+        # KV into the full sub-pool's slot entries by default
+        # (SGLANG_DISABLE_FUSED_DRAFT_KV=1 falls back to the private pool +
+        # admission reserve); NGRAM has no draft KV to fuse.
         # Everything else stays a loud error:
         # - FROZEN_KV_MTP hides inside is_eagle() — excluded by identity: its
         #   draft aliases the TARGET pool, which the unified draft rule
         #   (virtual-indexed private pool) has not been validated against.
         # - STANDALONE runs a full-model draft; its pool sizing/translation
-        #   story is unvalidated.
+        #   story is unvalidated (and its many-layer draft would inflate the
+        #   fused entry prohibitively).
         if self.speculative_algorithm is not None:
             _allowed_spec_algos = ("EAGLE", "EAGLE3", "NGRAM", "DFLASH")
             if self.speculative_algorithm.upper() not in _allowed_spec_algos:

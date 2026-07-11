@@ -2443,14 +2443,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Gate here so `draft_kv_geometry is not None` <=> fusion enabled —
         # the single condition every consumer (factories, configurators,
-        # _init_unified_draft_pool via has_draft_region) keys on.
+        # _init_unified_draft_pool via has_draft_region) keys on. Algorithm
+        # eligibility is the server_args unified spec allow-list (EAGLE /
+        # EAGLE3 / DFLASH carry draft KV; NGRAM has none).
         if (
             self.is_draft_worker
             or not self.server_args.enable_unified_memory
             or self.spec_algorithm.is_none()
             or not self.spec_algorithm.has_draft_kv()
-            or not _should_enable_fused_draft_kv()
         ):
+            return
+        if not _should_enable_fused_draft_kv():
+            logger.info(
+                "[unified-memory-pool] fused draft KV disabled "
+                "(SGLANG_DISABLE_FUSED_DRAFT_KV=1): falling back to the "
+                "virtual-index-sized private draft pool + admission reserve."
+            )
             return
 
         from sglang.srt.layers.dp_attention import get_attention_tp_size
