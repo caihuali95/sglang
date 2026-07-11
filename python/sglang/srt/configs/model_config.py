@@ -929,6 +929,17 @@ class ModelConfig:
         self.num_nextn_predict_layers = getattr(
             self.hf_text_config, "num_nextn_predict_layers", None
         )
+        if self.num_nextn_predict_layers is None:
+            # `_config_draft_model` (run earlier in __init__) sets this on
+            # `hf_config`, but for nested configs (e.g. Qwen3.5's
+            # Qwen3_5ForConditionalGeneration) `hf_text_config` is a DIFFERENT
+            # object, so the value never surfaced. Consumers then fell back to
+            # the FULL model's layer count and sized the MTP draft's KV at 32
+            # layers instead of 1 (eval_272: fused draft region 32 layers ->
+            # 5x cell inflation; the private draft pool was equally oversized).
+            self.num_nextn_predict_layers = getattr(
+                self.hf_config, "num_nextn_predict_layers", None
+            )
         self.vocab_size = self.hf_text_config.vocab_size
 
     def get_total_num_attention_heads(self) -> int:

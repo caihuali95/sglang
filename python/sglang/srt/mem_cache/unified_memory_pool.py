@@ -703,6 +703,45 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 page_size=self._page_size,
             )
 
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale=None,
+        v_scale=None,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Commit only each row's valid prefix (DFLASH's block write).
+
+        MUST override: the parent's fused kernel writes through a packed
+        `row_dim` stride, but our K/V are 4-D strided envelope views
+        (stride[0] = page_bytes), so it would scatter to the WRONG addresses —
+        silently, no crash. This is the same assumption that forced the
+        `set_kv_buffer` override. Reduce to the valid rows and route through
+        the stride-aware `set_kv_buffer` (exactly what the parent already does
+        on non-CUDA). `loc_2d` is PHYSICAL — DFLASH translates at its choke
+        point (`_append_target_hidden_to_draft_kv_by_loc`).
+        """
+        if loc_2d.ndim != 2:
+            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+        row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        valid = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+        valid_idx = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
+        if valid_idx.numel() == 0:
+            return
+        self.set_kv_buffer(
+            layer,
+            loc_2d.reshape(-1).index_select(0, valid_idx),
+            cache_k.index_select(0, valid_idx),
+            cache_v.index_select(0, valid_idx),
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id_override,
+        )
+
     def get_contiguous_buf_infos(self):
         # PD-disaggregation KV transfer assumes densely packed rows; a fused
         # slot interleaves draft bytes between host rows, so the item/len
@@ -736,6 +775,17 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             "UnifiedMHATokenToKVPool.set_kv_buffer: decode context parallel "
             "(dcp_kv_mask) is not supported with --enable-unified-memory."
         )
+        # Accept a bare loc OR a KVWriteLoc. Composite pools (HybridLinearKVPool,
+        # UnifiedSWAKVPool) unwrap and hand us a bare PHYSICAL tensor, which is
+        # the only way this pool was reached before Stage 4.1. A fused DENSE
+        # draft (DFLASH / EAGLE3 checkpoint) binds UnifiedDraftKVPool as the
+        # runner's token_to_kv_pool DIRECTLY, so the backend's KVWriteLoc lands
+        # here raw (eval_272: 'KVWriteLoc' object has no attribute 'numel').
+        # `full_loc` is the pre-translated PHYSICAL loc; a bare `loc` is already
+        # physical.
+        loc, _, full_loc = unwrap_write_loc(loc)
+        if full_loc is not None:
+            loc = full_loc
         # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't
         # merge our 4-D layer-major view (stride[0]=page_bytes) at page_size>1. Call
         # store_cache_4d_kernel directly. `loc` is PHYSICAL token ids — no v2p translate.

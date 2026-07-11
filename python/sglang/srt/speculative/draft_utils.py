@@ -19,16 +19,25 @@ logger = logging.getLogger(__name__)
 _SINGLE_LAYER_MTP_ARCHS = ("MiMoV2MTP", "Step3p5MTP")
 
 
-def _draft_layer_count(model_config: "ModelConfig") -> int:
+def _draft_layer_count(model_config: "ModelConfig") -> Optional[int]:
     """KV layer count of one draft runner, mirroring the ModelRunner rules:
     the single-layer MTP arch override first, then `num_nextn_predict_layers`,
-    then the dense-draft hidden/attention layer count."""
+    then the dense-draft hidden/attention layer count.
+
+    Returns None for an MTP/NextN draft whose head size cannot be determined —
+    falling back to `num_hidden_layers` there would size the draft region at the
+    WHOLE target (eval_272: 32 layers instead of 1, a 5x cell inflation). A
+    dense draft checkpoint (DFLASH / EAGLE3) legitimately uses its own layer
+    count, so only the MTP archs get the guard.
+    """
     arch = model_config.hf_config.architectures[0]
     if arch in _SINGLE_LAYER_MTP_ARCHS:
         return 1
     nnpl = model_config.num_nextn_predict_layers
     if nnpl is not None and int(nnpl) > 0:
         return int(nnpl)
+    if _is_mtp_draft_arch(model_config):
+        return None
     return int(
         max(model_config.num_hidden_layers, model_config.num_attention_layers)
     )
@@ -90,9 +99,10 @@ def resolve_draft_kv_geometry(
         # holds by construction; the fused draft region concatenates their
         # layers (step i occupies layer sub-range i, keyed by draft_model_idx).
         num_steps = int(server_args.speculative_num_steps or 0)
-        if num_steps <= 0:
+        per_step = _draft_layer_count(cfg)
+        if num_steps <= 0 or per_step is None:
             return None
-        layer_num = num_steps * _draft_layer_count(cfg)
+        layer_num = num_steps * per_step
     elif spec_algorithm.is_dflash():
         from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
@@ -100,6 +110,8 @@ def resolve_draft_kv_geometry(
         layer_num = int(dflash_config.require_num_layers())
     elif draft_model_config is not None:
         layer_num = _draft_layer_count(draft_model_config)
+        if layer_num is None:
+            return None
     else:
         # MTP/NEXTN self-draft: no MTP layers -> no draft KV to fuse.
         nnpl = target_model_config.num_nextn_predict_layers

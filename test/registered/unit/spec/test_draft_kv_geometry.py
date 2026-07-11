@@ -140,6 +140,43 @@ class TestResolveDraftKvGeometry(CustomTestCase):
         self.assertEqual(geometry.layer_num, 1)
         self.assertEqual(geometry.head_num, 8)
 
+    def test_mtp_draft_never_sizes_at_the_full_model(self):
+        """eval_272 regression: ModelConfig surfaces num_nextn_predict_layers from
+        hf_TEXT_config, but _config_draft_model sets it on hf_config — for nested
+        configs (Qwen3.5) those differ, so nnpl read as None and the layer count
+        fell through to num_hidden_layers: the draft region was sized at the WHOLE
+        32-layer target (5x cell inflation) instead of the 1-layer MTP head.
+        ModelConfig now falls back to hf_config; this pins the resolver's guard so
+        an MTP draft with an indeterminable head size refuses to fuse rather than
+        fusing the full model."""
+        mtp_no_nnpl = _model_config(
+            arch="Qwen3_5ForCausalLMMTP",
+            num_nextn_predict_layers=None,  # nnpl failed to surface
+            num_hidden_layers=32,  # the FULL target's depth
+        )
+        self.assertIsNone(
+            _resolve(
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                target_model_config=_model_config(),
+                draft_model_config=mtp_no_nnpl,
+                is_self_draft=True,
+            ),
+            "an MTP draft must never size its region at the full model",
+        )
+        # With nnpl surfaced (the ModelConfig fix), it fuses at 1 layer.
+        mtp = _model_config(
+            arch="Qwen3_5ForCausalLMMTP",
+            num_nextn_predict_layers=1,
+            num_hidden_layers=32,
+        )
+        geometry = _resolve(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            target_model_config=_model_config(),
+            draft_model_config=mtp,
+            is_self_draft=True,
+        )
+        self.assertEqual(geometry.layer_num, 1)
+
     def test_self_draft_without_mtp_head_does_not_fuse_full_model(self):
         """Safety guard: if the is_draft_model re-read did NOT swap in an MTP arch,
         the target has no MTP head and cfg.num_hidden_layers is the FULL model's —
