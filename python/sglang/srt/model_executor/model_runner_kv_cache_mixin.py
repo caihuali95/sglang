@@ -71,6 +71,16 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
+def _should_enable_fused_draft_kv() -> bool:
+    """Fused draft KV (Stage 4.1, design doc §33.4 Design B) — bring-up
+    opt-in via `SGLANG_ENABLE_FUSED_DRAFT_KV=1`; flips to default-on (with a
+    `SGLANG_DISABLE_FUSED_DRAFT_KV` escape hatch) once GPU-eval-validated.
+    The ONLY env read site — target factory wiring and the draft worker's
+    pool binding both route through here.
+    """
+    return envs.SGLANG_ENABLE_FUSED_DRAFT_KV.get()
+
+
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
@@ -732,6 +742,11 @@ class ModelRunnerKVCacheMixin:
             # access: handle_max_mamba_cache always runs before pool init for
             # mambaish configs.
             spec_state_size=self.mamba_spec_state_size,
+            # Fused draft KV (Stage 4.1): attach the draft region to the full
+            # sub-pool so draft KV rides inside the fused slot entries.
+            draft_kv_geometry=(
+                self.draft_kv_geometry if _should_enable_fused_draft_kv() else None
+            ),
         )
         self.req_to_token_pool = bundle.req_to_token_pool
         self.token_to_kv_pool = bundle.token_to_kv_pool
@@ -816,15 +831,113 @@ class ModelRunnerKVCacheMixin:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # Fused draft KV (Stage 4.1): the dense draft fuses into the FULL
+            # sub-pool (a DSV4-style draft would attach to "swa" instead).
+            draft_kv_geometry=(
+                self.draft_kv_geometry if _should_enable_fused_draft_kv() else None
+            ),
         )
         self.token_to_kv_pool = bundle.token_to_kv_pool
         self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = bundle.unified_memory_pool
 
+    def _init_unified_draft_pool(self: ModelRunner) -> bool:
+        """DRAFT worker under a fused-draft-KV target (Stage 4.1): bind
+        `token_to_kv_pool` to the DRAFT-region views of the target's unified
+        full sub-pool instead of allocating a private, virtual-index-sized
+        pool. Returns True when the fused binding was made; the caller must
+        then skip all pool construction (the shared allocator/req_to_token
+        came in through the spec-worker handoff).
+        """
+        if not self.is_draft_worker:
+            return False
+        unified_buffer = getattr(
+            self.token_to_kv_pool_allocator, "unified_buffer", None
+        )
+        if unified_buffer is None or not unified_buffer.has_draft_region("full"):
+            return False
+
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
+
+        # The target built the region from resolve_draft_kv_geometry; validate
+        # this runner's actual geometry against it (a mismatch would silently
+        # corrupt neighboring slots).
+        region = unified_buffer.mha_spec("full").draft_region
+        head_num = self.model_config.get_num_kv_heads(get_attention_tp_size())
+        head_dim = self.model_config.head_dim
+        v_head_dim = self.model_config.v_head_dim or head_dim
+        for name, got, expected in (
+            ("head_num", head_num, region.head_num),
+            ("head_dim", head_dim, region.head_dim),
+            ("v_head_dim", v_head_dim, region.v_head_dim),
+        ):
+            assert got == expected, (
+                f"fused draft region {name} mismatch: draft runner has {got}, "
+                f"target reserved {expected} (resolve_draft_kv_geometry drift?)"
+            )
+        from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
+
+        assert _store_dtype_for(self.kv_cache_dtype) == region.store_dtype, (
+            f"fused draft region store_dtype mismatch: draft runner stores "
+            f"{_store_dtype_for(self.kv_cache_dtype)}, target reserved "
+            f"{region.store_dtype} (4.1 requires draft dtype == target dtype)"
+        )
+        layer_offset = (self.draft_model_idx or 0) * self.num_effective_layers
+        assert layer_offset + self.num_effective_layers <= region.layer_num, (
+            f"draft layers [{layer_offset}, "
+            f"{layer_offset + self.num_effective_layers}) exceed the fused "
+            f"region's {region.layer_num} layers"
+        )
+
+        draft_pool = UnifiedDraftKVPool(
+            unified_buffer=unified_buffer,
+            sub_pool_name="full",
+            page_size=self.page_size,
+            layer_offset=layer_offset,
+            layer_num=self.num_effective_layers,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+        )
+        if self.mambaish_config is not None:
+            # MTP self-draft on hybrid Mamba: keep the HybridLinearKVPool
+            # shell (mamba states stay in the shared mamba pool, translated).
+            self.token_to_kv_pool = HybridLinearKVPool(
+                page_size=self.page_size,
+                size=self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                full_attention_layer_ids=[0],
+                device=self.device,
+                mamba_pool=self.req_to_token_pool.mamba_pool,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                use_mla=self.use_mla_backend,
+                start_layer=self.start_layer,
+                full_kv_pool=draft_pool,
+            )
+        else:
+            self.token_to_kv_pool = draft_pool
+        logger.info(
+            "[unified-memory-pool] draft worker: fused draft KV bound to the "
+            "target's 'full' sub-pool (layers [%d, %d) of the %d-layer draft "
+            "region); no private draft pool allocated.",
+            layer_offset,
+            layer_offset + self.num_effective_layers,
+            region.layer_num,
+        )
+        return True
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+
+        # Fused draft KV (Stage 4.1): when the target's unified full sub-pool
+        # carries a draft region, the draft worker binds views instead of
+        # allocating a private pool — the vcap bump and every construction
+        # path below are then irrelevant.
+        if self._init_unified_draft_pool():
+            return
 
         # DRAFT worker under a unified-pool TARGET: the shared allocator mints
         # VIRTUAL token ids in [0, max_slots) — larger than

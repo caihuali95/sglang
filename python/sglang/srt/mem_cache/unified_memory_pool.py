@@ -773,6 +773,87 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             )
 
 
+class UnifiedDraftKVPool(UnifiedMHATokenToKVPool):
+    """Draft-model KV pool over the DRAFT byte region of a fused host sub-pool
+    (Stage 4.1, design doc §33.4 Design B).
+
+    An envelope view into the target's `UnifiedKVPool._raw`: shares the host
+    sub-pool's slot ids, allocator, v2p mapping, and compaction; owns NO
+    memory. Draft-runner layer `i` maps to draft-region layer
+    `layer_offset + i` (multi-layer EAGLE gives each per-step runner its own
+    layer sub-range, keyed by `draft_model_idx`). Relocation is host-driven —
+    the host pool's `move_kv_cache` carries the whole fused envelope — so this
+    pool must never be asked to move or to describe contiguous buffers.
+    Like `UnifiedMambaPool`, skips the immediate parent's `__init__`: it binds
+    the draft views, then initializes `MHATokenToKVPool` state directly with
+    the draft region's geometry.
+    """
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        sub_pool_name: str,
+        page_size: int = 1,
+        layer_offset: int = 0,
+        layer_num: Optional[int] = None,
+        enable_alt_stream: bool = True,
+    ):
+        spec = unified_buffer.mha_spec(sub_pool_name)
+        region = spec.draft_region
+        assert (
+            region is not None
+        ), f"sub-pool {sub_pool_name!r} has no fused draft region"
+        draft_k, draft_v = unified_buffer.draft_views_for(sub_pool_name)
+        if layer_num is None:
+            layer_num = region.layer_num - layer_offset
+        assert 0 <= layer_offset and layer_offset + layer_num <= region.layer_num, (
+            f"draft layer sub-range [{layer_offset}, {layer_offset + layer_num}) "
+            f"out of the region's {region.layer_num} layers"
+        )
+        max_slots = unified_buffer.max_slots(sub_pool_name)
+
+        self._unified_buffer = unified_buffer
+        self._sub_pool_name = sub_pool_name
+        self._k_views = draft_k[layer_offset : layer_offset + layer_num]
+        self._v_views = draft_v[layer_offset : layer_offset + layer_num]
+        self._page_size = page_size
+        # Never a mover (see move_kv_cache below); the host pool's fused move
+        # lists carry this region.
+        self._draft_k_views: List[torch.Tensor] = []
+        self._draft_v_views: List[torch.Tensor] = []
+
+        MHATokenToKVPool.__init__(
+            self,
+            size=max_slots - 1,  # -1 for reserved slot 0
+            page_size=page_size,
+            dtype=region.store_dtype,
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            layer_num=layer_num,
+            device=unified_buffer.device,
+            enable_memory_saver=False,  # buffer owned by UnifiedKVPool
+            v_head_dim=region.v_head_dim,
+            start_layer=0,  # draft-runner layer ids are 0-based
+            end_layer=layer_num,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=False,  # strided views — no tiled copy
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "UnifiedDraftKVPool never moves KV: the HOST sub-pool's "
+            "move_kv_cache relocates the whole fused [host|draft] envelope."
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "get_contiguous_buf_infos is not supported on the fused draft "
+            "view pool (strided rows; PD transfer is excluded under "
+            "--enable-unified-memory)."
+        )
+
+
 class UnifiedMambaPool(MambaPool):
     """Mamba state pool whose conv/temporal state are strided views into a `UnifiedKVPool`.
 
@@ -1169,6 +1250,7 @@ def init_unified_mamba_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     spec_state_size: Optional[int] = None,
+    draft_kv_geometry: Optional[MHARegionGeometry] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -1185,6 +1267,9 @@ def init_unified_mamba_pools(
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), mamba at the low-byte end (grow-up).
+    # With draft_kv_geometry (Stage 4.1 fused draft KV), each full slot carries
+    # the draft model's KV region; the draft worker binds a UnifiedDraftKVPool
+    # over the same slots.
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),
@@ -1192,6 +1277,7 @@ def init_unified_mamba_pools(
         head_dim=head_dim,
         store_dtype=store_dtype,
         grow_direction="down",
+        draft_region=draft_kv_geometry,
     )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -1629,6 +1715,7 @@ def init_unified_swa_pools(
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
+    draft_kv_geometry: Optional[MHARegionGeometry] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1647,6 +1734,9 @@ def init_unified_swa_pools(
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), swa at the low-byte end (grow-up).
+    # With draft_kv_geometry (Stage 4.1 fused draft KV), each FULL slot carries
+    # the draft model's KV region — the draft is dense, so it fuses into the
+    # full sub-pool (a DSV4-style draft would instead attach to "swa").
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),
@@ -1655,6 +1745,7 @@ def init_unified_swa_pools(
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
         grow_direction="down",
+        draft_region=draft_kv_geometry,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
