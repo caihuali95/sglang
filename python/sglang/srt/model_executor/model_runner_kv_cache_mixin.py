@@ -1690,6 +1690,16 @@ class ModelRunnerKVCacheMixin:
                 "and --kv-cache-dtype != fp4_e2m1."
             )
 
+        # Invariant D8 (NON-fused draft only; the fused path returned above):
+        # a draft worker reaching here built a PRIVATE pool indexed by VIRTUAL
+        # token ids — declare the capability so attention backends skip the
+        # v2p translate (see TritonAttnBackend). Capability lives on the POOL,
+        # not the worker role; harmless no-op for non-unified allocators
+        # (their probe finds no translate_kv_loc either way). Retires together
+        # with the reserve path once fused draft KV is the only mode.
+        if self.is_draft_worker:
+            self.token_to_kv_pool.kv_ids_are_virtual = True
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 
