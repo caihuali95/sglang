@@ -76,6 +76,47 @@ def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
     return kv_cache_dtype
 
 
+def _align_up(n: int, alignment: int) -> int:
+    return (n + alignment - 1) // alignment * alignment
+
+
+class MHARegionGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Geometry of one MHA-shaped byte region inside a fused slot envelope.
+
+    Describes the DRAFT model's per-slot KV footprint when its KV is fused
+    into a host sub-pool's entry (`[target KV | draft KV]`, design doc
+    §33.4 Design B / Stage 4.1). Mirrors `MHASubPoolSpec`'s MHA fields but
+    carries the draft's OWN geometry — EAGLE3/DFLASH drafts are separate
+    checkpoints whose head_num/head_dim differ from the target's.
+    `msgspec.Struct`, deliberately outside the grandfathered `SubPoolSpec`
+    `@dataclass` hierarchy (same convention as `SpecStateSubPoolSpec`).
+    """
+
+    layer_num: int
+    head_num: int
+    head_dim: int
+    v_head_dim: int
+    store_dtype: torch.dtype
+
+    def validate(self) -> None:
+        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
+        assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
+        assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
+        assert (
+            self.v_head_dim > 0
+        ), f"v_head_dim must be positive; got {self.v_head_dim}"
+
+    def k_row_bytes(self) -> int:
+        return self.head_num * self.head_dim * self.store_dtype.itemsize
+
+    def v_row_bytes(self) -> int:
+        return self.head_num * self.v_head_dim * self.store_dtype.itemsize
+
+    def entry_bytes(self) -> int:
+        """Bytes for one slot's draft region across all draft layers."""
+        return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+
 @dataclass(frozen=True, kw_only=True)
 class SubPoolSpec(ABC):
     """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`."""
@@ -104,12 +145,21 @@ class SubPoolSpec(ABC):
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`."""
+    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
+
+    With `draft_region` set, each slot is a FUSED envelope
+    `[host KV | pad | draft KV]` (design doc §33.4 Design B / Stage 4.1): the
+    draft model's KV rides at byte offset `draft_region_offset_bytes()` inside
+    every slot, sharing this pool's slot ids, allocator, v2p mapping, and
+    compaction moves. `draft_region is None` keeps the layout byte-identical
+    to the pre-fusion one.
+    """
 
     head_num: int
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
+    draft_region: Optional[MHARegionGeometry] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -120,6 +170,8 @@ class MHASubPoolSpec(SubPoolSpec):
         assert (
             self.v_head_dim > 0
         ), f"v_head_dim must be positive; got {self.v_head_dim}"
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -127,8 +179,23 @@ class MHASubPoolSpec(SubPoolSpec):
     def v_row_bytes(self) -> int:
         return self.head_num * self.v_head_dim * self.store_dtype.itemsize
 
-    def entry_bytes(self) -> int:
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot — the pre-fusion entry."""
         return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+    def draft_region_offset_bytes(self) -> int:
+        """Byte offset of the draft region within one slot's fused envelope
+        (host entry aligned up to the draft dtype's itemsize so the draft
+        views' element-space `storage_offset` never truncates)."""
+        assert self.draft_region is not None
+        return _align_up(
+            self.host_entry_bytes(), self.draft_region.store_dtype.itemsize
+        )
+
+    def entry_bytes(self) -> int:
+        if self.draft_region is None:
+            return self.host_entry_bytes()
+        return self.draft_region_offset_bytes() + self.draft_region.entry_bytes()
 
     # Page-major byte math: within a page block K/V group per layer
     # [L0_K*ps | L0_V*ps | L1_K*ps | ...]; at ps==1 this collapses to the per-slot envelope.
@@ -306,6 +373,12 @@ class UnifiedKVPool:
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
         self._spec_state_views: Dict[str, Tuple[torch.Tensor, List[torch.Tensor]]] = {}
+        # Draft-region K/V views of fused MHA sub-pools (Stage 4.1): same slot
+        # ids and per-page stride as the host views, offset into each slot's
+        # draft byte region.
+        self._mha_draft_views: Dict[
+            str, Tuple[List[torch.Tensor], List[torch.Tensor]]
+        ] = {}
 
         # Slot-0 dummy writes for every pool land in [0, entry_max); each pool's
         # first allocatable slot is chosen so real data starts at >= entry_max.
@@ -332,6 +405,13 @@ class UnifiedKVPool:
                     max_slots,
                     page_size=page_size,
                 )
+                if spec.draft_region is not None:
+                    self._mha_draft_views[spec.name] = self._build_mha_draft_views(
+                        spec,
+                        anchor,
+                        max_slots,
+                        page_size=page_size,
+                    )
             elif isinstance(spec, MambaSubPoolSpec):
                 self._mamba_views[spec.name] = self._build_mamba_views(
                     spec, anchor, max_slots
@@ -363,6 +443,19 @@ class UnifiedKVPool:
                 self._min_slot_index[s.name],
                 self._min_slot_index[s.name],
             )
+            if isinstance(s, MHASubPoolSpec) and s.draft_region is not None:
+                logger.info(
+                    "[unified-memory-pool]     fused draft region: layer_num=%d, "
+                    "head_num=%d, head_dim=%d/%d, entry_bytes=%d at slot offset %d "
+                    "(host entry_bytes=%d)",
+                    s.draft_region.layer_num,
+                    s.draft_region.head_num,
+                    s.draft_region.head_dim,
+                    s.draft_region.v_head_dim,
+                    s.draft_region.entry_bytes(),
+                    s.draft_region_offset_bytes(),
+                    s.host_entry_bytes(),
+                )
 
     # -- introspection --
 
@@ -404,6 +497,16 @@ class UnifiedKVPool:
     def mha_views_for(self, name: str) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         return self._mha_views[name]
 
+    def has_draft_region(self, name: str) -> bool:
+        """True when sub-pool `name` carries a fused draft KV region."""
+        return name in self._mha_draft_views
+
+    def draft_views_for(
+        self, name: str
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Draft-region K/V views of fused sub-pool `name` (Stage 4.1)."""
+        return self._mha_draft_views[name]
+
     def mamba_views_for(self, name: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
         return self._mamba_views[name]
 
@@ -419,6 +522,9 @@ class UnifiedKVPool:
         max_slots: int,
         page_size: int,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        # page_stride_bytes uses the FUSED entry (== the host page bytes when
+        # draft_region is None): with a draft region, consecutive pages are
+        # entry_bytes() apart even for the host views.
         return build_page_major_mha_views(
             self._raw,
             layer_num=spec.layer_num,
@@ -429,6 +535,33 @@ class UnifiedKVPool:
             page_size=page_size,
             num_pages=max_slots // page_size,
             anchor_bytes=anchor_bytes,
+            page_stride_bytes=page_size * spec.entry_bytes(),
+        )
+
+    def _build_mha_draft_views(
+        self,
+        spec: MHASubPoolSpec,
+        anchor_bytes: int,
+        max_slots: int,
+        page_size: int,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """K/V views of the draft byte region inside `spec`'s fused slots:
+        same slot ids and page stride as the host views, based at the draft
+        region's offset within each page block."""
+        region = spec.draft_region
+        assert region is not None
+        return build_page_major_mha_views(
+            self._raw,
+            layer_num=region.layer_num,
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            v_head_dim=region.v_head_dim,
+            store_dtype=region.store_dtype,
+            page_size=page_size,
+            num_pages=max_slots // page_size,
+            anchor_bytes=anchor_bytes
+            + page_size * spec.draft_region_offset_bytes(),
+            page_stride_bytes=page_size * spec.entry_bytes(),
         )
 
     def _build_mamba_views(

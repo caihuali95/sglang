@@ -435,6 +435,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        # Fused-draft-KV region geometry (Stage 4.1); resolved by
+        # maybe_init_draft_kv_geometry() during initialize().
+        self.draft_kv_geometry = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker
@@ -820,6 +823,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
+
+        # Fused-draft-KV geometry (needs the resolved kv_cache_dtype; consumed
+        # by the unified pool factories in init_memory_pool).
+        self.maybe_init_draft_kv_geometry()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         hf_config = self.model_config.hf_text_config
@@ -2419,6 +2426,44 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
+
+    def maybe_init_draft_kv_geometry(self):
+        """Resolve and stash the draft model's fused-KV region geometry
+        (`self.draft_kv_geometry`, design doc §33.4 Design B / Stage 4.1).
+
+        Target worker + unified memory + a spec algorithm with draft KV only;
+        everything else leaves the `None` default. Must run after
+        `configure_kv_cache_dtype()` (the geometry stores the resolved dtype)
+        and before the memory pools are built (the unified factories attach
+        the geometry to the host sub-pool spec).
+        """
+        if (
+            self.is_draft_worker
+            or not self.server_args.enable_unified_memory
+            or self.spec_algorithm.is_none()
+            or not self.spec_algorithm.has_draft_kv()
+        ):
+            return
+
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.speculative.draft_utils import resolve_draft_kv_geometry
+
+        draft_model_config = None
+        if self.server_args.speculative_draft_model_path:
+            draft_model_config = self._build_model_config(
+                self.server_args,
+                model_path=self.server_args.speculative_draft_model_path,
+                model_revision=self.server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+        self.draft_kv_geometry = resolve_draft_kv_geometry(
+            server_args=self.server_args,
+            spec_algorithm=self.spec_algorithm,
+            target_model_config=self.model_config,
+            draft_model_config=draft_model_config,
+            kv_cache_dtype=self.kv_cache_dtype,
+            attn_tp_size=get_attention_tp_size(),
+        )
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
