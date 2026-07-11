@@ -620,6 +620,16 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         self._k_views = k_buffer
         self._v_views = v_buffer
         self._page_size = page_size
+        # Fused draft region (Stage 4.1): the host pool owns relocation for the
+        # WHOLE slot envelope, so compaction/accept moves must carry the draft
+        # bytes together with the host bytes.
+        if unified_buffer.has_draft_region(sub_pool_name):
+            draft_k, draft_v = unified_buffer.draft_views_for(sub_pool_name)
+            self._draft_k_views: List[torch.Tensor] = draft_k
+            self._draft_v_views: List[torch.Tensor] = draft_v
+        else:
+            self._draft_k_views = []
+            self._draft_v_views = []
 
         super().__init__(
             size=max_slots - 1,  # -1 for reserved slot 0
@@ -663,16 +673,35 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # tgt_loc/src_loc are PHYSICAL slot ids; native move only (strided views).
+        # With a fused draft region the draft views ride in the same lists: one
+        # move relocates the whole [host KV | draft KV] envelope atomically
+        # (compaction, inverse-history rollback, and move_accept_kv all land
+        # here). move_kv_cache_native zips k/v pairwise, so heterogeneous
+        # host/draft shapes are fine.
         if tgt_loc.numel() == 0:
             return
         with record_function("UnifiedMHA.move_kv_cache"):
             move_kv_cache_native(
-                self.k_buffer,
-                self.v_buffer,
+                self.k_buffer + self._draft_k_views,
+                self.v_buffer + self._draft_v_views,
                 tgt_loc,
                 src_loc,
                 page_size=self._page_size,
             )
+
+    def get_contiguous_buf_infos(self):
+        # PD-disaggregation KV transfer assumes densely packed rows; a fused
+        # slot interleaves draft bytes between host rows, so the item/len
+        # math would silently transfer garbage. Unified memory already
+        # excludes PD (server_args gate) — fail loud if anything reaches here.
+        if self._draft_k_views:
+            raise NotImplementedError(
+                "get_contiguous_buf_infos is not supported on a fused "
+                "draft-KV sub-pool (Stage 4.1): rows are strided, not "
+                "contiguous. PD transfer / HiCache must stay disabled with "
+                "--enable-unified-memory + speculative decoding."
+            )
+        return super().get_contiguous_buf_infos()
 
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
