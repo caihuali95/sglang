@@ -696,6 +696,34 @@ class TritonAttnBackend(AttentionBackend):
         )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
+    def _translate_window_kv_indices(
+        self, window_kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Sliding-window READ ids (virtual) -> physical.
+
+        Two pool families need different maps, and the discriminator is the
+        POOL, not the model: `sliding_window_size` merely says the MODEL has
+        window layers.
+          * Hybrid-SWA pools keep the window in a SEPARATE swa sub-pool with
+            its own id space -> `translate_loc_from_full_to_swa`.
+          * Single-pool models whose window layers read the SAME slots as the
+            full layers -> the ordinary v2p translate. This is the fused draft
+            view pool (Stage 4.1): a DFLASH draft has sliding-window layers but
+            its KV lives entirely in the target's fused full-pool slots, so its
+            window ids are plain full-pool ids. Before the translate flip the
+            draft skipped translation altogether, which is why this path was
+            never exercised (eval_270: AttributeError under CG capture, and a
+            silent VIRTUAL-id window read in eager mode).
+        """
+        swa_translate = getattr(
+            self.token_to_kv_pool, "translate_loc_from_full_to_swa", None
+        )
+        if swa_translate is not None:
+            return swa_translate(window_kv_indices)
+        if self._translate_kv_loc is not None:
+            return self._translate_kv_loc(window_kv_indices)
+        return window_kv_indices  # non-unified: ids are already physical
+
     def _translate_cuda_graph_shared_pool_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
@@ -753,7 +781,7 @@ class TritonAttnBackend(AttentionBackend):
                 n_win = int(self.window_kv_indptr[bs].item())
             if n_win > 0:
                 self.cuda_graph_window_kv_indices[:n_win] = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    self._translate_window_kv_indices(
                         self.cuda_graph_window_kv_indices[:n_win]
                     )
                 )
@@ -826,7 +854,15 @@ class TritonAttnBackend(AttentionBackend):
                             bs,
                             self.device,
                             self.token_to_kv_pool,
+                            # Translate here, not in the util: only the backend
+                            # knows the single-pool (fused draft) case, whose
+                            # window ids need the ordinary v2p map rather than
+                            # a full->swa map. Equivalent for every other pool.
+                            skip_full_to_swa_translation=True,
                         )
+                    )
+                    window_kv_indices = self._translate_window_kv_indices(
+                        window_kv_indices
                     )
                     window_num_kv_splits = torch.empty(
                         (bs,), dtype=torch.int32, device=self.device
@@ -934,6 +970,10 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                    skip_full_to_swa_translation=True,  # see helper
+                )
+                window_kv_indices = self._translate_window_kv_indices(
+                    window_kv_indices
                 )
 
             custom_mask = spec_info.custom_mask
@@ -996,6 +1036,10 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                    skip_full_to_swa_translation=True,  # see helper
+                )
+                window_kv_indices = self._translate_window_kv_indices(
+                    window_kv_indices
                 )
 
             qo_indptr = self.qo_indptr

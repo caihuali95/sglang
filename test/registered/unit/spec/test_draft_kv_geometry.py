@@ -73,6 +73,7 @@ def _resolve(
     server_args=None,
     kv_cache_dtype=torch.bfloat16,
     attn_tp_size=1,
+    is_self_draft=False,
 ):
     return resolve_draft_kv_geometry(
         server_args=server_args or _server_args(),
@@ -81,6 +82,7 @@ def _resolve(
         draft_model_config=draft_model_config,
         kv_cache_dtype=kv_cache_dtype,
         attn_tp_size=attn_tp_size,
+        is_self_draft=is_self_draft,
     )
 
 
@@ -112,6 +114,45 @@ class TestResolveDraftKvGeometry(CustomTestCase):
                 ),
                 msg=f"nnpl={nnpl}",
             )
+
+    def test_self_draft_reads_the_mtp_swapped_draft_config(self):
+        """eval_270 regression: targets outside the auto-draft-path list (Qwen3.5,
+        Qwen3-Next) leave speculative_draft_model_path=None, so the caller re-reads
+        the TARGET checkpoint with is_draft_model=True — which is what swaps in the
+        MTP arch and sets num_nextn_predict_layers. Reading the raw TARGET config
+        instead sees no MTP head and silently skips fusion."""
+        # Target config as-loaded: no MTP head advertised.
+        target = _model_config(arch="Qwen3_5ForConditionalGeneration", head_dim=128)
+        # Same checkpoint re-read with is_draft_model=True (arch swapped, nnpl set).
+        draft = _model_config(
+            arch="Qwen3_5ForCausalLMMTP",
+            num_nextn_predict_layers=1,
+            head_dim=128,
+            num_kv_heads=8,
+        )
+        geometry = _resolve(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            target_model_config=target,
+            draft_model_config=draft,
+            is_self_draft=True,
+        )
+        self.assertIsNotNone(geometry, "self-draft MTP geometry must resolve")
+        self.assertEqual(geometry.layer_num, 1)
+        self.assertEqual(geometry.head_num, 8)
+
+    def test_self_draft_without_mtp_head_does_not_fuse_full_model(self):
+        """Safety guard: if the is_draft_model re-read did NOT swap in an MTP arch,
+        the target has no MTP head and cfg.num_hidden_layers is the FULL model's —
+        fusing that would size the draft region at the whole target."""
+        no_mtp = _model_config(arch="LlamaForCausalLM", num_hidden_layers=32)
+        self.assertIsNone(
+            _resolve(
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                target_model_config=no_mtp,
+                draft_model_config=no_mtp,
+                is_self_draft=True,
+            )
+        )
 
     def test_eagle_checkpoint_uses_draft_geometry(self):
         # EAGLE3-like: the draft checkpoint's head dims differ from the target's.

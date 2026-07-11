@@ -34,6 +34,19 @@ def _draft_layer_count(model_config: "ModelConfig") -> int:
     )
 
 
+def _is_mtp_draft_arch(model_config: "ModelConfig") -> bool:
+    """True when a config re-read with `is_draft_model=True` actually became an
+    MTP/NextN draft (`ModelConfig._config_draft_model` swapped the arch). Guards
+    the self-draft path: a target with NO MTP head keeps its original arch, and
+    its layer count is the FULL model's — fusing that would size the draft region
+    at the whole target."""
+    arch = model_config.hf_config.architectures[0]
+    if arch.endswith("MTP") or arch.endswith("NextN"):
+        return True
+    nnpl = model_config.num_nextn_predict_layers
+    return nnpl is not None and int(nnpl) > 0
+
+
 def resolve_draft_kv_geometry(
     *,
     server_args: ServerArgs,
@@ -42,6 +55,7 @@ def resolve_draft_kv_geometry(
     draft_model_config: Optional["ModelConfig"],
     kv_cache_dtype: torch.dtype,
     attn_tp_size: int,
+    is_self_draft: bool = False,
 ) -> Optional["MHARegionGeometry"]:
     """Resolve the draft model's per-slot KV geometry for fused draft KV
     (design doc §33.4 Design B / Stage 4.1).
@@ -52,9 +66,13 @@ def resolve_draft_kv_geometry(
     configs — config loading is the caller's job (ModelRunner helper) so each
     case's geometry is unit-testable.
 
-    `draft_model_config is None` means MTP/NEXTN self-draft: the target's own
-    MTP head is the draft, so the geometry comes from the target config with
-    `num_nextn_predict_layers` layers.
+    `is_self_draft` = the run has no `speculative_draft_model_path`, so the
+    caller built `draft_model_config` from the TARGET checkpoint with
+    `is_draft_model=True`. That is what materializes the MTP head (the arch
+    swap + `num_nextn_predict_layers` in `ModelConfig._config_draft_model`).
+    If the swap did NOT happen the target has no MTP head, and its layer count
+    is the FULL model's — fusing that would size the draft region at the whole
+    target, so return None instead.
     """
     from sglang.srt.mem_cache.unified_memory_pool import MHARegionGeometry
 
@@ -62,6 +80,9 @@ def resolve_draft_kv_geometry(
         return None
 
     cfg = draft_model_config if draft_model_config is not None else target_model_config
+
+    if is_self_draft and not _is_mtp_draft_arch(cfg):
+        return None
 
     if server_args.enable_multi_layer_eagle:
         # One ModelRunner per draft step, each loading its own MTP module.

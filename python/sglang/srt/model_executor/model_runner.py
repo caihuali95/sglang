@@ -2464,19 +2464,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.layers.dp_attention import get_attention_tp_size
         from sglang.srt.speculative.draft_utils import resolve_draft_kv_geometry
 
-        draft_model_config = None
-        if self.server_args.speculative_draft_model_path:
-            draft_model_config = self._build_model_config(
-                self.server_args,
-                model_path=self.server_args.speculative_draft_model_path,
-                model_revision=self.server_args.speculative_draft_model_revision,
-                is_draft_model=True,
-            )
+        # MTP self-draft: `speculative_draft_model_path` is None for targets
+        # outside the auto-path list (e.g. Qwen3.5 / Qwen3-Next), yet they DO
+        # carry an MTP head. Building the config from the TARGET path with
+        # `is_draft_model=True` is what makes it materialize —
+        # `ModelConfig._config_draft_model` swaps in the MTP arch and sets
+        # `num_nextn_predict_layers`. Reading the target config directly instead
+        # sees no MTP layers and silently skips fusion (eval_270: the EAGLE
+        # cells fell back to the private pool while DFLASH fused correctly).
+        draft_path = self.server_args.speculative_draft_model_path
+        is_self_draft = draft_path is None
+        draft_model_config = self._build_model_config(
+            self.server_args,
+            model_path=draft_path or self.server_args.model_path,
+            model_revision=(
+                self.server_args.revision
+                if is_self_draft
+                else self.server_args.speculative_draft_model_revision
+            ),
+            is_draft_model=True,
+        )
         self.draft_kv_geometry = resolve_draft_kv_geometry(
             server_args=self.server_args,
             spec_algorithm=self.spec_algorithm,
             target_model_config=self.model_config,
             draft_model_config=draft_model_config,
+            is_self_draft=is_self_draft,
             kv_cache_dtype=self.kv_cache_dtype,
             attn_tp_size=get_attention_tp_size(),
         )
