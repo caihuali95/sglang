@@ -80,6 +80,18 @@ def _align_up(n: int, alignment: int) -> int:
     return (n + alignment - 1) // alignment * alignment
 
 
+def fused_entry_bytes(host_entry_bytes: int, draft_region: "MHARegionGeometry") -> int:
+    """Per-slot bytes of a fused `[host KV | pad | draft KV]` envelope
+    (Stage 4.1). SINGLE SOURCE OF TRUTH for both the physical layout
+    (`MHASubPoolSpec.entry_bytes`) and the byte budget (the pool
+    configurators' per-token cell) — the two must never drift, or the solve
+    under- or over-provisions the buffer the views are built over."""
+    return (
+        _align_up(host_entry_bytes, draft_region.store_dtype.itemsize)
+        + draft_region.entry_bytes()
+    )
+
+
 class MHARegionGeometry(msgspec.Struct, frozen=True, kw_only=True):
     """Geometry of one MHA-shaped byte region inside a fused slot envelope.
 
@@ -195,7 +207,9 @@ class MHASubPoolSpec(SubPoolSpec):
     def entry_bytes(self) -> int:
         if self.draft_region is None:
             return self.host_entry_bytes()
-        return self.draft_region_offset_bytes() + self.draft_region.entry_bytes()
+        # Via the shared helper so the configurators' cell math can never
+        # drift from the physical layout.
+        return fused_entry_bytes(self.host_entry_bytes(), self.draft_region)
 
     # Page-major byte math: within a page block K/V group per layer
     # [L0_K*ps | L0_V*ps | L1_K*ps | ...]; at ps==1 this collapses to the per-slot envelope.

@@ -177,6 +177,36 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
         # 2/3 of the unreserved count.
         self.assertLess(dflash.max_num_reqs * 3, no_reserve.max_num_reqs * 2)
 
+    def test_fused_draft_kv_beats_reserve(self):
+        """Fused draft KV (Stage 4.1): the draft rides inside the fused slot,
+        so the solve runs with cell == base == fused entry — no reserve
+        (draft_reserve_bytes == 0) and mamba/band bytes charged RAW. For the
+        SAME per-token layout cost, fusion must admit at least as many
+        requests as the reserve-mode solve (which additionally inflates every
+        mamba/band byte by cell/base to back the virtual-id overshoot); for a
+        heavy DFLASH draft (q=0.75) the win is strict."""
+        rest_bytes = 55 * GIB
+        for base_kwargs in (QWEN_EAGLE, QWEN_DFLASH):
+            fused_cell = base_kwargs["cell_size"]  # same physical bytes/token
+            fused = solve_unified_spec_admission(
+                rest_bytes=rest_bytes,
+                requested=1024,
+                **{
+                    **base_kwargs,
+                    "cell_size": fused_cell,
+                    "base_cell_size": fused_cell,
+                },
+            )
+            reserve = solve_unified_spec_admission(
+                rest_bytes=rest_bytes, requested=1024, **base_kwargs
+            )
+            with self.subTest(cell=fused_cell):
+                self.assertEqual(fused.draft_reserve_bytes, 0)
+                self.assertGreaterEqual(fused.max_num_reqs, reserve.max_num_reqs)
+                if base_kwargs is QWEN_DFLASH:
+                    # Reserve inflates byte terms ~1.75x; fusion charges raw.
+                    self.assertGreater(fused.max_num_reqs, reserve.max_num_reqs)
+
     def test_requested_caps_admission(self):
         a = solve_unified_spec_admission(
             rest_bytes=55 * GIB, requested=48, **QWEN_DFLASH

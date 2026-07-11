@@ -2437,11 +2437,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         and before the memory pools are built (the unified factories attach
         the geometry to the host sub-pool spec).
         """
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            _should_enable_fused_draft_kv,
+        )
+
+        # Gate here so `draft_kv_geometry is not None` <=> fusion enabled —
+        # the single condition every consumer (factories, configurators,
+        # _init_unified_draft_pool via has_draft_region) keys on.
         if (
             self.is_draft_worker
             or not self.server_args.enable_unified_memory
             or self.spec_algorithm.is_none()
             or not self.spec_algorithm.has_draft_kv()
+            or not _should_enable_fused_draft_kv()
         ):
             return
 

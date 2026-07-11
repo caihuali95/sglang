@@ -517,11 +517,21 @@ class ModelRunnerKVCacheMixin:
             # never overwritten (_resolve_max_num_reqs min's + warns instead).
             server_args.max_running_requests = int(n * dp)
 
+        # Fused draft KV (Stage 4.1): cell == base, the draft KV is part of
+        # every fused slot — no separate pool, no reserve to report.
+        draft_note = (
+            f"draft KV fused into cell ({cell_size} B/token)"
+            if self.draft_kv_geometry is not None
+            else (
+                f"draft-KV reserve "
+                f"{admission.draft_reserve_bytes / (1 << 30):.2f} GiB "
+                f"(cell {cell_size}/{base_cell_size} B/token)"
+            )
+        )
         logger.info(
             "[unified-memory-pool] joint admission solve: max_num_reqs=%d "
             "(requested %d%s), hard_slots/req=%d, D=%d, mamba slots=%d "
-            "(hard %d + radix headroom %d), band %.2f GiB, "
-            "draft-KV reserve %.2f GiB (cell %d/%d B/token), "
+            "(hard %d + radix headroom %d), band %.2f GiB, %s, "
             "token floor %d tok/req, token-pool budget %.2f GiB.",
             n,
             requested,
@@ -532,9 +542,7 @@ class ModelRunnerKVCacheMixin:
             admission.hard_mamba_slots,
             admission.headroom_slots,
             admission.band_bytes / (1 << 30),
-            admission.draft_reserve_bytes / (1 << 30),
-            cell_size,
-            base_cell_size,
+            draft_note,
             UNIFIED_SPEC_MIN_TOKENS_PER_REQ,
             admission.token_budget_bytes / (1 << 30),
         )
@@ -743,10 +751,9 @@ class ModelRunnerKVCacheMixin:
             # mambaish configs.
             spec_state_size=self.mamba_spec_state_size,
             # Fused draft KV (Stage 4.1): attach the draft region to the full
-            # sub-pool so draft KV rides inside the fused slot entries.
-            draft_kv_geometry=(
-                self.draft_kv_geometry if _should_enable_fused_draft_kv() else None
-            ),
+            # sub-pool so draft KV rides inside the fused slot entries
+            # (non-None <=> fusion enabled; gated in maybe_init_draft_kv_geometry).
+            draft_kv_geometry=self.draft_kv_geometry,
         )
         self.req_to_token_pool = bundle.req_to_token_pool
         self.token_to_kv_pool = bundle.token_to_kv_pool
@@ -832,10 +839,9 @@ class ModelRunnerKVCacheMixin:
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
             # Fused draft KV (Stage 4.1): the dense draft fuses into the FULL
-            # sub-pool (a DSV4-style draft would attach to "swa" instead).
-            draft_kv_geometry=(
-                self.draft_kv_geometry if _should_enable_fused_draft_kv() else None
-            ),
+            # sub-pool (a DSV4-style draft would attach to "swa" instead;
+            # non-None <=> fusion enabled, gated in maybe_init_draft_kv_geometry).
+            draft_kv_geometry=self.draft_kv_geometry,
         )
         self.token_to_kv_pool = bundle.token_to_kv_pool
         self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
