@@ -719,10 +719,39 @@ class TritonAttnBackend(AttentionBackend):
             self.token_to_kv_pool, "translate_loc_from_full_to_swa", None
         )
         if swa_translate is not None:
-            return swa_translate(window_kv_indices)
-        if self._translate_kv_loc is not None:
-            return self._translate_kv_loc(window_kv_indices)
-        return window_kv_indices  # non-unified: ids are already physical
+            out = swa_translate(window_kv_indices)
+        elif self._translate_kv_loc is not None:
+            out = self._translate_kv_loc(window_kv_indices)
+        else:
+            return window_kv_indices  # non-unified: ids are already physical
+        # Preserve the caller's index dtype: `translate_loc_from_full_to_swa`
+        # returns INT32, and callers that REBIND (rather than assign in place
+        # into a static int64 buffer) would otherwise silently downcast their
+        # int64 index tensor. See `_translate_window_kv_indices_single_pool`.
+        if out.dtype != window_kv_indices.dtype:
+            out = out.to(window_kv_indices.dtype)
+        return out
+
+    def _translate_window_kv_indices_single_pool(
+        self, window_kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Eager-path window translate for SINGLE-pool models only.
+
+        Pools that own a separate SWA sub-pool are translated IN PLACE inside
+        `update_sliding_window_buffer` (unchanged, pre-Stage-4.1 behavior) — do
+        NOT re-route them through the returning helper: that translate yields
+        int32, and rebinding the caller's int64 index tensor to it silently
+        downcast the eager indices (eval_275: gpt-oss chunk/ps256/cg_off went
+        to GSM8K 0.000 with spec OFF; the cuda-graph path was spared only
+        because it assigns in place into a static int64 buffer).
+
+        Only the fused draft view pool needs this: it has no SWA sub-pool, so
+        `update_sliding_window_buffer`'s hasattr guard leaves its window ids
+        VIRTUAL, and they need the ordinary v2p translate.
+        """
+        if hasattr(self.token_to_kv_pool, "translate_loc_from_full_to_swa"):
+            return window_kv_indices  # already translated in place by the util
+        return self._translate_window_kv_indices(window_kv_indices)
 
     def _translate_cuda_graph_shared_pool_locs(
         self, forward_batch: ForwardBatch, bs: int
@@ -854,14 +883,11 @@ class TritonAttnBackend(AttentionBackend):
                             bs,
                             self.device,
                             self.token_to_kv_pool,
-                            # Translate here, not in the util: only the backend
-                            # knows the single-pool (fused draft) case, whose
-                            # window ids need the ordinary v2p map rather than
-                            # a full->swa map. Equivalent for every other pool.
-                            skip_full_to_swa_translation=True,
                         )
                     )
-                    window_kv_indices = self._translate_window_kv_indices(
+                    # Pools WITH an swa sub-pool were translated in place above
+                    # (unchanged). Only the single-pool fused draft needs v2p.
+                    window_kv_indices = self._translate_window_kv_indices_single_pool(
                         window_kv_indices
                     )
                     window_num_kv_splits = torch.empty(
@@ -970,9 +996,8 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
-                    skip_full_to_swa_translation=True,  # see helper
                 )
-                window_kv_indices = self._translate_window_kv_indices(
+                window_kv_indices = self._translate_window_kv_indices_single_pool(
                     window_kv_indices
                 )
 
@@ -1036,9 +1061,8 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
-                    skip_full_to_swa_translation=True,  # see helper
                 )
-                window_kv_indices = self._translate_window_kv_indices(
+                window_kv_indices = self._translate_window_kv_indices_single_pool(
                     window_kv_indices
                 )
 
