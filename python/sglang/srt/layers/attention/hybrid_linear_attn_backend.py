@@ -345,7 +345,19 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     # None during dummy run
                     if retrieve_next_token is not None:
-                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                        # -1, NOT empty: the tree builder leaves a token's parent
+                        # entry UNSET when it finds no parent for it (it warns
+                        # "invalid eagle tree ... the token will be ignored" and
+                        # skips). Uninitialized garbage there is not merely a wrong
+                        # state read -- the GDN verify kernels multiply this value
+                        # by the intermediate-state step stride (~1e7 elements) to
+                        # form a pointer, so a junk entry is an illegal access. -1
+                        # is the sentinel those kernels skip on. (The cuda-graph
+                        # path allocates these zeroed, which is why only the eager
+                        # path ever faulted.)
+                        retrieve_parent_token = torch.full_like(
+                            retrieve_next_token, -1
+                        )
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device

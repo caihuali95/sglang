@@ -922,11 +922,15 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     for _ in range(0, T):
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx = 0 should use the b_h from USE_INITIAL_STATE
-            if step_idx != 0 and cache_idx >= 0:
-                # when calculating current step's attention, load the state from the parent token
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
+            # when calculating current step's attention, load the state from the parent token
+            parent_step_idx = tl.sum(
+                tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+            )
+            # -1 marks a token the tree builder could not parent (it warns and
+            # skips it). Scaled by stride_inter_step (~1e7 elements) such a value
+            # forms a wild pointer, so guard before the arithmetic, not after.
+            parent_valid = (parent_step_idx >= 0) & (parent_step_idx < T)
+            if step_idx != 0 and cache_idx >= 0 and parent_valid:
                 cache_ptr = (
                     intermediate_states_buffer
                     + cache_idx * stride_inter_slot

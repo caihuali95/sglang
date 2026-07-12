@@ -138,10 +138,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Tree attention: load parent's cached state
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
-            if step_idx != 0 and cache_idx >= 0:
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
+            parent_step_idx = tl.sum(
+                tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+            )
+            # A token the tree builder could not parent keeps the -1 sentinel (it
+            # warns and skips that token). Never let such a value reach the pointer
+            # arithmetic: it is scaled by stride_cache_step (~1e7 elements), so a
+            # junk index is an illegal access, not just a wrong state. Out-of-tree
+            # values are equally unusable. Skipping keeps b_h at the parent state
+            # already in hand -- the token is discarded downstream regardless.
+            parent_valid = (parent_step_idx >= 0) & (parent_step_idx < T)
+            if step_idx != 0 and cache_idx >= 0 and parent_valid:
                 step_offset = parent_step_idx.to(tl.int64) * stride_cache_step
                 cache_ptr = (
                     intermediate_states_buffer
