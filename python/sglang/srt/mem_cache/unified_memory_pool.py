@@ -1260,6 +1260,15 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             # arbitrary strides. So normalize rather than reject.
             cache_k = _as_row_contiguous(cache_k)
             cache_v = _as_row_contiguous(cache_v)
+            # The SAME raw-pointer hazard applies to `loc`: the kernel reads it as
+            # `tl.load(loc_ptr + i)` — flat memory, strides ignored. A strided loc
+            # (e.g. a row of a permuted-then-reshaped per-step buffer) makes the
+            # kernel consume an interleaving of SEVERAL steps' locs: KV lands at
+            # the wrong slots and most intended slots are never written, while
+            # every torch-side check still passes (torch honours the stride).
+            # This was the fused-EAGLE accept-length regression.
+            if not loc.is_contiguous():
+                loc = loc.contiguous()
             assert k_view.stride(-1) == 1 and k_view.stride(-2) == k_view.shape[-1], (
                 f"{type(self).__name__}: k_view trailing dims not contiguous; "
                 f"stride={k_view.stride()}, shape={tuple(k_view.shape)}"

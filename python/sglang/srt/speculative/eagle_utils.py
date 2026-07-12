@@ -51,10 +51,22 @@ def per_step_draft_out_cache_loc(
         f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
         f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
     )
+    # `.contiguous()` is LOAD-BEARING. The permuted layout is merge-able, so the
+    # reshape returns a strided VIEW (strides (1, num_steps)) — each per-step row
+    # is then a tensor whose elements sit num_steps apart in memory. Torch
+    # consumers honour that stride, but these rows feed Triton kernels that read
+    # the loc with raw pointer arithmetic (`tl.load(loc_ptr + i)`), which walks
+    # FLAT memory: such a kernel sees the step-INTERLEAVED window instead of one
+    # step's locs, writing row r's KV to row r//num_steps's slot and leaving
+    # (num_steps-1)/num_steps of the intended slots unwritten. Silent wrong-slot
+    # KV, invisible to any stride-aware (torch-side) verification. The Qwen3-MoE
+    # MTP fused-RoPE `.contiguous()` special case in `draft_forward` was patching
+    # this same hazard for one arch; materializing here fixes every consumer.
     return (
         out_cache_loc.view(batch_size, topk, num_steps)
         .permute(2, 0, 1)
         .reshape(num_steps, -1)
+        .contiguous()
     )
 
 

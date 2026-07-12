@@ -237,6 +237,14 @@ def store_cache_4d(
         f"store_cache_4d: cache_v trailing dims must be contiguous; "
         f"got stride={cache_v.stride()}, shape={tuple(cache_v.shape)}"
     )
+    # `loc` is read with raw pointer arithmetic (`tl.load(loc_ptr + i)`), so its
+    # stride is IGNORED by the kernel: a strided loc (e.g. a row of a
+    # permuted-then-reshaped per-step buffer, stride == num_steps) makes the
+    # kernel consume an interleaving of other rows' locs -- silent wrong-slot
+    # writes that every torch-side (stride-aware) check waves through. Normalize
+    # rather than assert: a contiguous copy of a loc row is cheap and always safe.
+    if not loc.is_contiguous():
+        loc = loc.contiguous()
 
     head_num = k_view.shape[2]
     head_dim = k_view.shape[3]
