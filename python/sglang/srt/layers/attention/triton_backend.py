@@ -2124,12 +2124,17 @@ class TritonMultiStepDraftBackend:
             HAS_V2P=False,
         )
 
-        if not torch.equal(virt_indptr, self.kv_indptr):
+        # Only the LIVE segment: `self.kv_indptr` is a persistent buffer whose tail
+        # still holds a previous, larger batch's offsets, while the reference above
+        # is freshly zeroed. Comparing the whole tensor would flag that stale tail,
+        # which nothing reads.
+        live_indptr = self.kv_indptr[:, : bs + 1]
+        ref_indptr = virt_indptr[:, : bs + 1]
+        if not torch.equal(ref_indptr, live_indptr):
             raise AssertionError(
                 "[read-locs] the in-kernel v2p translate CHANGED kv_indptr "
                 "(it must only rewrite ids, never segment boundaries): "
-                f"translated={self.kv_indptr[:, : bs + 1].tolist()} vs "
-                f"reference={virt_indptr[:, : bs + 1].tolist()}"
+                f"translated={live_indptr.tolist()} vs reference={ref_indptr.tolist()}"
             )
 
         expected = torch.clamp_min(v2p[virt // ps] * ps + virt % ps, 0)
