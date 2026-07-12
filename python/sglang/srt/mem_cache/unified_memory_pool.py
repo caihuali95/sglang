@@ -36,6 +36,7 @@ import triton
 from torch.profiler import record_function
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     build_page_major_mha_views,
@@ -44,6 +45,7 @@ from sglang.srt.mem_cache.layout.page_major import (
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
+    KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
     move_kv_cache_native,
@@ -56,6 +58,76 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
+
+_DEBUG_WRITE_LOCS = envs.SGLANG_DEBUG_FUSED_WRITE_LOCS.get()
+if _DEBUG_WRITE_LOCS:
+    logger.warning(
+        "[write-locs] DIAGNOSTIC ACTIVE (SGLANG_DEBUG_FUSED_WRITE_LOCS=1): every "
+        "unified KV write re-translates its virtual loc and asserts it matches the "
+        "pre-translated physical loc. Adds a gather + sync per write."
+    )
+
+
+def _check_write_locs(
+    *,
+    sub_pool_name: str,
+    translate,
+    virt_loc: torch.Tensor,
+    phys_loc: Optional[torch.Tensor],
+    min_slot: int,
+    max_slot: int,
+) -> None:
+    """DIAGNOSTIC (SGLANG_DEBUG_FUSED_WRITE_LOCS): assert this KV write targets the
+    slots the LIVE v2p map dictates.
+
+    Three failure modes, all of which corrupt KV *silently* (no crash, just wrong
+    content that later reads pick up -- e.g. a draft model reading a peer request's
+    KV, which shows up only as a degraded accept length):
+
+      (a) `phys_loc is None`  -- the metadata carried no pre-translated physical
+          loc, so the caller is about to write at a VIRTUAL id. Correct only while
+          v2p is identity; wrong the moment it diverges.
+      (b) `phys_loc != translate(virt_loc)` -- the pre-translated loc disagrees
+          with the live map (stale, mis-sliced, or built from the wrong tensor).
+      (c) out-of-range physical slot -- would be an illegal access, or a silent
+          write into a peer sub-pool's bytes.
+
+    Raises with the offending call stack, so the traceback names the write site.
+    """
+    if virt_loc is None or virt_loc.numel() == 0:
+        return
+    if phys_loc is None:
+        raise AssertionError(
+            f"[write-locs] sub-pool {sub_pool_name!r}: KV write reached the pool with "
+            f"NO pre-translated physical loc (full_loc=None) -- the write would use "
+            f"VIRTUAL ids ({virt_loc[:8].tolist()}...) as physical slots. Correct only "
+            f"while v2p is identity; silent wrong-slot writes once it diverges."
+        )
+    expected = translate(virt_loc)
+    if phys_loc.shape != expected.shape:
+        raise AssertionError(
+            f"[write-locs] sub-pool {sub_pool_name!r}: physical loc has shape "
+            f"{tuple(phys_loc.shape)} but the virtual loc has {tuple(virt_loc.shape)} "
+            f"-- a mis-sliced per-step write buffer writes each token to the WRONG slot."
+        )
+    bad = phys_loc.to(torch.int64) != expected.to(torch.int64)
+    if bool(bad.any().item()):
+        idx = bad.nonzero(as_tuple=False).flatten()[:8]
+        raise AssertionError(
+            f"[write-locs] sub-pool {sub_pool_name!r}: WRONG-SLOT KV WRITE -- the "
+            f"pre-translated physical loc disagrees with the live v2p map at "
+            f"{int(bad.sum())}/{bad.numel()} tokens. First offenders (token idx, "
+            f"virtual, written-to, should-be): "
+            f"{list(zip(idx.tolist(), virt_loc[idx].tolist(), phys_loc[idx].tolist(), expected[idx].tolist()))}"
+        )
+    oob = (phys_loc < min_slot) | (phys_loc >= max_slot)
+    if bool(oob.any().item()):
+        idx = oob.nonzero(as_tuple=False).flatten()[:8]
+        raise AssertionError(
+            f"[write-locs] sub-pool {sub_pool_name!r}: physical slot OUT OF RANGE "
+            f"[{min_slot}, {max_slot}) at {int(oob.sum())} tokens, e.g. "
+            f"{phys_loc[idx].tolist()} (virtual {virt_loc[idx].tolist()})."
+        )
 
 # NOTE: SPEC_BAND_ALIGNMENT_MARGIN_SLOTS lives in multi_ended_allocator (the
 # layer that owns the band geometry). It is imported FUNCTION-LEVEL below —
@@ -394,6 +466,11 @@ class UnifiedKVPool:
         self._mha_draft_views: Dict[
             str, Tuple[List[torch.Tensor], List[torch.Tensor]]
         ] = {}
+        # DIAGNOSTIC only (SGLANG_DEBUG_FUSED_WRITE_LOCS): per-sub-pool v2p
+        # translate, registered by each allocator at construction. The pools
+        # can't reach the allocator (the tables live there), and this is the
+        # one object both sides already hold.
+        self._debug_translate: Dict[str, object] = {}
 
         # Slot-0 dummy writes for every pool land in [0, entry_max); each pool's
         # first allocatable slot is chosen so real data starts at >= entry_max.
@@ -519,7 +596,7 @@ class UnifiedKVPool:
     def draft_views_for(
         self, name: str
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Draft-region K/V views of fused sub-pool `name` ."""
+        """Draft-region K/V views of fused sub-pool `name`."""
         return self._mha_draft_views[name]
 
     def mamba_views_for(self, name: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
@@ -760,6 +837,32 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
+    def debug_check_write_locs(
+        self, virt_loc: torch.Tensor, phys_loc: Optional[torch.Tensor]
+    ) -> None:
+        """DIAGNOSTIC (SGLANG_DEBUG_FUSED_WRITE_LOCS): cross-check one KV write's
+        virtual/physical loc pair against the live v2p map. See `_check_write_locs`.
+
+        Public because the composite pools (`HybridLinearKVPool`) unwrap the
+        `KVWriteLoc` themselves and hand us a bare physical loc -- by then the
+        virtual partner is gone, so they must call this BEFORE unwrapping. They
+        duck-type it (`getattr(pool, "debug_check_write_locs", None)`) to avoid
+        importing this module.
+        """
+        if not _DEBUG_WRITE_LOCS:
+            return
+        translate = self._unified_buffer._debug_translate.get(self._sub_pool_name)
+        if translate is None:
+            return
+        _check_write_locs(
+            sub_pool_name=self._sub_pool_name,
+            translate=translate,
+            virt_loc=virt_loc,
+            phys_loc=phys_loc,
+            min_slot=self._unified_buffer.min_slot_index(self._sub_pool_name),
+            max_slot=self._unified_buffer.max_slots(self._sub_pool_name),
+        )
+
     def set_kv_buffer(
         self,
         layer,
@@ -784,7 +887,14 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         # here raw.
         # `full_loc` is the pre-translated PHYSICAL loc; a bare `loc` is already
         # physical.
+        # A KVWriteLoc carries the VIRTUAL loc + its pre-translated PHYSICAL
+        # partner, so it is checkable. A bare tensor comes from a composite pool
+        # that already translated (and dropped the virtual id) -- nothing to
+        # cross-check, and a None full_loc there is correct, not a bug.
+        checkable = _DEBUG_WRITE_LOCS and isinstance(loc, KVWriteLoc)
         loc, _, full_loc = unwrap_write_loc(loc)
+        if checkable:
+            self.debug_check_write_locs(loc, full_loc)
         if full_loc is not None:
             loc = full_loc
         # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't

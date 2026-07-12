@@ -139,6 +139,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         )
         self.unified_buffer = unified_buffer
         self.sub_pool_name = sub_pool_name
+        # DIAGNOSTIC only: hand our v2p translate to the buffer so the KV pools
+        # (which hold the buffer but not the tables) can re-derive the physical
+        # slot of a write and check it. No-op unless the write-loc check is on.
+        unified_buffer._debug_translate[sub_pool_name] = self.translate_kv_loc
         self.spec = spec
         self.max_slots = max_slots
         self.grow_direction = spec.grow_direction
