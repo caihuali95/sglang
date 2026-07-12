@@ -839,28 +839,25 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             if N == 0:
                 return
 
-            # `store_cache_4d_kernel` addresses (head_num, head_dim) as ONE flat
-            # ROW_DIM, which requires the trailing two dims of BOTH the destination
-            # views and the source to be contiguous. `store_cache_4d()` asserts
-            # that; we call the kernel directly (the wrapper can't merge our 4-D
-            # layer-major view at page_size>1), so the contract went UNCHECKED here
-            # -- and a source that violates it is read with the wrong element
-            # spacing, i.e. the store lands the wrong bytes at the right slot.
-            # Silent KV corruption, invisible to any location-based check.
+            # We call `store_cache_4d_kernel` DIRECTLY (the `store_cache_4d`
+            # wrapper cannot merge our 4-D layer-major view at page_size > 1), so
+            # the wrapper's contract checks do not run and we must uphold them
+            # here. The kernel reads `loc` and each KV row with raw pointer
+            # arithmetic and walks FLAT memory -- a non-compact layout is read
+            # with the wrong element spacing, so the store lands the WRONG BYTES
+            # at the RIGHT slot. It does not fail: no index leaves its range, and
+            # every torch-side check passes, because torch honours the very stride
+            # the kernel ignores. The only symptom is degraded model quality.
             #
-            # A model is free to hand us a non-contiguous k/v (a slice of a fused
-            # QKV projection, a transpose), and the pre-fusion draft path tolerated
-            # it because the plain pool stored via torch indexing, which honours
-            # arbitrary strides. So normalize rather than reject.
+            # Both hazards are real, not theoretical:
+            #   - source rows: a model may hand us a slice of a fused QKV
+            #     projection, or a transpose;
+            #   - `loc`: a per-step draft slot table built with
+            #     permute(...).reshape(...) is a strided VIEW, and it made this
+            #     kernel scatter draft KV across the wrong requests.
+            # Normalize rather than reject -- both callers are legitimate.
             cache_k = _as_row_contiguous(cache_k)
             cache_v = _as_row_contiguous(cache_v)
-            # The SAME raw-pointer hazard applies to `loc`: the kernel reads it as
-            # `tl.load(loc_ptr + i)` — flat memory, strides ignored. A strided loc
-            # (e.g. a row of a permuted-then-reshaped per-step buffer) makes the
-            # kernel consume an interleaving of SEVERAL steps' locs: KV lands at
-            # the wrong slots and most intended slots are never written, while
-            # every torch-side check still passes (torch honours the stride).
-            # This was the fused-EAGLE accept-length regression.
             if not loc.is_contiguous():
                 loc = loc.contiguous()
             assert k_view.stride(-1) == 1 and k_view.stride(-2) == k_view.shape[-1], (
