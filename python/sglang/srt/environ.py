@@ -320,6 +320,14 @@ class Envs:
     # writes (which degrade accept length without ever crashing). Costs a
     # gather + a sync per write -- diagnostic use only, never in production.
     SGLANG_DEBUG_FUSED_WRITE_LOCS = EnvBool(False)
+    # DIAGNOSTIC: the read-side counterpart. The multi-step draft backend
+    # translates its kv_indices INSIDE the index kernel, so nothing downstream can
+    # tell a correct physical id from a wrong one. This re-derives the same indices
+    # with the in-kernel translate OFF, translates them here against the live v2p
+    # map, and asserts the ids the draft actually reads through agree (plus bounds
+    # and the untouched kv_indptr). Costs a second kernel launch + a sync per draft
+    # forward -- diagnostic use only, never in production.
+    SGLANG_DEBUG_FUSED_READ_LOCS = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
