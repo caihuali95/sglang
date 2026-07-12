@@ -105,42 +105,60 @@ class TestKVReadbackCheck(CustomTestCase):
         self.k_view[page, tok] = self.k
         self.v_view[page, tok] = self.v
 
-    def _check(self, peer_before):
+    def _snapshots(self):
+        peer_before = self.pool._debug_peer_snapshot(self.loc, PAGE_SIZE)
+        p, t = self.loc // PAGE_SIZE, self.loc % PAGE_SIZE
+        own_before = (self.k_view[p, t].clone(), self.v_view[p, t].clone())
+        return peer_before, own_before
+
+    def _check(self, peer_before, own_before=None):
         self.pool._debug_readback(
-            0, self.loc, self.k, self.v, self.k_view, self.v_view, PAGE_SIZE, peer_before
+            0, self.loc, self.k, self.v, self.k_view, self.v_view, PAGE_SIZE,
+            peer_before, own_before,
+        )
+
+    def _events(self):
+        return (
+            getattr(self.pool, "_debug_readback_events", 0),
+            getattr(self.pool, "_debug_spill_events", 0),
         )
 
     def test_correct_store_passes(self):
-        peer_before = self.pool._debug_peer_snapshot(self.loc, PAGE_SIZE)
+        peer_before, own_before = self._snapshots()
         self._store()
-        self._check(peer_before)  # must not raise
+        self._check(peer_before, own_before)
+        self.assertEqual(self._events(), (0, 0))  # no event recorded
 
-    def test_store_that_lands_wrong_bytes_fires(self):
-        # (a) the store did not put down what it was handed.
-        peer_before = self.pool._debug_peer_snapshot(self.loc, PAGE_SIZE)
+    def test_store_that_lands_wrong_bytes_records_and_repairs(self):
+        # (a) the store did not put down what it was handed. The forensic
+        # version RECORDS the event and REPAIRS the slot instead of aborting --
+        # the repair is what turns a diagnostic run into a causal A/B.
+        peer_before, own_before = self._snapshots()
         self._store()
         page, tok = self.loc[0] // PAGE_SIZE, self.loc[0] % PAGE_SIZE
         self.k_view[page, tok, 0, 2] = 99.0  # one element off
-        with self.assertRaises(AssertionError) as cm:
-            self._check(peer_before)
-        msg = str(cm.exception)
-        self.assertIn("did NOT land the bytes it was given", msg)
-        self.assertIn(str(int(self.loc[0])), msg)  # names the physical slot
+        self._check(peer_before, own_before)
+        self.assertEqual(self._events()[0], 1)  # event counted
+        # ...and the slot now holds what the caller asked for (repaired).
+        self.assertTrue(
+            torch.equal(self.k_view[page, tok], self.k[0])
+        )
 
-    def test_store_that_clobbers_the_peer_region_fires(self):
+    def test_store_that_clobbers_the_peer_region_records_and_restores(self):
         # (b) THE case the readback alone is blind to: every byte the store meant
         # to write landed correctly, but its extent overran into the draft region.
-        peer_before = self.pool._debug_peer_snapshot(self.loc, PAGE_SIZE)
-        self._store()  # own region: perfect
+        # Recorded as a spill event, and the peer bytes are RESTORED.
         draft_k, _ = self.unified.draft_views_for("full")
+        for t in draft_k:
+            t.fill_(3.0)  # a known pre-store peer state
+        peer_before, own_before = self._snapshots()
+        self._store()  # own region: perfect
         page, tok = self.loc[1] // PAGE_SIZE, self.loc[1] % PAGE_SIZE
         draft_k[0][page, tok] = 7.0  # the spill
-        with self.assertRaises(AssertionError) as cm:
-            self._check(peer_before)
-        msg = str(cm.exception)
-        self.assertIn("CLOBBERED the draft region", msg)
-        self.assertIn("EXTENT overruns", msg)
-        self.assertIn(str(int(self.loc[1])), msg)
+        self._check(peer_before, own_before)
+        self.assertEqual(self._events(), (0, 1))  # spill counted, no readback event
+        # ...and the clobbered peer bytes are back to their snapshot.
+        self.assertTrue(torch.all(draft_k[0][page, tok] == 3.0))
 
     def test_untouched_peer_does_not_fire(self):
         # The peer legitimately holds data from earlier writes; only a CHANGE
@@ -148,9 +166,10 @@ class TestKVReadbackCheck(CustomTestCase):
         draft_k, draft_v = self.unified.draft_views_for("full")
         for t in draft_k + draft_v:
             t.fill_(3.0)
-        peer_before = self.pool._debug_peer_snapshot(self.loc, PAGE_SIZE)
+        peer_before, own_before = self._snapshots()
         self._store()
-        self._check(peer_before)  # must not raise
+        self._check(peer_before, own_before)
+        self.assertEqual(self._events(), (0, 0))
 
     def test_duplicate_and_sink_locs_are_excluded(self):
         # Two tokens writing one slot legitimately leave a value matching neither
@@ -161,9 +180,10 @@ class TestKVReadbackCheck(CustomTestCase):
         n = self.loc.numel()
         self.k = torch.arange(n * 4, dtype=torch.bfloat16).reshape(n, 1, 4)
         self.v = torch.arange(n * 4, dtype=torch.bfloat16).reshape(n, 1, 4)
-        peer_before = self.pool._debug_peer_snapshot(self.loc, PAGE_SIZE)
+        peer_before, own_before = self._snapshots()
         self._store()  # last writer wins at `base`; slot 0 is the sink
-        self._check(peer_before)  # must not raise
+        self._check(peer_before, own_before)
+        self.assertEqual(self._events(), (0, 0))
 
 
 
@@ -220,8 +240,9 @@ class TestStoreRowContract(CustomTestCase):
         pool.k_buffer[0][page, tok] = kc
         pool.v_buffer[0][page, tok] = vc
         pool._debug_readback(
-            0, loc, kc, vc, pool.k_buffer[0], pool.v_buffer[0], PAGE_SIZE, None
+            0, loc, kc, vc, pool.k_buffer[0], pool.v_buffer[0], PAGE_SIZE, None, None
         )
+        self.assertEqual(getattr(pool, "_debug_readback_events", 0), 0)
         self.assertTrue(torch.equal(pool.k_buffer[0][page, tok], k))
 
 if __name__ == "__main__":

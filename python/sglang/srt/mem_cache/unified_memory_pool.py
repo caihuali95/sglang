@@ -899,7 +899,16 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         )
 
     def _debug_readback(
-        self, layer_id, loc, cache_k, cache_v, k_view, v_view, ps, peer_before
+        self,
+        layer_id,
+        loc,
+        cache_k,
+        cache_v,
+        k_view,
+        v_view,
+        ps,
+        peer_before,
+        own_before,
     ) -> None:
         """DIAGNOSTIC (SGLANG_DEBUG_FUSED_KV_READBACK): did the store actually land
         the bytes we handed it, at the slots we aimed at?
@@ -940,23 +949,31 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
         sel = loc64[idx]
         page, tok = sel // ps, sel % ps
-        for name, view, src in (("K", k_view, cache_k), ("V", v_view, cache_v)):
+        for name, view, src, before in (
+            ("K", k_view, cache_k, own_before[0] if own_before else None),
+            ("V", v_view, cache_v, own_before[1] if own_before else None),
+        ):
             got = view[page, tok]
             want = src[idx].reshape(got.shape)
             bad = got != want
             if bool(bad.any().item()):
-                rows = bad.reshape(bad.shape[0], -1).any(dim=1)
-                r = rows.nonzero(as_tuple=False).flatten()[:4]
-                raise AssertionError(
-                    f"[kv-readback] sub-pool {self._sub_pool_name!r} "
-                    f"({type(self).__name__}) layer {layer_id}: the {name} store did "
-                    f"NOT land the bytes it was given -- {int(rows.sum())}/"
-                    f"{rows.numel()} slots read back different. The write is aimed "
-                    f"correctly but lays bytes down wrong (stride/extent), so it can "
-                    f"also be spilling into the neighbouring region of the fused "
-                    f"slot. Offending physical slots: {sel[r].tolist()}; first slot "
-                    f"wrote {want[r[0]].flatten()[:6].tolist()} but reads back "
-                    f"{got[r[0]].flatten()[:6].tolist()}."
+                # Forensics + REPAIR, no abort: the two aborting runs each died at
+                # their first event, so we never learned the failure's frequency,
+                # its class, or its effect on accept length. Log-and-repair gets
+                # all three from one run -- and the repair itself is the causal
+                # A/B: if these mis-stores ARE the accept regression, a repaired
+                # run must come back at baseline parity.
+                self._debug_readback_forensics(
+                    name=name,
+                    layer_id=layer_id,
+                    view=view,
+                    src=src,
+                    idx=idx,
+                    sel=sel,
+                    page=page,
+                    tok=tok,
+                    want=want,
+                    before_sel=before[idx] if before is not None else None,
                 )
 
         # The spill check. This store had no business touching the other region of
@@ -965,6 +982,128 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         # checks and the readback above are both blind to.
         if peer_before is None:
             return
+        self._debug_check_peer_spill(layer_id, peer_before, ps)
+
+    def _debug_readback_forensics(
+        self,
+        *,
+        name: str,
+        layer_id: int,
+        view: torch.Tensor,
+        src: torch.Tensor,
+        idx: torch.Tensor,
+        sel: torch.Tensor,
+        page: torch.Tensor,
+        tok: torch.Tensor,
+        want: torch.Tensor,
+        before_sel: Optional[torch.Tensor],
+    ) -> None:
+        """Classify ONE bad store, repair it, keep going.
+
+        On one stream, store-then-gather through the same view cannot disagree
+        with the source -- so when it does, the interesting question is not
+        "did it fail" but WHICH impossible thing happened. Three classes, told
+        apart with data only this moment has:
+
+          - UNWRITTEN:  the slot still holds its pre-store content -> the kernel
+                        never wrote this row at all;
+          - PERMUTED:   the slot holds a DIFFERENT source row -> the kernel
+                        mispaired rows and slots;
+          - FOREIGN:    the slot holds bytes matching no source row -> another
+                        writer, or a bytes-mangling store.
+
+        Also re-checks after a full device sync (a mismatch that disappears was
+        launch-ordering), then REPAIRS the store with a plain torch scatter.
+        The repair converts this diagnostic into a causal experiment: if these
+        mis-stores are the accept-length regression, a repaired run lands at
+        baseline parity.
+
+        Full detail for the first few events; afterwards count-only (the
+        counter still measures frequency, which the aborting version destroyed).
+        """
+        self._debug_readback_events = getattr(self, "_debug_readback_events", 0) + 1
+        ev = self._debug_readback_events
+        verbose = ev <= 5
+
+        if verbose and view.is_cuda:
+            torch.cuda.synchronize()
+        got = view[page, tok]  # re-gather (post-sync when verbose)
+        bad_rows = (got != want).reshape(got.shape[0], -1).any(dim=1)
+        n = int(bad_rows.numel())
+        n_bad = int(bad_rows.sum())
+
+        if verbose and n_bad:
+            b = bad_rows.nonzero(as_tuple=False).flatten()
+            got_rows = got.reshape(n, -1)[b]
+            # UNWRITTEN: still equal to the pre-store snapshot.
+            unwritten = torch.zeros(b.numel(), dtype=torch.bool, device=got.device)
+            if before_sel is not None:
+                bef_rows = before_sel.reshape(n, -1)[b]
+                unwritten = (got_rows == bef_rows).all(dim=1)
+            # PERMUTED: equal to some OTHER source row (row-correlate against the
+            # whole source batch; bs x bs x row is small at decode sizes).
+            src_rows = src.reshape(src.shape[0], -1)
+            eq = (got_rows[:, None, :] == src_rows[None, :, :]).all(dim=-1)
+            permuted = eq.any(dim=1) & ~unwritten
+            match_of = eq.to(torch.int8).argmax(dim=1)
+            foreign = ~(unwritten | permuted)
+            pairs = [
+                (int(idx[b[i]]), int(match_of[i]))
+                for i in permuted.nonzero(as_tuple=False).flatten()[:6]
+            ]
+            logger.error(
+                "[kv-readback] EVENT #%d sub-pool %r (%s) layer %d %s-store: "
+                "%d/%d checked rows wrong AFTER device sync (so not launch "
+                "ordering). Classes: UNWRITTEN=%d (kernel never wrote the row), "
+                "PERMUTED=%d (holds a different source row; (row, holds-row) "
+                "pairs %s), FOREIGN=%d (matches no source row). First bad slot "
+                "%d: want %s got %s. Geometry: view shape=%s stride=%s ptr=0x%x "
+                "| src shape=%s stride=%s dtype=%s ptr=0x%x | loc n=%d "
+                "sample=%s. Repairing with a torch scatter and continuing.",
+                ev,
+                self._sub_pool_name,
+                type(self).__name__,
+                layer_id,
+                name,
+                n_bad,
+                n,
+                int(unwritten.sum()),
+                int(permuted.sum()),
+                pairs,
+                int(foreign.sum()),
+                int(sel[b[0]]),
+                want.reshape(n, -1)[b[0]][:6].tolist(),
+                got_rows[0][:6].tolist(),
+                tuple(view.shape),
+                tuple(view.stride()),
+                view.data_ptr(),
+                tuple(src.shape),
+                tuple(src.stride()),
+                src.dtype,
+                src.data_ptr(),
+                int(sel.numel()),
+                sel[:6].tolist(),
+            )
+        elif ev % 200 == 0:
+            logger.error(
+                "[kv-readback] %d mis-store events so far on sub-pool %r (%s) "
+                "(detail suppressed after the first 5; repairs continue).",
+                ev,
+                self._sub_pool_name,
+                type(self).__name__,
+            )
+
+        # THE REPAIR (every event, verbose or not): land the bytes the caller
+        # asked for, via plain advanced indexing -- the reference store the
+        # kernel is supposed to match. Keeps the run alive AND turns accept
+        # length into the causal readout.
+        view[page, tok] = want
+
+    def _debug_check_peer_spill(self, layer_id, peer_before, ps) -> None:
+        """Spill half of the readback diagnostic: this store had no business
+        touching the OTHER region of the fused slot. Log + RESTORE the peer from
+        its snapshot, no abort -- same rationale as the readback forensics
+        (frequency + accept impact from a live run beat a single dead event)."""
         page, tok, pk_before, pv_before = peer_before
         peer = self._debug_peer_views()
         side = "host" if self._is_draft_region_pool else "draft"
@@ -975,18 +1114,33 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             for pl, (view, snap) in enumerate(zip(views, before)):
                 now = view[page, tok]
                 if not torch.equal(now, snap):
-                    hit = (now != snap).reshape(now.shape[0], -1).any(dim=1)
-                    h = hit.nonzero(as_tuple=False).flatten()[:4]
-                    raise AssertionError(
-                        f"[kv-readback] sub-pool {self._sub_pool_name!r} "
-                        f"({type(self).__name__}) layer {layer_id}: this store "
-                        f"CLOBBERED the {side} region ({name}, {side} layer {pl}) at "
-                        f"{int(hit.sum())} slot(s) it never should have touched -- "
-                        f"the write's EXTENT overruns its region of the fused slot. "
-                        f"Physical slots: {(page * ps + tok)[h].tolist()}; first was "
-                        f"{snap[h[0]].flatten()[:6].tolist()} now "
-                        f"{now[h[0]].flatten()[:6].tolist()}."
+                    self._debug_spill_events = (
+                        getattr(self, "_debug_spill_events", 0) + 1
                     )
+                    if self._debug_spill_events <= 5:
+                        hit = (now != snap).reshape(now.shape[0], -1).any(dim=1)
+                        h = hit.nonzero(as_tuple=False).flatten()[:4]
+                        logger.error(
+                            "[kv-readback] SPILL EVENT #%d sub-pool %r (%s) layer "
+                            "%d: this store CLOBBERED the %s region (%s, %s layer "
+                            "%d) at %d slot(s) it never should have touched -- its "
+                            "EXTENT overruns its region of the fused slot. "
+                            "Physical slots %s; first was %s now %s. Restoring the "
+                            "snapshot and continuing.",
+                            self._debug_spill_events,
+                            self._sub_pool_name,
+                            type(self).__name__,
+                            layer_id,
+                            side,
+                            name,
+                            side,
+                            pl,
+                            int(hit.sum()),
+                            (page * ps + tok)[h].tolist(),
+                            snap[h[0]].flatten()[:6].tolist(),
+                            now[h[0]].flatten()[:6].tolist(),
+                        )
+                    view[page, tok] = snap  # restore the clobbered peer bytes
 
     def debug_check_write_locs(
         self, virt_loc: torch.Tensor, phys_loc: Optional[torch.Tensor]
@@ -1116,8 +1270,16 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             )
             # Snapshot the neighbouring region of the fused slot BEFORE the store:
             # an over-long write shows up as the peer changing when it had no
-            # business changing, and only a before/after pair can see that.
-            peer_before = self._debug_peer_snapshot(loc, ps) if _DEBUG_KV_READBACK else None
+            # business changing, and only a before/after pair can see that. Also
+            # snapshot OUR OWN rows: a post-store readback that still equals the
+            # pre-store content means the kernel never wrote at all -- a different
+            # failure than writing wrong bytes, and only the snapshot can tell
+            # them apart.
+            peer_before = own_before = None
+            if _DEBUG_KV_READBACK:
+                peer_before = self._debug_peer_snapshot(loc, ps)
+                _p, _t = loc.to(torch.int64) // ps, loc.to(torch.int64) % ps
+                own_before = (k_view[_p, _t].clone(), v_view[_p, _t].clone())
             head_num = k_view.shape[2]
             head_dim = k_view.shape[3]
             v_head_dim = v_view.shape[3]
@@ -1146,7 +1308,15 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
             if _DEBUG_KV_READBACK:
                 self._debug_readback(
-                    layer_id, loc, cache_k, cache_v, k_view, v_view, ps, peer_before
+                    layer_id,
+                    loc,
+                    cache_k,
+                    cache_v,
+                    k_view,
+                    v_view,
+                    ps,
+                    peer_before,
+                    own_before,
                 )
 
 
