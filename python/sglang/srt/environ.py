@@ -328,6 +328,15 @@ class Envs:
     # and the untouched kv_indptr). Costs a second kernel launch + a sync per draft
     # forward -- diagnostic use only, never in production.
     SGLANG_DEBUG_FUSED_READ_LOCS = EnvBool(False)
+    # DIAGNOSTIC: content check, where the two loc checks above are addressing
+    # checks. They verify WHERE a KV write is aimed; they are blind to HOW FAR it
+    # reaches. A store with a wrong row stride passes both while spilling out of
+    # its region -- right slot, wrong bytes. This reads the bytes back through the
+    # same view and compares them to the source, AND snapshots the neighbouring
+    # region of the fused slot to catch a write whose extent overruns into it
+    # (target KV bleeding into the draft's, or the reverse). Costs a gather + a
+    # sync per store -- diagnostic use only, never in production.
+    SGLANG_DEBUG_FUSED_KV_READBACK = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)

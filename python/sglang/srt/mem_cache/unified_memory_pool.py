@@ -60,6 +60,13 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 _DEBUG_WRITE_LOCS = envs.SGLANG_DEBUG_FUSED_WRITE_LOCS.get()
+_DEBUG_KV_READBACK = envs.SGLANG_DEBUG_FUSED_KV_READBACK.get()
+if _DEBUG_KV_READBACK:
+    logger.warning(
+        "[kv-readback] DIAGNOSTIC ACTIVE (SGLANG_DEBUG_FUSED_KV_READBACK=1): every "
+        "unified KV store is read back and compared to its source, and the peer "
+        "region of the fused slot is checked for spill. Adds a gather + sync per store."
+    )
 if _DEBUG_WRITE_LOCS:
     logger.warning(
         "[write-locs] DIAGNOSTIC ACTIVE (SGLANG_DEBUG_FUSED_WRITE_LOCS=1): every "
@@ -837,6 +844,126 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
+    # True on the pool that views the DRAFT region of a fused slot; False on the
+    # one that views the host region. Only used to pick "the other region" for the
+    # spill check.
+    _is_draft_region_pool = False
+
+    def _debug_peer_views(self):
+        """The OTHER region of the fused slot (host <-> draft), or None if this
+        sub-pool isn't fused (nothing to spill into)."""
+        name = self._sub_pool_name
+        if not self._unified_buffer.has_draft_region(name):
+            return None
+        if self._is_draft_region_pool:
+            return self._unified_buffer.mha_views_for(name)
+        return self._unified_buffer.draft_views_for(name)
+
+    def _debug_peer_snapshot(self, loc, ps):
+        """Copy the peer region's bytes at the slots we're about to write."""
+        peer = self._debug_peer_views()
+        if peer is None or loc.numel() == 0:
+            return None
+        sel = loc.to(torch.int64)
+        page, tok = sel // ps, sel % ps
+        pk, pv = peer
+        return (
+            page,
+            tok,
+            [v[page, tok].clone() for v in pk],
+            [v[page, tok].clone() for v in pv],
+        )
+
+    def _debug_readback(
+        self, layer_id, loc, cache_k, cache_v, k_view, v_view, ps, peer_before
+    ) -> None:
+        """DIAGNOSTIC (SGLANG_DEBUG_FUSED_KV_READBACK): did the store actually land
+        the bytes we handed it, at the slots we aimed at?
+
+        The loc checks verify WHERE a write is aimed; they are blind to HOW FAR it
+        reaches. A store kernel with a wrong row stride passes every one of them
+        while spilling out of its region -- right slot, wrong bytes. Under fusion
+        that means the target's write can bleed into the draft's KV (or vice
+        versa), which corrupts the draft's cache without ever moving a pointer
+        out of range. This reads the bytes back through the SAME view and compares
+        them to the source, which is the only check that can see that.
+
+        Also snapshots the PEER region (draft <-> host) around the write and
+        re-checks it afterwards: an over-long store shows up as the neighbour
+        changing when it had no business changing.
+
+        Duplicate locs and sink-slot writes are excluded -- both legitimately end
+        with a different value than any one source row.
+        """
+        loc64 = loc.to(torch.int64)
+        keep = loc64 >= int(self._unified_buffer.min_slot_index(self._sub_pool_name))
+        uniq, counts = torch.unique(loc64, return_counts=True)
+        dup = uniq[counts > 1]
+        if dup.numel():
+            keep &= ~torch.isin(loc64, dup)
+        idx = keep.nonzero(as_tuple=False).flatten()
+        if idx.numel() == 0:
+            return
+
+        self._debug_readback_checks = getattr(self, "_debug_readback_checks", 0) + 1
+        if self._debug_readback_checks == 1 or self._debug_readback_checks % 2000 == 0:
+            logger.info(
+                "[kv-readback] verified %d store(s) so far on sub-pool %r (%s)",
+                self._debug_readback_checks,
+                self._sub_pool_name,
+                type(self).__name__,
+            )
+
+        sel = loc64[idx]
+        page, tok = sel // ps, sel % ps
+        for name, view, src in (("K", k_view, cache_k), ("V", v_view, cache_v)):
+            got = view[page, tok]
+            want = src[idx].reshape(got.shape)
+            bad = got != want
+            if bool(bad.any().item()):
+                rows = bad.reshape(bad.shape[0], -1).any(dim=1)
+                r = rows.nonzero(as_tuple=False).flatten()[:4]
+                raise AssertionError(
+                    f"[kv-readback] sub-pool {self._sub_pool_name!r} "
+                    f"({type(self).__name__}) layer {layer_id}: the {name} store did "
+                    f"NOT land the bytes it was given -- {int(rows.sum())}/"
+                    f"{rows.numel()} slots read back different. The write is aimed "
+                    f"correctly but lays bytes down wrong (stride/extent), so it can "
+                    f"also be spilling into the neighbouring region of the fused "
+                    f"slot. Offending physical slots: {sel[r].tolist()}; first slot "
+                    f"wrote {want[r[0]].flatten()[:6].tolist()} but reads back "
+                    f"{got[r[0]].flatten()[:6].tolist()}."
+                )
+
+        # The spill check. This store had no business touching the other region of
+        # the fused slot; if it did, its extent is wrong even though every byte it
+        # meant to write landed correctly -- which is exactly the failure the loc
+        # checks and the readback above are both blind to.
+        if peer_before is None:
+            return
+        page, tok, pk_before, pv_before = peer_before
+        peer = self._debug_peer_views()
+        side = "host" if self._is_draft_region_pool else "draft"
+        for name, views, before in (
+            ("K", peer[0], pk_before),
+            ("V", peer[1], pv_before),
+        ):
+            for pl, (view, snap) in enumerate(zip(views, before)):
+                now = view[page, tok]
+                if not torch.equal(now, snap):
+                    hit = (now != snap).reshape(now.shape[0], -1).any(dim=1)
+                    h = hit.nonzero(as_tuple=False).flatten()[:4]
+                    raise AssertionError(
+                        f"[kv-readback] sub-pool {self._sub_pool_name!r} "
+                        f"({type(self).__name__}) layer {layer_id}: this store "
+                        f"CLOBBERED the {side} region ({name}, {side} layer {pl}) at "
+                        f"{int(hit.sum())} slot(s) it never should have touched -- "
+                        f"the write's EXTENT overruns its region of the fused slot. "
+                        f"Physical slots: {(page * ps + tok)[h].tolist()}; first was "
+                        f"{snap[h[0]].flatten()[:6].tolist()} now "
+                        f"{now[h[0]].flatten()[:6].tolist()}."
+                    )
+
     def debug_check_write_locs(
         self, virt_loc: torch.Tensor, phys_loc: Optional[torch.Tensor]
     ) -> None:
@@ -933,6 +1060,10 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             N = loc.numel()
             if N == 0:
                 return
+            # Snapshot the neighbouring region of the fused slot BEFORE the store:
+            # an over-long write shows up as the peer changing when it had no
+            # business changing, and only a before/after pair can see that.
+            peer_before = self._debug_peer_snapshot(loc, ps) if _DEBUG_KV_READBACK else None
             head_num = k_view.shape[2]
             head_dim = k_view.shape[3]
             v_head_dim = v_view.shape[3]
@@ -959,6 +1090,11 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 num_warps=4,
             )
 
+            if _DEBUG_KV_READBACK:
+                self._debug_readback(
+                    layer_id, loc, cache_k, cache_v, k_view, v_view, ps, peer_before
+                )
+
 
 class UnifiedDraftKVPool(UnifiedMHATokenToKVPool):
     """Draft-model KV pool over the DRAFT byte region of a fused host sub-pool.
@@ -974,6 +1110,10 @@ class UnifiedDraftKVPool(UnifiedMHATokenToKVPool):
     the draft views, then initializes `MHATokenToKVPool` state directly with
     the draft region's geometry.
     """
+
+    # This pool views the DRAFT half of the fused slot, so the "other region" its
+    # writes must never touch is the HOST half.
+    _is_draft_region_pool = True
 
     def __init__(
         self,
