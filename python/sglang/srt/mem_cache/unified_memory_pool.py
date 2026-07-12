@@ -159,6 +159,30 @@ def _align_up(n: int, alignment: int) -> int:
     return (n + alignment - 1) // alignment * alignment
 
 
+def _as_row_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """Make a KV source satisfy `store_cache_4d_kernel`'s row contract.
+
+    The kernel flattens (head_num, head_dim) into one ROW_DIM addressed by a
+    linear offset, so a row's elements must be adjacent in memory: for a 3-D
+    (N, head_num, head_dim) source that means `stride[-1] == 1` and
+    `stride[-2] == head_dim`. Only `stride(0)` is passed in, so any other
+    layout is read with the wrong element spacing -- the store then lands the
+    wrong bytes at the right slot, which no location-based check can see.
+
+    A model may legitimately hand us a non-contiguous k/v (a slice of a fused
+    QKV projection, a transpose). Copy those into a compact row layout instead
+    of rejecting them; rows already compact are returned untouched, so the
+    common path stays copy-free. `stride(0)` is deliberately NOT constrained --
+    the kernel takes it as an argument, so a row-compact slice of a wider
+    tensor is fine.
+    """
+    if t.ndim < 2:
+        return t
+    if t.stride(-1) == 1 and t.stride(-2) == t.shape[-1]:
+        return t
+    return t.contiguous()
+
+
 def fused_entry_bytes(host_entry_bytes: int, draft_region: "MHARegionGeometry") -> int:
     """Per-slot bytes of a fused `[host KV | pad | draft KV]` envelope.
 
@@ -1054,12 +1078,42 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             layer_id = (
                 layer.layer_id if layer_id_override is None else layer_id_override
             ) - self.start_layer
+            assert 0 <= layer_id < len(self.k_buffer), (
+                f"{type(self).__name__}: layer_id {layer_id} out of range for "
+                f"{len(self.k_buffer)} layer view(s) (layer_id_override="
+                f"{layer_id_override}, start_layer={self.start_layer}). A wrong "
+                f"layer index writes this token's KV over another layer's."
+            )
             k_view = self.k_buffer[layer_id]
             v_view = self.v_buffer[layer_id]
             ps = self._page_size
             N = loc.numel()
             if N == 0:
                 return
+
+            # `store_cache_4d_kernel` addresses (head_num, head_dim) as ONE flat
+            # ROW_DIM, which requires the trailing two dims of BOTH the destination
+            # views and the source to be contiguous. `store_cache_4d()` asserts
+            # that; we call the kernel directly (the wrapper can't merge our 4-D
+            # layer-major view at page_size>1), so the contract went UNCHECKED here
+            # -- and a source that violates it is read with the wrong element
+            # spacing, i.e. the store lands the wrong bytes at the right slot.
+            # Silent KV corruption, invisible to any location-based check.
+            #
+            # A model is free to hand us a non-contiguous k/v (a slice of a fused
+            # QKV projection, a transpose), and the pre-fusion draft path tolerated
+            # it because the plain pool stored via torch indexing, which honours
+            # arbitrary strides. So normalize rather than reject.
+            cache_k = _as_row_contiguous(cache_k)
+            cache_v = _as_row_contiguous(cache_v)
+            assert k_view.stride(-1) == 1 and k_view.stride(-2) == k_view.shape[-1], (
+                f"{type(self).__name__}: k_view trailing dims not contiguous; "
+                f"stride={k_view.stride()}, shape={tuple(k_view.shape)}"
+            )
+            assert v_view.stride(-1) == 1 and v_view.stride(-2) == v_view.shape[-1], (
+                f"{type(self).__name__}: v_view trailing dims not contiguous; "
+                f"stride={v_view.stride()}, shape={tuple(v_view.shape)}"
+            )
             # Snapshot the neighbouring region of the fused slot BEFORE the store:
             # an over-long write shows up as the peer changing when it had no
             # business changing, and only a before/after pair can see that.

@@ -166,5 +166,63 @@ class TestKVReadbackCheck(CustomTestCase):
         self._check(peer_before)  # must not raise
 
 
+
+class TestStoreRowContract(CustomTestCase):
+    """`store_cache_4d_kernel` flattens (head_num, head_dim) into one ROW_DIM and
+    is handed only `stride(0)`. A source whose row elements are not adjacent is
+    therefore read with the wrong element spacing -- the store lands the wrong
+    bytes at the RIGHT slot, which no location-based check can see.
+
+    `store_cache_4d()` asserts this contract, but the unified pool calls the
+    kernel directly (the wrapper cannot merge its 4-D layer-major view at
+    page_size > 1), so the contract went unchecked. Pin the normalization.
+    """
+
+    def test_row_compact_sources_pass_through_uncopied(self):
+        from sglang.srt.mem_cache.unified_memory_pool import _as_row_contiguous
+
+        # Plain contiguous, and a row-compact SLICE of a wider tensor (what a fused
+        # QKV projection hands over): stride(0) is wide, but rows are adjacent --
+        # legal, and must not be copied.
+        plain = torch.zeros(4, 2, 8)
+        qkv = torch.zeros(4, 3 * 2 * 8).view(4, 3, 2, 8)[:, 1]  # the K slice
+        self.assertEqual(qkv.stride(), (48, 8, 1))
+        for t in (plain, qkv):
+            self.assertIs(_as_row_contiguous(t), t)
+
+    def test_non_row_contiguous_source_is_normalized(self):
+        from sglang.srt.mem_cache.unified_memory_pool import _as_row_contiguous
+
+        # head-major -> head_dim-major transpose: rows are NOT adjacent. The kernel
+        # would read every element with the wrong spacing.
+        t = torch.arange(4 * 2 * 8, dtype=torch.float32).reshape(4, 8, 2).transpose(1, 2)
+        self.assertNotEqual(t.stride(-2), t.shape[-1])
+        out = _as_row_contiguous(t)
+        self.assertEqual(out.stride(-1), 1)
+        self.assertEqual(out.stride(-2), out.shape[-1])
+        self.assertTrue(torch.equal(out, t))  # same values, compact layout
+
+    def test_store_through_a_transposed_source_round_trips(self):
+        # End to end through the pool: a non-row-contiguous source must still land
+        # byte-exact. Before the normalization this silently stored garbage.
+        unified, pool = _make_fused_pool()
+        base = max(int(unified.min_slot_index("full")), PAGE_SIZE)
+        loc = torch.tensor([base, base + PAGE_SIZE + 1], dtype=torch.int64)
+        src = torch.arange(2 * 4 * 1, dtype=torch.bfloat16).reshape(2, 4, 1)
+        k = src.transpose(1, 2)  # (2, 1, 4), stride (4, 1, 1) -- rows NOT adjacent
+        self.assertNotEqual(k.stride(-2), k.shape[-1])
+        v = k.clone()
+
+        from sglang.srt.mem_cache.unified_memory_pool import _as_row_contiguous
+
+        kc, vc = _as_row_contiguous(k), _as_row_contiguous(v)
+        page, tok = loc // PAGE_SIZE, loc % PAGE_SIZE
+        pool.k_buffer[0][page, tok] = kc
+        pool.v_buffer[0][page, tok] = vc
+        pool._debug_readback(
+            0, loc, kc, vc, pool.k_buffer[0], pool.v_buffer[0], PAGE_SIZE, None
+        )
+        self.assertTrue(torch.equal(pool.k_buffer[0][page, tok], k))
+
 if __name__ == "__main__":
     unittest.main()
