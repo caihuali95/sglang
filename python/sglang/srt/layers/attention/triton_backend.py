@@ -2109,7 +2109,16 @@ class TritonMultiStepDraftBackend:
         kv_indices_width = draft_kv_indices_buffer_width(
             forward_batch.batch_size, self.topk, self.max_context_len
         )
-        kv_indices = torch.empty(
+        # Zeroed, not empty: `generate_draft_decode_kv_indices` writes only the
+        # entries a step actually uses, and the per-step slice below is sized from
+        # `seq_lens_sum` -- an UPPER BOUND when the exact sum isn't on hand. Any
+        # slack is therefore handed to attention as KV slot ids. Uninitialized
+        # there means reading arbitrary slots (another request's KV, or out of
+        # range); zeroed means the slot-0 sink, which is what every other
+        # padding path in the unified pool already targets. The cuda-graph buffer
+        # is zeroed for exactly this reason -- the eager one was not, which is why
+        # only the eager path was ever affected.
+        kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int64,
             device=self.device,
