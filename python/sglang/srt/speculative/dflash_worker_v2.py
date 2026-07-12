@@ -979,10 +979,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
-        # Fused draft KV (Stage 4.1): this is the ONE draft KV write that
+        # Fused draft KV: this is the ONE draft KV write that
         # bypasses attention metadata, so the virtual->physical translate
-        # happens here (invariant D8': every loc reaching a unified pool
-        # method is PHYSICAL). Same pool-capability rule as TritonAttnBackend;
+        # happens here: every loc reaching a unified pool method must already be
+        # PHYSICAL. Same pool-capability rule as TritonAttnBackend;
         # probed at call time because pools bind after __init__
         # (alloc_memory_pool). Every id in cache_loc/cache_loc_2d is a real
         # pre-allocated slot of the verify block (commit_lens only limits

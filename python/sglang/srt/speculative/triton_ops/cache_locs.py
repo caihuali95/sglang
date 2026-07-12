@@ -122,7 +122,7 @@ def generate_draft_decode_kv_indices(
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
-    # Fused draft KV (Stage 4.1): the unified full sub-pool's v2p table.
+    # Fused draft KV: the unified full sub-pool's v2p table.
     # With HAS_V2P, every id read from req_to_token is translated in-kernel
     # so the emitted kv_indices are PHYSICAL — the kernel translates exactly
     # the entries it writes (no post-pass, no garbage-tail hazard).

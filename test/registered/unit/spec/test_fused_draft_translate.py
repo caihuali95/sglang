@@ -11,8 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""In-kernel v2p translate of `generate_draft_decode_kv_indices` (Stage 4.1
-fused draft KV): with HAS_V2P the kernel must emit exactly
+"""In-kernel v2p translate of `generate_draft_decode_kv_indices` (fused draft
+KV): with HAS_V2P the kernel must emit exactly
 `clamp_min(v2p[id // ps] * ps + id % ps, 0)` for every id it writes, and
 write NOTHING it didn't write before (no garbage-tail translation).
 

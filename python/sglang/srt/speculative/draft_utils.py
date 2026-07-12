@@ -24,11 +24,14 @@ def _draft_layer_count(model_config: "ModelConfig") -> Optional[int]:
     the single-layer MTP arch override first, then `num_nextn_predict_layers`,
     then the dense-draft hidden/attention layer count.
 
-    Returns None for an MTP/NextN draft whose head size cannot be determined —
+    Returns None for an MTP/NextN draft whose head size cannot be determined:
     falling back to `num_hidden_layers` there would size the draft region at the
-    WHOLE target (eval_272: 32 layers instead of 1, a 5x cell inflation). A
-    dense draft checkpoint (DFLASH / EAGLE3) legitimately uses its own layer
-    count, so only the MTP archs get the guard.
+    WHOLE target -- a 1-layer MTP head charged as 32 layers, a ~5x per-token cell
+    inflation that silently halves admission (see the `num_nextn_predict_layers`
+    note in `ModelConfig`, whose nested-config miss is exactly how that fallback
+    used to get taken). Refusing to fuse is the safe failure. A dense draft
+    checkpoint (DFLASH / EAGLE3) legitimately uses its own layer count, so only
+    the MTP archs get the guard.
     """
     arch = model_config.hf_config.architectures[0]
     if arch in _SINGLE_LAYER_MTP_ARCHS:
@@ -67,7 +70,7 @@ def resolve_draft_kv_geometry(
     is_self_draft: bool = False,
 ) -> Optional["MHARegionGeometry"]:
     """Resolve the draft model's per-slot KV geometry for fused draft KV
-    (design doc §33.4 Design B / Stage 4.1).
+    
 
     Returns the geometry of the draft byte region that rides inside the host
     sub-pool's fused slot entry, or None when there is no draft KV to fuse

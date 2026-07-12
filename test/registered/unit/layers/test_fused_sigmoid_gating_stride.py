@@ -46,7 +46,7 @@ def _envelope_view(shape, slot_stride_elems, dtype, device, fill=None):
     not torch.cuda.is_available(), "fused_sigmoid_gating kernels require CUDA"
 )
 class TestFusedSigmoidGatingEnvelopeStride(unittest.TestCase):
-    """Bug-B regression (eval_248/251, design doc §30.3 tail): the kernel
+    """Envelope-stride regression: the kernel
     hard-coded the h0 slot stride (`HV*K*V`) and the intermediate-cache
     slot/step strides (`cache_steps*HV*K*V` / `HV*K*V`), silently reading and
     writing the WRONG slot for the page-major envelope's strided pool views —
@@ -167,7 +167,7 @@ class TestFusedSigmoidGatingEnvelopeStride(unittest.TestCase):
         torch.testing.assert_close(ssm_e.contiguous(), ssm_ref, rtol=0, atol=0)
 
     def test_large_stride_int64_no_overflow(self):
-        """eval_228-class guard: idx * slot_stride past 2**31 must not wrap.
+        """Overflow guard: idx * slot_stride past 2**31 must not wrap.
         Production-scale envelope slot stride (~2.6e7 elems) x slot 88 ≈ 2.3e9
         elements > int32 max; the un-cast int32 load would fault or mis-copy."""
         B, T, H, HV, K, V = 1, 1, 2, 4, 64, 64

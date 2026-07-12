@@ -3264,7 +3264,7 @@ class Scheduler(
                             allocator.set_latest_forward_done_event(forward_done)
                             # Write-set classification: hand the allocator this
                             # forward's virtual out_cache_loc as a tensor ref (no GPU work).
-                            # Fused draft KV (Stage 4.1) is covered by construction:
+                            # Fused draft KV is covered by construction:
                             # the write-set is SLOT/page-granular and the draft writes
                             # its byte region at the SAME out_cache_loc ids the target
                             # writes, while forward_done records after the WHOLE spec

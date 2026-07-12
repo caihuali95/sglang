@@ -1,9 +1,8 @@
 """Unit tests for `resolve_draft_kv_geometry` (speculative/draft_utils.py) --
 CPU only, pure config arithmetic.
 
-Stage 4.1 (fused draft KV, design doc §33.4 Design B) attaches the draft
-model's per-slot KV byte region to the host sub-pool's fused entry. These
-tests pin the per-case geometry resolution:
+Fused draft KV attaches the draft model's per-slot KV byte region to the host
+sub-pool's fused entry. These tests pin the per-case geometry resolution:
   1. MTP/NEXTN self-draft (no draft path): target geometry, nnpl layers;
      nnpl absent/0 -> None,
   2. EAGLE separate checkpoint: DRAFT-config geometry (EAGLE3-like head
@@ -116,7 +115,7 @@ class TestResolveDraftKvGeometry(CustomTestCase):
             )
 
     def test_self_draft_reads_the_mtp_swapped_draft_config(self):
-        """eval_270 regression: targets outside the auto-draft-path list (Qwen3.5,
+        """Regression: targets outside the auto-draft-path list (Qwen3.5,
         Qwen3-Next) leave speculative_draft_model_path=None, so the caller re-reads
         the TARGET checkpoint with is_draft_model=True — which is what swaps in the
         MTP arch and sets num_nextn_predict_layers. Reading the raw TARGET config
@@ -141,14 +140,14 @@ class TestResolveDraftKvGeometry(CustomTestCase):
         self.assertEqual(geometry.head_num, 8)
 
     def test_mtp_draft_never_sizes_at_the_full_model(self):
-        """eval_272 regression: ModelConfig surfaces num_nextn_predict_layers from
+        """Regression: ModelConfig surfaces num_nextn_predict_layers from
         hf_TEXT_config, but _config_draft_model sets it on hf_config — for nested
-        configs (Qwen3.5) those differ, so nnpl read as None and the layer count
-        fell through to num_hidden_layers: the draft region was sized at the WHOLE
-        32-layer target (5x cell inflation) instead of the 1-layer MTP head.
-        ModelConfig now falls back to hf_config; this pins the resolver's guard so
-        an MTP draft with an indeterminable head size refuses to fuse rather than
-        fusing the full model."""
+        configs (e.g. Qwen3.5) those are different objects, so nnpl read as None and
+        the layer count fell through to num_hidden_layers: the draft region was
+        sized at the WHOLE 32-layer target (a 5x cell inflation) instead of the
+        1-layer MTP head. ModelConfig now falls back to hf_config; this pins the
+        resolver's guard so an MTP draft with an indeterminable head size refuses to
+        fuse rather than fusing the full model."""
         mtp_no_nnpl = _model_config(
             arch="Qwen3_5ForCausalLMMTP",
             num_nextn_predict_layers=None,  # nnpl failed to surface

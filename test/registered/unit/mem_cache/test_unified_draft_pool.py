@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""`UnifiedDraftKVPool` binding (Stage 4.1): the draft worker's KV pool is a
+"""`UnifiedDraftKVPool` binding: the draft worker's KV pool is a
 pure view object over the DRAFT region of the target's fused full sub-pool.
 
 Covers: buffers alias the unified draft views exactly (same storage, same

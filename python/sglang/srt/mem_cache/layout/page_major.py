@@ -73,7 +73,7 @@ def build_page_major_mha_views(
     V is analogous with ``v_row_bytes`` / ``v_head_dim``. A token id ``t`` reads
     page ``t // page_size``, slot ``t % page_size``.
 
-    Fused slots (Stage 4.1): when several MHA regions share one page block
+    Fused slots: when several MHA regions share one page block
     (``[host KV·ps | pad·ps | draft KV·ps]``), pass the FUSED block size as
     ``page_stride_bytes`` (same stride[0] for every region) and the region's
     base offset within the block as ``anchor_bytes`` — offsets are additive,

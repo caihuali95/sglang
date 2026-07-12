@@ -435,7 +435,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
-        # Fused-draft-KV region geometry (Stage 4.1); resolved by
+        # Fused-draft-KV region geometry; resolved by
         # maybe_init_draft_kv_geometry() during initialize().
         self.draft_kv_geometry = None
         if (
@@ -757,6 +757,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # the field being absent — otherwise the draft worker takes the MTP branch below with
         # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
         # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
+        # The opposite miss is just as silent and far more expensive: if an MTP draft's
+        # `num_nextn_predict_layers` fails to surface at all (see the nested-config note in
+        # `ModelConfig`), this falls through to the target's own depth and builds the draft's
+        # KV pool with the FULL model's layer count — e.g. 32 layers of KV for a 1-layer MTP
+        # head. Nothing crashes; the pool is simply ~32x oversized and the memory is lost.
         _nnpl = self.model_config.num_nextn_predict_layers
         model_has_mtp_layers = _nnpl is not None and _nnpl > 0
         model_num_layers = (
@@ -2429,7 +2434,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def maybe_init_draft_kv_geometry(self):
         """Resolve and stash the draft model's fused-KV region geometry
-        (`self.draft_kv_geometry`, design doc §33.4 Design B / Stage 4.1).
+        (`self.draft_kv_geometry`).
 
         Target worker + unified memory + a spec algorithm with draft KV only;
         everything else leaves the `None` default. Must run after
@@ -2470,8 +2475,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # `is_draft_model=True` is what makes it materialize —
         # `ModelConfig._config_draft_model` swaps in the MTP arch and sets
         # `num_nextn_predict_layers`. Reading the target config directly instead
-        # sees no MTP layers and silently skips fusion (eval_270: the EAGLE
-        # cells fell back to the private pool while DFLASH fused correctly).
+        # sees no MTP layers and silently skips fusion, leaving such targets on
+        # the private-pool fallback.
         draft_path = self.server_args.speculative_draft_model_path
         is_self_draft = draft_path is None
         draft_model_config = self._build_model_config(

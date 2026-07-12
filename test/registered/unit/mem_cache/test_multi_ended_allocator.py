@@ -2957,7 +2957,7 @@ class TestSpecStateBandAllocator(unittest.TestCase):
 
 
 class TestFloatMultiEndedAllocator(unittest.TestCase):
-    """General per-slot float middle pool (§6.4): smart-direction alloc +
+    """General per-slot float middle pool: smart-direction alloc +
     tighter-side compaction. Unit-validated; production use arrives with the
     first cache-class middle pool."""
 

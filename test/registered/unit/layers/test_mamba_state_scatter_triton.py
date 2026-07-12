@@ -462,7 +462,7 @@ class TestEnvelopeStridedScatter(unittest.TestCase):
 
 
 class TestScatterInt32OverflowRegression(unittest.TestCase):
-    """eval_228 regression: `src_idx * src_req_stride` computed in int32 wraps
+    """Overflow regression: `src_idx * src_req_stride` computed in int32 wraps
     negative once the product exceeds 2**31 (the band-slice slot stride is
     ~1.4e8 ELEMENTS in production, so row >= 16 wraps) — an illegal access when
     the band sits low in the buffer, SILENT state corruption when it sits high

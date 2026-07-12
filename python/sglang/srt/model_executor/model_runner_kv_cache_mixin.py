@@ -72,10 +72,10 @@ def _should_enable_lazy_compaction() -> bool:
 
 
 def _should_enable_fused_draft_kv() -> bool:
-    """Fused draft KV (Stage 4.1, design doc §33.4 Design B) default — ON
-    unless `SGLANG_DISABLE_FUSED_DRAFT_KV=1` (escape hatch for A/B /
-    rollback to the private-pool + reserve path). The ONLY env read site —
-    everything downstream keys on `draft_kv_geometry is not None`.
+    """Fused draft KV is ON by default, unless `SGLANG_DISABLE_FUSED_DRAFT_KV=1`
+    (escape hatch for A/B / rollback to the private-pool + reserve path). The
+    ONLY env read site — everything downstream keys on
+    `draft_kv_geometry is not None`.
     """
     return not envs.SGLANG_DISABLE_FUSED_DRAFT_KV.get()
 
@@ -516,7 +516,7 @@ class ModelRunnerKVCacheMixin:
             # never overwritten (_resolve_max_num_reqs min's + warns instead).
             server_args.max_running_requests = int(n * dp)
 
-        # Fused draft KV (Stage 4.1): cell == base, the draft KV is part of
+        # Fused draft KV: cell == base, the draft KV is part of
         # every fused slot — no separate pool, no reserve to report.
         draft_note = (
             f"draft KV fused into cell ({cell_size} B/token)"
@@ -749,7 +749,7 @@ class ModelRunnerKVCacheMixin:
             # access: handle_max_mamba_cache always runs before pool init for
             # mambaish configs.
             spec_state_size=self.mamba_spec_state_size,
-            # Fused draft KV (Stage 4.1): attach the draft region to the full
+            # Fused draft KV: attach the draft region to the full
             # sub-pool so draft KV rides inside the fused slot entries
             # (non-None <=> fusion enabled; gated in maybe_init_draft_kv_geometry).
             draft_kv_geometry=self.draft_kv_geometry,
@@ -837,7 +837,7 @@ class ModelRunnerKVCacheMixin:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
-            # Fused draft KV (Stage 4.1): the dense draft fuses into the FULL
+            # Fused draft KV: the dense draft fuses into the FULL
             # sub-pool (a DSV4-style draft would attach to "swa" instead;
             # non-None <=> fusion enabled, gated in maybe_init_draft_kv_geometry).
             draft_kv_geometry=self.draft_kv_geometry,
@@ -848,7 +848,7 @@ class ModelRunnerKVCacheMixin:
         self._unified_memory_pool = bundle.unified_memory_pool
 
     def _init_unified_draft_pool(self: ModelRunner) -> bool:
-        """DRAFT worker under a fused-draft-KV target (Stage 4.1): bind
+        """DRAFT worker under a fused-draft-KV target: bind
         `token_to_kv_pool` to the DRAFT-region views of the target's unified
         full sub-pool instead of allocating a private, virtual-index-sized
         pool. Returns True when the fused binding was made; the caller must
@@ -937,7 +937,7 @@ class ModelRunnerKVCacheMixin:
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
-        # Fused draft KV (Stage 4.1): when the target's unified full sub-pool
+        # Fused draft KV: when the target's unified full sub-pool
         # carries a draft region, the draft worker binds views instead of
         # allocating a private pool — the vcap bump and every construction
         # path below are then irrelevant.
@@ -1695,13 +1695,14 @@ class ModelRunnerKVCacheMixin:
                 "and --kv-cache-dtype != fp4_e2m1."
             )
 
-        # Invariant D8 (NON-fused draft only; the fused path returned above):
-        # a draft worker reaching here built a PRIVATE pool indexed by VIRTUAL
-        # token ids — declare the capability so attention backends skip the
-        # v2p translate (see TritonAttnBackend). Capability lives on the POOL,
-        # not the worker role; harmless no-op for non-unified allocators
-        # (their probe finds no translate_kv_loc either way). Retires together
-        # with the reserve path once fused draft KV is the only mode.
+        # NON-fused draft only (the fused path returned above): a draft worker
+        # reaching here built a PRIVATE pool indexed by VIRTUAL token ids, whose
+        # bytes never move (compaction relocates target-pool bytes only). Declare
+        # the capability so attention backends skip the v2p translate for it (see
+        # TritonAttnBackend); translating would address the wrong draft slots.
+        # The capability lives on the POOL, not the worker role; harmless no-op
+        # for non-unified allocators (their probe finds no translate_kv_loc
+        # either way). Retires with the private-pool fallback.
         if self.is_draft_worker:
             self.token_to_kv_pool.kv_ids_are_virtual = True
 

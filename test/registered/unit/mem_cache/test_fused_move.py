@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Fused-slot relocation (Stage 4.1): `UnifiedMHATokenToKVPool.move_kv_cache`
+"""Fused-slot relocation: `UnifiedMHATokenToKVPool.move_kv_cache`
 must move the WHOLE `[host KV | draft KV]` envelope in one call — compaction,
 inverse-history rollback, and `move_accept_kv` all route through this method,
 so a host-only move would silently strand the draft bytes at the old physical

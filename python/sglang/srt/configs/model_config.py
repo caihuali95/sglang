@@ -930,13 +930,23 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         if self.num_nextn_predict_layers is None:
-            # `_config_draft_model` (run earlier in __init__) sets this on
-            # `hf_config`, but for nested configs (e.g. Qwen3.5's
-            # Qwen3_5ForConditionalGeneration) `hf_text_config` is a DIFFERENT
-            # object, so the value never surfaced. Consumers then fell back to
-            # the FULL model's layer count and sized the MTP draft's KV at 32
-            # layers instead of 1 (eval_272: fused draft region 32 layers ->
-            # 5x cell inflation; the private draft pool was equally oversized).
+            # An MTP/NextN draft advertises its head depth here, and it is the
+            # ONLY source for it. `_config_draft_model` (run earlier in
+            # __init__) writes the value onto `hf_config`; reading it back from
+            # `hf_text_config` works only for FLAT configs, where the two are
+            # the same object. For a nested config (a multimodal/conditional
+            # wrapper whose text tower is a sub-config) they are DIFFERENT
+            # objects and the value never surfaces -- the attribute reads as
+            # None on a draft that plainly has an MTP head.
+            #
+            # That silent None is dangerous rather than merely lossy: every
+            # consumer of this field falls back to `num_hidden_layers`, i.e. it
+            # sizes a 1-layer MTP draft's KV at the FULL target's depth. The KV
+            # bytes charged per token then jump by (1 + target_layers) / 2 --
+            # for a 32-layer target that is a ~5x per-token cell inflation,
+            # which halves the admitted batch on the fused path and oversizes
+            # the private draft pool by 32x on the non-fused one. Fall back to
+            # `hf_config` so the value surfaces for nested configs too.
             self.num_nextn_predict_layers = getattr(
                 self.hf_config, "num_nextn_predict_layers", None
             )

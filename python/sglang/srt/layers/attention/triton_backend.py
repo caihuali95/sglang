@@ -153,11 +153,11 @@ class TritonAttnBackend(AttentionBackend):
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
         # kernels need PHYSICAL. Applied eagerly so the captured graph has no translate.
         # Capability on the POOL, not the worker role: a pool that declares
-        # `kv_ids_are_virtual` (the NON-fused private draft pool, invariant D8)
+        # `kv_ids_are_virtual` (the NON-fused private draft pool)
         # opts out — its KV is indexed by VIRTUAL ids (relocation-stable;
         # compaction moves target-pool bytes only, so translating would read
         # the wrong draft slots). Absent => translate: target pools and the
-        # FUSED draft view pool (Stage 4.1, whose bytes ride in the target's
+        # FUSED draft view pool, whose bytes ride in the target's
         # relocatable slots) both need physical ids; non-unified allocators
         # have no translate_kv_loc so the probe degenerates to None. Draft
         # mamba states keep their own translate (_translate_mamba_indices)
@@ -708,12 +708,12 @@ class TritonAttnBackend(AttentionBackend):
             its own id space -> `translate_loc_from_full_to_swa`.
           * Single-pool models whose window layers read the SAME slots as the
             full layers -> the ordinary v2p translate. This is the fused draft
-            view pool (Stage 4.1): a DFLASH draft has sliding-window layers but
+            view pool: a DFLASH draft has sliding-window layers but
             its KV lives entirely in the target's fused full-pool slots, so its
             window ids are plain full-pool ids. Before the translate flip the
             draft skipped translation altogether, which is why this path was
-            never exercised (eval_270: AttributeError under CG capture, and a
-            silent VIRTUAL-id window read in eager mode).
+            never exercised: it raised AttributeError under cuda-graph capture,
+            and silently read VIRTUAL ids in eager mode.
         """
         swa_translate = getattr(
             self.token_to_kv_pool, "translate_loc_from_full_to_swa", None
@@ -741,9 +741,9 @@ class TritonAttnBackend(AttentionBackend):
         `update_sliding_window_buffer` (unchanged, pre-Stage-4.1 behavior) — do
         NOT re-route them through the returning helper: that translate yields
         int32, and rebinding the caller's int64 index tensor to it silently
-        downcast the eager indices (eval_275: gpt-oss chunk/ps256/cg_off went
-        to GSM8K 0.000 with spec OFF; the cuda-graph path was spared only
-        because it assigns in place into a static int64 buffer).
+        downcast the eager indices, corrupting the window read (the cuda-graph
+        path was spared only because it assigns in place into a static int64
+        buffer, which preserves the dtype).
 
         Only the fused draft view pool needs this: it has no SWA sub-pool, so
         `update_sliding_window_buffer`'s hasattr guard leaves its window ids
@@ -2015,7 +2015,7 @@ class TritonMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
-        # Fused draft KV (Stage 4.1): same pool capability gate as
+        # Fused draft KV: same pool capability gate as
         # TritonAttnBackend, but the READ translate is fused INTO
         # generate_draft_decode_kv_indices (the v2p table rides into the
         # kernel), so all steps' kv_indices emerge PHYSICAL from the single

@@ -11,8 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Layout correctness of fused draft-KV slots (Stage 4.1, design doc §33.4
-Design B): ``MHASubPoolSpec.draft_region`` + ``UnifiedKVPool`` draft views.
+"""Layout correctness of fused draft-KV slots: ``MHASubPoolSpec.draft_region``
++ ``UnifiedKVPool`` draft views.
 
 A fused slot is one contiguous envelope ``[host KV | pad | draft KV]``; within
 a page block the layout is ``[host L0_K·ps | host L0_V·ps | ... | pad·ps |

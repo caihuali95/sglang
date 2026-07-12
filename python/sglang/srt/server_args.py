@@ -6328,9 +6328,9 @@ class ServerArgs:
         # chain-only mamba commit now releases the band pin on every exit path
         # (unpin_spec_state_band in dflash_worker_v2's verify finally) — the
         # write/commit band translation is target-side and algorithm-agnostic.
-        # This allow-list is ALSO the fused-draft-KV eligibility set (Stage
-        # 4.1): EAGLE/EAGLE3 (incl. multi-layer) and DFLASH drafts fuse their
-        # KV into the full sub-pool's slot entries by default
+        # This allow-list is ALSO the fused-draft-KV eligibility set:
+        # EAGLE/EAGLE3 (incl. multi-layer) and DFLASH drafts fuse their KV
+        # into the full sub-pool's slot entries by default
         # (SGLANG_DISABLE_FUSED_DRAFT_KV=1 falls back to the private pool +
         # admission reserve); NGRAM has no draft KV to fuse.
         # Everything else stays a loud error:

@@ -81,8 +81,9 @@ def _align_up(n: int, alignment: int) -> int:
 
 
 def fused_entry_bytes(host_entry_bytes: int, draft_region: "MHARegionGeometry") -> int:
-    """Per-slot bytes of a fused `[host KV | pad | draft KV]` envelope
-    (Stage 4.1). SINGLE SOURCE OF TRUTH for both the physical layout
+    """Per-slot bytes of a fused `[host KV | pad | draft KV]` envelope.
+
+    SINGLE SOURCE OF TRUTH for both the physical layout
     (`MHASubPoolSpec.entry_bytes`) and the byte budget (the pool
     configurators' per-token cell) — the two must never drift, or the solve
     under- or over-provisions the buffer the views are built over."""
@@ -96,8 +97,8 @@ class MHARegionGeometry(msgspec.Struct, frozen=True, kw_only=True):
     """Geometry of one MHA-shaped byte region inside a fused slot envelope.
 
     Describes the DRAFT model's per-slot KV footprint when its KV is fused
-    into a host sub-pool's entry (`[target KV | draft KV]`, design doc
-    §33.4 Design B / Stage 4.1). Mirrors `MHASubPoolSpec`'s MHA fields but
+    into a host sub-pool's entry (`[target KV | draft KV]`). Mirrors
+    `MHASubPoolSpec`'s MHA fields but
     carries the draft's OWN geometry — EAGLE3/DFLASH drafts are separate
     checkpoints whose head_num/head_dim differ from the target's.
     `msgspec.Struct`, deliberately outside the grandfathered `SubPoolSpec`
@@ -160,8 +161,8 @@ class MHASubPoolSpec(SubPoolSpec):
     """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
 
     With `draft_region` set, each slot is a FUSED envelope
-    `[host KV | pad | draft KV]` (design doc §33.4 Design B / Stage 4.1): the
-    draft model's KV rides at byte offset `draft_region_offset_bytes()` inside
+    `[host KV | pad | draft KV]`: the draft model's KV rides at byte offset
+    `draft_region_offset_bytes()` inside
     every slot, sharing this pool's slot ids, allocator, v2p mapping, and
     compaction moves. `draft_region is None` keeps the layout byte-identical
     to the pre-fusion one.
@@ -387,7 +388,7 @@ class UnifiedKVPool:
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
         self._spec_state_views: Dict[str, Tuple[torch.Tensor, List[torch.Tensor]]] = {}
-        # Draft-region K/V views of fused MHA sub-pools (Stage 4.1): same slot
+        # Draft-region K/V views of fused MHA sub-pools: same slot
         # ids and per-page stride as the host views, offset into each slot's
         # draft byte region.
         self._mha_draft_views: Dict[
@@ -518,7 +519,7 @@ class UnifiedKVPool:
     def draft_views_for(
         self, name: str
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """Draft-region K/V views of fused sub-pool `name` (Stage 4.1)."""
+        """Draft-region K/V views of fused sub-pool `name` ."""
         return self._mha_draft_views[name]
 
     def mamba_views_for(self, name: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
@@ -634,7 +635,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         self._k_views = k_buffer
         self._v_views = v_buffer
         self._page_size = page_size
-        # Fused draft region (Stage 4.1): the host pool owns relocation for the
+        # Fused draft region: the host pool owns relocation for the
         # WHOLE slot envelope, so compaction/accept moves must carry the draft
         # bytes together with the host bytes.
         if unified_buffer.has_draft_region(sub_pool_name):
@@ -750,7 +751,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         if self._draft_k_views:
             raise NotImplementedError(
                 "get_contiguous_buf_infos is not supported on a fused "
-                "draft-KV sub-pool (Stage 4.1): rows are strided, not "
+                "draft-KV sub-pool: rows are strided, not "
                 "contiguous. PD transfer / HiCache must stay disabled with "
                 "--enable-unified-memory + speculative decoding."
             )
@@ -777,10 +778,10 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         )
         # Accept a bare loc OR a KVWriteLoc. Composite pools (HybridLinearKVPool,
         # UnifiedSWAKVPool) unwrap and hand us a bare PHYSICAL tensor, which is
-        # the only way this pool was reached before Stage 4.1. A fused DENSE
+        # the only way this pool was reached before fused draft KV. A fused DENSE
         # draft (DFLASH / EAGLE3 checkpoint) binds UnifiedDraftKVPool as the
         # runner's token_to_kv_pool DIRECTLY, so the backend's KVWriteLoc lands
-        # here raw (eval_272: 'KVWriteLoc' object has no attribute 'numel').
+        # here raw.
         # `full_loc` is the pre-translated PHYSICAL loc; a bare `loc` is already
         # physical.
         loc, _, full_loc = unwrap_write_loc(loc)
@@ -838,8 +839,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
 
 class UnifiedDraftKVPool(UnifiedMHATokenToKVPool):
-    """Draft-model KV pool over the DRAFT byte region of a fused host sub-pool
-    (Stage 4.1, design doc §33.4 Design B).
+    """Draft-model KV pool over the DRAFT byte region of a fused host sub-pool.
 
     An envelope view into the target's `UnifiedKVPool._raw`: shares the host
     sub-pool's slot ids, allocator, v2p mapping, and compaction; owns NO
@@ -1331,7 +1331,7 @@ def init_unified_mamba_pools(
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), mamba at the low-byte end (grow-up).
-    # With draft_kv_geometry (Stage 4.1 fused draft KV), each full slot carries
+    # With draft_kv_geometry (fused draft KV), each full slot carries
     # the draft model's KV region; the draft worker binds a UnifiedDraftKVPool
     # over the same slots.
     full_spec = MHASubPoolSpec(
@@ -1798,7 +1798,7 @@ def init_unified_swa_pools(
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), swa at the low-byte end (grow-up).
-    # With draft_kv_geometry (Stage 4.1 fused draft KV), each FULL slot carries
+    # With draft_kv_geometry (fused draft KV), each FULL slot carries
     # the draft model's KV region — the draft is dense, so it fuses into the
     # full sub-pool (a DSV4-style draft would instead attach to "swa").
     full_spec = MHASubPoolSpec(

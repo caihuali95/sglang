@@ -151,7 +151,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # virtual-id overshoot backing mamba/band bytes).
         self._base_cell_size = self._cell_size
 
-        # Fused draft KV (Stage 4.1): the draft's KV is part of the full-KV
+        # Fused draft KV: the draft's KV is part of the full-KV
         # slot entry, so the per-token cell IS the fused entry — exact, from
         # the draft's own geometry, via the same helper the physical layout
         # uses (no drift). cell == base by construction: mamba/band bytes
@@ -175,6 +175,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
         ) and not mr.is_draft_worker:
+            # `eagle_draft_num_layers` derives from the draft's
+            # `num_nextn_predict_layers`. If that failed to surface (see the
+            # nested-config note in `ModelConfig`) this reads None and the draft's
+            # KV is charged NOTHING here -- the target sizes its token budget as if
+            # spec were off, and the draft pool built afterwards has to come out of
+            # bytes nobody budgeted for. The complementary failure is the draft pool
+            # itself falling back to `num_hidden_layers` and being built 32x too
+            # large. Both are silent; the pair OOMs at high mem-fraction.
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
             if (
                 eagle_draft_num_layers is not None
@@ -367,12 +375,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * self._swa_layers_num
             )
 
-        # Fused draft KV (Stage 4.1): the draft region rides inside every FULL
+        # Fused draft KV: the draft region rides inside every FULL
         # slot, so only the full-side per-token term grows — exact, via the
-        # same helper the physical layout uses. This also FILLS the §32.10.6
-        # gap (this configurator had no draft scaling at all, a latent OOM on
-        # SWA-hybrid × spec); the non-fused fallback stays upstream-verbatim
-        # by design. `draft_kv_geometry is not None` <=> fusion enabled.
+        # same helper the physical layout uses. This also closes a latent gap:
+        # this configurator had no draft scaling at all, which could OOM on
+        # SWA-hybrid x spec. The non-fused fallback stays upstream-verbatim by
+        # design. `draft_kv_geometry is not None` <=> fusion enabled.
         draft_kv_geometry = _resolve_fused_draft_geometry(mr)
         if (
             draft_kv_geometry is not None

@@ -178,7 +178,7 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
         self.assertLess(dflash.max_num_reqs * 3, no_reserve.max_num_reqs * 2)
 
     def test_fused_draft_kv_beats_reserve(self):
-        """Fused draft KV (Stage 4.1): the draft rides inside the fused slot,
+        """Fused draft KV: the draft rides inside the fused slot,
         so the solve runs with cell == base == fused entry — no reserve
         (draft_reserve_bytes == 0) and mamba/band bytes charged RAW. For the
         SAME per-token layout cost, fusion must admit at least as many
