@@ -2564,16 +2564,7 @@ class HybridLinearKVPool(KVCache):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
         # `loc` is already physical) — either way the pool writes a PHYSICAL loc.
-        was_write_loc = isinstance(loc, KVWriteLoc)
         loc, _, full_loc = unwrap_write_loc(loc)
-        if was_write_loc:
-            # DIAGNOSTIC only: we unwrap here, so the inner unified pool never sees
-            # the virtual partner and cannot self-check. Hand it the pair while we
-            # still have both. Duck-typed: no-op for every non-unified pool, and a
-            # no-op inside the unified pool unless the check is enabled.
-            checker = getattr(self.full_kv_pool, "debug_check_write_locs", None)
-            if checker is not None:
-                checker(loc, full_loc)
         layer_id = self._transfer_full_attention_id(layer.layer_id)
         if not self.use_mla:
             write_loc = full_loc if full_loc is not None else loc

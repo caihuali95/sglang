@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -48,19 +47,6 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
-
-# DIAGNOSTIC: verify the PHYSICAL kv_indices the multi-step draft reads through.
-# The write-side counterpart (SGLANG_DEBUG_FUSED_WRITE_LOCS) proved every draft KV
-# WRITE lands correctly, so a draft that still reads the wrong KV must be reading
-# through the wrong indices -- this checks exactly that. Costs a second index-kernel
-# launch + a sync per draft forward; diagnostic runs only.
-_DEBUG_READ_LOCS = envs.SGLANG_DEBUG_FUSED_READ_LOCS.get()
-if _DEBUG_READ_LOCS:
-    logging.getLogger(__name__).warning(
-        "[read-locs] DIAGNOSTIC ACTIVE (SGLANG_DEBUG_FUSED_READ_LOCS=1): every "
-        "multi-step draft forward re-derives its kv_indices without the in-kernel "
-        "v2p and asserts the physical ids it actually reads agree with the live map."
-    )
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
@@ -2072,108 +2058,6 @@ class TritonMultiStepDraftBackend:
             self.speculative_num_steps,
         )
 
-    def _debug_check_read_indices(
-        self,
-        forward_batch: ForwardBatch,
-        kv_indices_buffer: torch.Tensor,
-        num_seqs: int,
-        bs: int,
-    ) -> None:
-        """DIAGNOSTIC (SGLANG_DEBUG_FUSED_READ_LOCS): assert the PHYSICAL kv_indices
-        the draft is about to read through match the live v2p map.
-
-        The multi-step backend folds the virtual->physical translate INTO the index
-        kernel, which is efficient but leaves nothing downstream able to tell a
-        correct physical id from a wrong one -- a draft reading a peer request's KV
-        looks exactly like a draft reading its own. So re-derive the same indices
-        with the in-kernel translate OFF (recovering the VIRTUAL ids the kernel
-        would have emitted), translate them here, and compare.
-
-        Checks, over the region each step actually reads (bounded by kv_indptr, so
-        the untouched tail is not judged):
-          - every physical id equals clamp_min(v2p[page] * ps + offset, 0);
-          - every physical id is a real slot (>= 0, inside the pool);
-          - kv_indptr is unchanged by translation (it must not be -- a shifted
-            indptr would mis-segment the batch even with perfect ids).
-
-        Raises naming the step, the position, and the (virtual, read, expected)
-        triple, so the offending draft step is unambiguous.
-        """
-        # Prove the check RAN. It has an early-exit guard (no v2p table), and a
-        # diagnostic that silently no-ops reports "clean" for a bug it never looked
-        # at -- an actively misleading result, worse than no result.
-        self._debug_read_checks = getattr(self, "_debug_read_checks", 0) + 1
-        if self._debug_read_checks == 1 or self._debug_read_checks % 500 == 0:
-            logging.getLogger(__name__).info(
-                "[read-locs] verified %d draft forward(s) so far",
-                self._debug_read_checks,
-            )
-
-        ps = self.page_size
-        v2p = self._kv_v2p_table
-
-        virt = torch.zeros_like(kv_indices_buffer)
-        virt_indptr = torch.zeros_like(self.kv_indptr)
-        generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
-        ](
-            forward_batch.req_pool_indices,
-            self.req_to_token_pool.req_to_token,
-            forward_batch.seq_lens,
-            virt,
-            virt_indptr,
-            forward_batch.positions,
-            self.pool_len,
-            virt.shape[1],
-            virt_indptr.shape[1],
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps),
-            next_power_of_2(bs),
-            ps,
-            v2p_ptr=None,
-            HAS_V2P=False,
-        )
-
-        # Only the LIVE segment: `self.kv_indptr` is a persistent buffer whose tail
-        # still holds a previous, larger batch's offsets, while the reference above
-        # is freshly zeroed. Comparing the whole tensor would flag that stale tail,
-        # which nothing reads.
-        live_indptr = self.kv_indptr[:, : bs + 1]
-        ref_indptr = virt_indptr[:, : bs + 1]
-        if not torch.equal(ref_indptr, live_indptr):
-            raise AssertionError(
-                "[read-locs] the in-kernel v2p translate CHANGED kv_indptr "
-                "(it must only rewrite ids, never segment boundaries): "
-                f"translated={live_indptr.tolist()} vs reference={ref_indptr.tolist()}"
-            )
-
-        expected = torch.clamp_min(v2p[virt // ps] * ps + virt % ps, 0)
-        max_slot = int(v2p.numel()) * ps
-        for i in range(self.speculative_num_steps):
-            n = int(self.kv_indptr[i, bs].item())  # ids this step really reads
-            if n <= 0:
-                continue
-            got = kv_indices_buffer[i, :n]
-            exp = expected[i, :n]
-            bad = got != exp
-            if bool(bad.any().item()):
-                at = bad.nonzero(as_tuple=False).flatten()[:8]
-                raise AssertionError(
-                    f"[read-locs] draft step {i}: WRONG-SLOT KV READ -- "
-                    f"{int(bad.sum())}/{n} indices disagree with the live v2p map. "
-                    f"The draft is reading another request's KV. First offenders "
-                    f"(position, virtual, read-from, should-be): "
-                    f"{list(zip(at.tolist(), virt[i, :n][at].tolist(), got[at].tolist(), exp[at].tolist()))}"
-                )
-            oob = (got < 0) | (got >= max_slot)
-            if bool(oob.any().item()):
-                at = oob.nonzero(as_tuple=False).flatten()[:8]
-                raise AssertionError(
-                    f"[read-locs] draft step {i}: physical slot OUT OF RANGE "
-                    f"[0, {max_slot}) at {int(oob.sum())} positions, e.g. "
-                    f"{got[at].tolist()} (virtual {virt[i, :n][at].tolist()})."
-                )
-
     def common_template(
         self,
         forward_batch: ForwardBatch,
@@ -2210,11 +2094,6 @@ class TritonMultiStepDraftBackend:
             v2p_ptr=self._kv_v2p_table,
             HAS_V2P=self._kv_v2p_table is not None,
         )
-
-        if _DEBUG_READ_LOCS and self._kv_v2p_table is not None:
-            self._debug_check_read_indices(
-                forward_batch, kv_indices_buffer, num_seqs, bs
-            )
 
         if call_fn is None:
             return

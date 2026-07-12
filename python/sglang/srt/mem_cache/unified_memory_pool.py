@@ -59,88 +59,6 @@ logger = logging.getLogger(__name__)
 
 GB = 1024 * 1024 * 1024
 
-_DEBUG_WRITE_LOCS = envs.SGLANG_DEBUG_FUSED_WRITE_LOCS.get()
-_DEBUG_KV_READBACK = envs.SGLANG_DEBUG_FUSED_KV_READBACK.get()
-if _DEBUG_KV_READBACK:
-    logger.warning(
-        "[kv-readback] DIAGNOSTIC ACTIVE (SGLANG_DEBUG_FUSED_KV_READBACK=1): every "
-        "unified KV store is read back and compared to its source, and the peer "
-        "region of the fused slot is checked for spill. Adds a gather + sync per store."
-    )
-if _DEBUG_WRITE_LOCS:
-    logger.warning(
-        "[write-locs] DIAGNOSTIC ACTIVE (SGLANG_DEBUG_FUSED_WRITE_LOCS=1): every "
-        "unified KV write re-translates its virtual loc and asserts it matches the "
-        "pre-translated physical loc. Adds a gather + sync per write."
-    )
-
-
-def _check_write_locs(
-    *,
-    sub_pool_name: str,
-    translate,
-    virt_loc: torch.Tensor,
-    phys_loc: Optional[torch.Tensor],
-    min_slot: int,
-    max_slot: int,
-) -> None:
-    """DIAGNOSTIC (SGLANG_DEBUG_FUSED_WRITE_LOCS): assert this KV write targets the
-    slots the LIVE v2p map dictates.
-
-    Three failure modes, all of which corrupt KV *silently* (no crash, just wrong
-    content that later reads pick up -- e.g. a draft model reading a peer request's
-    KV, which shows up only as a degraded accept length):
-
-      (a) `phys_loc is None`  -- the metadata carried no pre-translated physical
-          loc, so the caller is about to write at a VIRTUAL id. Correct only while
-          v2p is identity; wrong the moment it diverges.
-      (b) `phys_loc != translate(virt_loc)` -- the pre-translated loc disagrees
-          with the live map (stale, mis-sliced, or built from the wrong tensor).
-      (c) out-of-range physical slot -- would be an illegal access, or a silent
-          write into a peer sub-pool's bytes.
-
-    Raises with the offending call stack, so the traceback names the write site.
-    """
-    if virt_loc is None or virt_loc.numel() == 0:
-        return
-    if phys_loc is None:
-        raise AssertionError(
-            f"[write-locs] sub-pool {sub_pool_name!r}: KV write reached the pool with "
-            f"NO pre-translated physical loc (full_loc=None) -- the write would use "
-            f"VIRTUAL ids ({virt_loc[:8].tolist()}...) as physical slots. Correct only "
-            f"while v2p is identity; silent wrong-slot writes once it diverges."
-        )
-    expected = translate(virt_loc)
-    if phys_loc.shape != expected.shape:
-        raise AssertionError(
-            f"[write-locs] sub-pool {sub_pool_name!r}: physical loc has shape "
-            f"{tuple(phys_loc.shape)} but the virtual loc has {tuple(virt_loc.shape)} "
-            f"-- a mis-sliced per-step write buffer writes each token to the WRONG slot."
-        )
-    bad = phys_loc.to(torch.int64) != expected.to(torch.int64)
-    if bool(bad.any().item()):
-        idx = bad.nonzero(as_tuple=False).flatten()[:8]
-        raise AssertionError(
-            f"[write-locs] sub-pool {sub_pool_name!r}: WRONG-SLOT KV WRITE -- the "
-            f"pre-translated physical loc disagrees with the live v2p map at "
-            f"{int(bad.sum())}/{bad.numel()} tokens. First offenders (token idx, "
-            f"virtual, written-to, should-be): "
-            f"{list(zip(idx.tolist(), virt_loc[idx].tolist(), phys_loc[idx].tolist(), expected[idx].tolist()))}"
-        )
-    oob = (phys_loc < min_slot) | (phys_loc >= max_slot)
-    if bool(oob.any().item()):
-        idx = oob.nonzero(as_tuple=False).flatten()[:8]
-        raise AssertionError(
-            f"[write-locs] sub-pool {sub_pool_name!r}: physical slot OUT OF RANGE "
-            f"[{min_slot}, {max_slot}) at {int(oob.sum())} tokens, e.g. "
-            f"{phys_loc[idx].tolist()} (virtual {virt_loc[idx].tolist()})."
-        )
-
-# NOTE: SPEC_BAND_ALIGNMENT_MARGIN_SLOTS lives in multi_ended_allocator (the
-# layer that owns the band geometry). It is imported FUNCTION-LEVEL below —
-# multi_ended_allocator module-level-imports this module, so a module-level
-# import here would be circular.
-
 
 def _prod(iterable) -> int:
     out = 1
@@ -497,11 +415,6 @@ class UnifiedKVPool:
         self._mha_draft_views: Dict[
             str, Tuple[List[torch.Tensor], List[torch.Tensor]]
         ] = {}
-        # DIAGNOSTIC only (SGLANG_DEBUG_FUSED_WRITE_LOCS): per-sub-pool v2p
-        # translate, registered by each allocator at construction. The pools
-        # can't reach the allocator (the tables live there), and this is the
-        # one object both sides already hold.
-        self._debug_translate: Dict[str, object] = {}
 
         # Slot-0 dummy writes for every pool land in [0, entry_max); each pool's
         # first allocatable slot is chosen so real data starts at >= entry_max.
@@ -868,318 +781,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
 
-    # True on the pool that views the DRAFT region of a fused slot; False on the
-    # one that views the host region. Only used to pick "the other region" for the
-    # spill check.
-    _is_draft_region_pool = False
-
-    def _debug_peer_views(self):
-        """The OTHER region of the fused slot (host <-> draft), or None if this
-        sub-pool isn't fused (nothing to spill into)."""
-        name = self._sub_pool_name
-        if not self._unified_buffer.has_draft_region(name):
-            return None
-        if self._is_draft_region_pool:
-            return self._unified_buffer.mha_views_for(name)
-        return self._unified_buffer.draft_views_for(name)
-
-    def _debug_peer_snapshot(self, loc, ps):
-        """Copy the peer region's bytes at the slots we're about to write."""
-        peer = self._debug_peer_views()
-        if peer is None or loc.numel() == 0:
-            return None
-        sel = loc.to(torch.int64)
-        page, tok = sel // ps, sel % ps
-        pk, pv = peer
-        return (
-            page,
-            tok,
-            [v[page, tok].clone() for v in pk],
-            [v[page, tok].clone() for v in pv],
-        )
-
-    def _debug_readback(
-        self,
-        layer_id,
-        loc,
-        cache_k,
-        cache_v,
-        k_view,
-        v_view,
-        ps,
-        peer_before,
-        own_before,
-    ) -> None:
-        """DIAGNOSTIC (SGLANG_DEBUG_FUSED_KV_READBACK): did the store actually land
-        the bytes we handed it, at the slots we aimed at?
-
-        The loc checks verify WHERE a write is aimed; they are blind to HOW FAR it
-        reaches. A store kernel with a wrong row stride passes every one of them
-        while spilling out of its region -- right slot, wrong bytes. Under fusion
-        that means the target's write can bleed into the draft's KV (or vice
-        versa), which corrupts the draft's cache without ever moving a pointer
-        out of range. This reads the bytes back through the SAME view and compares
-        them to the source, which is the only check that can see that.
-
-        Also snapshots the PEER region (draft <-> host) around the write and
-        re-checks it afterwards: an over-long store shows up as the neighbour
-        changing when it had no business changing.
-
-        Duplicate locs and sink-slot writes are excluded -- both legitimately end
-        with a different value than any one source row.
-        """
-        loc64 = loc.to(torch.int64)
-        keep = loc64 >= int(self._unified_buffer.min_slot_index(self._sub_pool_name))
-        uniq, counts = torch.unique(loc64, return_counts=True)
-        dup = uniq[counts > 1]
-        if dup.numel():
-            keep &= ~torch.isin(loc64, dup)
-        idx = keep.nonzero(as_tuple=False).flatten()
-        if idx.numel() == 0:
-            return
-
-        self._debug_readback_checks = getattr(self, "_debug_readback_checks", 0) + 1
-        if self._debug_readback_checks == 1 or self._debug_readback_checks % 2000 == 0:
-            logger.info(
-                "[kv-readback] verified %d store(s) so far on sub-pool %r (%s)",
-                self._debug_readback_checks,
-                self._sub_pool_name,
-                type(self).__name__,
-            )
-
-        sel = loc64[idx]
-        page, tok = sel // ps, sel % ps
-        for name, view, src, before in (
-            ("K", k_view, cache_k, own_before[0] if own_before else None),
-            ("V", v_view, cache_v, own_before[1] if own_before else None),
-        ):
-            got = view[page, tok]
-            want = src[idx].reshape(got.shape)
-            bad = got != want
-            if bool(bad.any().item()):
-                # Forensics + REPAIR, no abort: the two aborting runs each died at
-                # their first event, so we never learned the failure's frequency,
-                # its class, or its effect on accept length. Log-and-repair gets
-                # all three from one run -- and the repair itself is the causal
-                # A/B: if these mis-stores ARE the accept regression, a repaired
-                # run must come back at baseline parity.
-                self._debug_readback_forensics(
-                    name=name,
-                    layer_id=layer_id,
-                    view=view,
-                    src=src,
-                    idx=idx,
-                    sel=sel,
-                    page=page,
-                    tok=tok,
-                    want=want,
-                    before_sel=before[idx] if before is not None else None,
-                )
-
-        # The spill check. This store had no business touching the other region of
-        # the fused slot; if it did, its extent is wrong even though every byte it
-        # meant to write landed correctly -- which is exactly the failure the loc
-        # checks and the readback above are both blind to.
-        if peer_before is None:
-            return
-        self._debug_check_peer_spill(layer_id, peer_before, ps)
-
-    def _debug_readback_forensics(
-        self,
-        *,
-        name: str,
-        layer_id: int,
-        view: torch.Tensor,
-        src: torch.Tensor,
-        idx: torch.Tensor,
-        sel: torch.Tensor,
-        page: torch.Tensor,
-        tok: torch.Tensor,
-        want: torch.Tensor,
-        before_sel: Optional[torch.Tensor],
-    ) -> None:
-        """Classify ONE bad store, repair it, keep going.
-
-        On one stream, store-then-gather through the same view cannot disagree
-        with the source -- so when it does, the interesting question is not
-        "did it fail" but WHICH impossible thing happened. Three classes, told
-        apart with data only this moment has:
-
-          - UNWRITTEN:  the slot still holds its pre-store content -> the kernel
-                        never wrote this row at all;
-          - PERMUTED:   the slot holds a DIFFERENT source row -> the kernel
-                        mispaired rows and slots;
-          - FOREIGN:    the slot holds bytes matching no source row -> another
-                        writer, or a bytes-mangling store.
-
-        Also re-checks after a full device sync (a mismatch that disappears was
-        launch-ordering), then REPAIRS the store with a plain torch scatter.
-        The repair converts this diagnostic into a causal experiment: if these
-        mis-stores are the accept-length regression, a repaired run lands at
-        baseline parity.
-
-        Full detail for the first few events; afterwards count-only (the
-        counter still measures frequency, which the aborting version destroyed).
-        """
-        self._debug_readback_events = getattr(self, "_debug_readback_events", 0) + 1
-        ev = self._debug_readback_events
-        verbose = ev <= 5
-
-        if verbose and view.is_cuda:
-            torch.cuda.synchronize()
-        got = view[page, tok]  # re-gather (post-sync when verbose)
-        bad_rows = (got != want).reshape(got.shape[0], -1).any(dim=1)
-        n = int(bad_rows.numel())
-        n_bad = int(bad_rows.sum())
-
-        if verbose and n_bad:
-            b = bad_rows.nonzero(as_tuple=False).flatten()
-            got_rows = got.reshape(n, -1)[b]
-            # UNWRITTEN: still equal to the pre-store snapshot.
-            unwritten = torch.zeros(b.numel(), dtype=torch.bool, device=got.device)
-            if before_sel is not None:
-                bef_rows = before_sel.reshape(n, -1)[b]
-                unwritten = (got_rows == bef_rows).all(dim=1)
-            # PERMUTED: equal to some OTHER source row (row-correlate against the
-            # whole source batch; bs x bs x row is small at decode sizes).
-            src_rows = src.reshape(src.shape[0], -1)
-            eq = (got_rows[:, None, :] == src_rows[None, :, :]).all(dim=-1)
-            permuted = eq.any(dim=1) & ~unwritten
-            match_of = eq.to(torch.int8).argmax(dim=1)
-            foreign = ~(unwritten | permuted)
-            pairs = [
-                (int(idx[b[i]]), int(match_of[i]))
-                for i in permuted.nonzero(as_tuple=False).flatten()[:6]
-            ]
-            logger.error(
-                "[kv-readback] EVENT #%d sub-pool %r (%s) layer %d %s-store: "
-                "%d/%d checked rows wrong AFTER device sync (so not launch "
-                "ordering). Classes: UNWRITTEN=%d (kernel never wrote the row), "
-                "PERMUTED=%d (holds a different source row; (row, holds-row) "
-                "pairs %s), FOREIGN=%d (matches no source row). First bad slot "
-                "%d: want %s got %s. Geometry: view shape=%s stride=%s ptr=0x%x "
-                "| src shape=%s stride=%s dtype=%s ptr=0x%x | loc n=%d "
-                "sample=%s. Repairing with a torch scatter and continuing.",
-                ev,
-                self._sub_pool_name,
-                type(self).__name__,
-                layer_id,
-                name,
-                n_bad,
-                n,
-                int(unwritten.sum()),
-                int(permuted.sum()),
-                pairs,
-                int(foreign.sum()),
-                int(sel[b[0]]),
-                want.reshape(n, -1)[b[0]][:6].tolist(),
-                got_rows[0][:6].tolist(),
-                tuple(view.shape),
-                tuple(view.stride()),
-                view.data_ptr(),
-                tuple(src.shape),
-                tuple(src.stride()),
-                src.dtype,
-                src.data_ptr(),
-                int(sel.numel()),
-                sel[:6].tolist(),
-            )
-        elif ev % 200 == 0:
-            logger.error(
-                "[kv-readback] %d mis-store events so far on sub-pool %r (%s) "
-                "(detail suppressed after the first 5; repairs continue).",
-                ev,
-                self._sub_pool_name,
-                type(self).__name__,
-            )
-
-        # THE REPAIR (every event, verbose or not): land the bytes the caller
-        # asked for, via plain advanced indexing -- the reference store the
-        # kernel is supposed to match. Keeps the run alive AND turns accept
-        # length into the causal readout.
-        view[page, tok] = want
-
-    def _debug_check_peer_spill(self, layer_id, peer_before, ps) -> None:
-        """Spill half of the readback diagnostic: this store had no business
-        touching the OTHER region of the fused slot. Log + RESTORE the peer from
-        its snapshot, no abort -- same rationale as the readback forensics
-        (frequency + accept impact from a live run beat a single dead event)."""
-        page, tok, pk_before, pv_before = peer_before
-        peer = self._debug_peer_views()
-        side = "host" if self._is_draft_region_pool else "draft"
-        for name, views, before in (
-            ("K", peer[0], pk_before),
-            ("V", peer[1], pv_before),
-        ):
-            for pl, (view, snap) in enumerate(zip(views, before)):
-                now = view[page, tok]
-                if not torch.equal(now, snap):
-                    self._debug_spill_events = (
-                        getattr(self, "_debug_spill_events", 0) + 1
-                    )
-                    if self._debug_spill_events <= 5:
-                        hit = (now != snap).reshape(now.shape[0], -1).any(dim=1)
-                        h = hit.nonzero(as_tuple=False).flatten()[:4]
-                        logger.error(
-                            "[kv-readback] SPILL EVENT #%d sub-pool %r (%s) layer "
-                            "%d: this store CLOBBERED the %s region (%s, %s layer "
-                            "%d) at %d slot(s) it never should have touched -- its "
-                            "EXTENT overruns its region of the fused slot. "
-                            "Physical slots %s; first was %s now %s. Restoring the "
-                            "snapshot and continuing.",
-                            self._debug_spill_events,
-                            self._sub_pool_name,
-                            type(self).__name__,
-                            layer_id,
-                            side,
-                            name,
-                            side,
-                            pl,
-                            int(hit.sum()),
-                            (page * ps + tok)[h].tolist(),
-                            snap[h[0]].flatten()[:6].tolist(),
-                            now[h[0]].flatten()[:6].tolist(),
-                        )
-                    view[page, tok] = snap  # restore the clobbered peer bytes
-
-    def debug_check_write_locs(
-        self, virt_loc: torch.Tensor, phys_loc: Optional[torch.Tensor]
-    ) -> None:
-        """DIAGNOSTIC (SGLANG_DEBUG_FUSED_WRITE_LOCS): cross-check one KV write's
-        virtual/physical loc pair against the live v2p map. See `_check_write_locs`.
-
-        Public because the composite pools (`HybridLinearKVPool`) unwrap the
-        `KVWriteLoc` themselves and hand us a bare physical loc -- by then the
-        virtual partner is gone, so they must call this BEFORE unwrapping. They
-        duck-type it (`getattr(pool, "debug_check_write_locs", None)`) to avoid
-        importing this module.
-        """
-        if not _DEBUG_WRITE_LOCS:
-            return
-        translate = self._unified_buffer._debug_translate.get(self._sub_pool_name)
-        if translate is None:
-            return
-        # Prove the check RAN. Callers reach it only with a KVWriteLoc, and it
-        # early-exits without a registered translate -- so a silent no-op would
-        # report "clean" for writes it never inspected. Say how many, and on which
-        # sub-pool, so a missing draft-side path is visible instead of assumed.
-        self._debug_write_checks = getattr(self, "_debug_write_checks", 0) + 1
-        if self._debug_write_checks == 1 or self._debug_write_checks % 2000 == 0:
-            logger.info(
-                "[write-locs] verified %d write(s) so far on sub-pool %r (%s)",
-                self._debug_write_checks,
-                self._sub_pool_name,
-                type(self).__name__,
-            )
-        _check_write_locs(
-            sub_pool_name=self._sub_pool_name,
-            translate=translate,
-            virt_loc=virt_loc,
-            phys_loc=phys_loc,
-            min_slot=self._unified_buffer.min_slot_index(self._sub_pool_name),
-            max_slot=self._unified_buffer.max_slots(self._sub_pool_name),
-        )
-
     def set_kv_buffer(
         self,
         layer,
@@ -1204,14 +805,7 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         # here raw.
         # `full_loc` is the pre-translated PHYSICAL loc; a bare `loc` is already
         # physical.
-        # A KVWriteLoc carries the VIRTUAL loc + its pre-translated PHYSICAL
-        # partner, so it is checkable. A bare tensor comes from a composite pool
-        # that already translated (and dropped the virtual id) -- nothing to
-        # cross-check, and a None full_loc there is correct, not a bug.
-        checkable = _DEBUG_WRITE_LOCS and isinstance(loc, KVWriteLoc)
         loc, _, full_loc = unwrap_write_loc(loc)
-        if checkable:
-            self.debug_check_write_locs(loc, full_loc)
         if full_loc is not None:
             loc = full_loc
         # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't
@@ -1277,22 +871,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 f"{type(self).__name__}: v_view trailing dims not contiguous; "
                 f"stride={v_view.stride()}, shape={tuple(v_view.shape)}"
             )
-            # Snapshot the neighbouring region of the fused slot BEFORE the store:
-            # an over-long write shows up as the peer changing when it had no
-            # business changing, and only a before/after pair can see that. Also
-            # snapshot OUR OWN rows: a post-store readback that still equals the
-            # pre-store content means the kernel never wrote at all -- a different
-            # failure than writing wrong bytes, and only the snapshot can tell
-            # them apart.
-            peer_before = own_before = None
-            debug_readback_live = _DEBUG_KV_READBACK and not (
-                torch.cuda.is_available()
-                and torch.cuda.is_current_stream_capturing()
-            )
-            if debug_readback_live:
-                peer_before = self._debug_peer_snapshot(loc, ps)
-                _p, _t = loc.to(torch.int64) // ps, loc.to(torch.int64) % ps
-                own_before = (k_view[_p, _t].clone(), v_view[_p, _t].clone())
             head_num = k_view.shape[2]
             head_dim = k_view.shape[3]
             v_head_dim = v_view.shape[3]
@@ -1319,25 +897,6 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 num_warps=4,
             )
 
-            # Capture-guarded: the readback syncs (.item(), synchronize), which is
-            # illegal while a stream is capturing -- and pointless anyway, since a
-            # captured decode's stores replay inside the graph where no Python
-            # runs. Under cuda-graph mode this diagnostic can only ever observe
-            # the EAGER stores (prefill / extend); decode coverage requires a
-            # cg_off cell.
-            if debug_readback_live:
-                self._debug_readback(
-                    layer_id,
-                    loc,
-                    cache_k,
-                    cache_v,
-                    k_view,
-                    v_view,
-                    ps,
-                    peer_before,
-                    own_before,
-                )
-
 
 class UnifiedDraftKVPool(UnifiedMHATokenToKVPool):
     """Draft-model KV pool over the DRAFT byte region of a fused host sub-pool.
@@ -1353,10 +912,6 @@ class UnifiedDraftKVPool(UnifiedMHATokenToKVPool):
     the draft views, then initializes `MHATokenToKVPool` state directly with
     the draft region's geometry.
     """
-
-    # This pool views the DRAFT half of the fused slot, so the "other region" its
-    # writes must never touch is the HOST half.
-    _is_draft_region_pool = True
 
     def __init__(
         self,

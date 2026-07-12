@@ -312,31 +312,6 @@ class Envs:
     # Used for A/B and rollback;
     # retires with the reserve path once fusion is the only mode.
     SGLANG_DISABLE_FUSED_DRAFT_KV = EnvBool(False)
-    # DIAGNOSTIC: verify every unified KV write lands at the slot the live v2p
-    # map says it should. At each set_kv_buffer, re-translate the VIRTUAL loc
-    # and compare against the pre-translated PHYSICAL loc the attention
-    # metadata carried; fail loud on a mismatch, an unbounded slot, or a
-    # virtual loc reaching the pool untranslated. Catches silent wrong-slot KV
-    # writes (which degrade accept length without ever crashing). Costs a
-    # gather + a sync per write -- diagnostic use only, never in production.
-    SGLANG_DEBUG_FUSED_WRITE_LOCS = EnvBool(False)
-    # DIAGNOSTIC: the read-side counterpart. The multi-step draft backend
-    # translates its kv_indices INSIDE the index kernel, so nothing downstream can
-    # tell a correct physical id from a wrong one. This re-derives the same indices
-    # with the in-kernel translate OFF, translates them here against the live v2p
-    # map, and asserts the ids the draft actually reads through agree (plus bounds
-    # and the untouched kv_indptr). Costs a second kernel launch + a sync per draft
-    # forward -- diagnostic use only, never in production.
-    SGLANG_DEBUG_FUSED_READ_LOCS = EnvBool(False)
-    # DIAGNOSTIC: content check, where the two loc checks above are addressing
-    # checks. They verify WHERE a KV write is aimed; they are blind to HOW FAR it
-    # reaches. A store with a wrong row stride passes both while spilling out of
-    # its region -- right slot, wrong bytes. This reads the bytes back through the
-    # same view and compares them to the source, AND snapshots the neighbouring
-    # region of the fused slot to catch a write whose extent overruns into it
-    # (target KV bleeding into the draft's, or the reverse). Costs a gather + a
-    # sync per store -- diagnostic use only, never in production.
-    SGLANG_DEBUG_FUSED_KV_READBACK = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
