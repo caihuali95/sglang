@@ -854,6 +854,18 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         translate = self._unified_buffer._debug_translate.get(self._sub_pool_name)
         if translate is None:
             return
+        # Prove the check RAN. Callers reach it only with a KVWriteLoc, and it
+        # early-exits without a registered translate -- so a silent no-op would
+        # report "clean" for writes it never inspected. Say how many, and on which
+        # sub-pool, so a missing draft-side path is visible instead of assumed.
+        self._debug_write_checks = getattr(self, "_debug_write_checks", 0) + 1
+        if self._debug_write_checks == 1 or self._debug_write_checks % 2000 == 0:
+            logger.info(
+                "[write-locs] verified %d write(s) so far on sub-pool %r (%s)",
+                self._debug_write_checks,
+                self._sub_pool_name,
+                type(self).__name__,
+            )
         _check_write_locs(
             sub_pool_name=self._sub_pool_name,
             translate=translate,

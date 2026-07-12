@@ -2099,6 +2099,16 @@ class TritonMultiStepDraftBackend:
         Raises naming the step, the position, and the (virtual, read, expected)
         triple, so the offending draft step is unambiguous.
         """
+        # Prove the check RAN. It has an early-exit guard (no v2p table), and a
+        # diagnostic that silently no-ops reports "clean" for a bug it never looked
+        # at -- an actively misleading result, worse than no result.
+        self._debug_read_checks = getattr(self, "_debug_read_checks", 0) + 1
+        if self._debug_read_checks == 1 or self._debug_read_checks % 500 == 0:
+            logging.getLogger(__name__).info(
+                "[read-locs] verified %d draft forward(s) so far",
+                self._debug_read_checks,
+            )
+
         ps = self.page_size
         v2p = self._kv_v2p_table
 
