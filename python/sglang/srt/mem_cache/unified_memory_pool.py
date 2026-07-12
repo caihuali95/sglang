@@ -1276,7 +1276,11 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             # failure than writing wrong bytes, and only the snapshot can tell
             # them apart.
             peer_before = own_before = None
-            if _DEBUG_KV_READBACK:
+            debug_readback_live = _DEBUG_KV_READBACK and not (
+                torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
+            )
+            if debug_readback_live:
                 peer_before = self._debug_peer_snapshot(loc, ps)
                 _p, _t = loc.to(torch.int64) // ps, loc.to(torch.int64) % ps
                 own_before = (k_view[_p, _t].clone(), v_view[_p, _t].clone())
@@ -1306,7 +1310,13 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 num_warps=4,
             )
 
-            if _DEBUG_KV_READBACK:
+            # Capture-guarded: the readback syncs (.item(), synchronize), which is
+            # illegal while a stream is capturing -- and pointless anyway, since a
+            # captured decode's stores replay inside the graph where no Python
+            # runs. Under cuda-graph mode this diagnostic can only ever observe
+            # the EAGER stores (prefill / extend); decode coverage requires a
+            # cg_off cell.
+            if debug_readback_live:
                 self._debug_readback(
                     layer_id,
                     loc,
