@@ -830,10 +830,6 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     o,
     h0_source,
     h0_indices,
-    # Slot stride of h0_source, in elements. A dense pool has HV*K*V; the unified
-    # pool's temporal view is an envelope slice whose slot stride is the WHOLE
-    # mamba entry (all layers interleaved), so it must be passed, not assumed.
-    stride_h0_slot,
     cu_seqlens,
     scale,
     intermediate_states_buffer,
@@ -904,13 +900,31 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     mask_h = mask_v[:, None] & mask_k[None, :]
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    # TODO: this addressing assumes h0_source is a DENSE state pool, i.e. that a
+    # slot is exactly HV*K*V elements away from the next. That does not hold for
+    # the unified memory pool, whose `temporal` view is an envelope slice: its
+    # slot stride is the WHOLE layer-interleaved mamba entry, so `idx * HV*K*V`
+    # lands in the wrong slot on every read and every write-back below. There is
+    # no crash -- the model just decodes from another request's state.
+    #
+    # The sibling kernel (fused_sigmoid_gating_delta_rule_update) takes an
+    # explicit `stride_h0_slot` for exactly this reason; this one never got it.
+    # `idx` should also be widened to int64: envelope slot strides run to ~1e7-1e8
+    # elements, so the int32 multiply overflows at modest slot counts.
+    #
+    # Left as-is deliberately. The only caller is JetNemotron, which does not
+    # currently reach this kernel (it passes cu_seqlens + initial_state_source
+    # without intermediate_state_indices, and the wrapper's arity check raises
+    # AttributeError first), and no eval wave covers that model. Fix this BEFORE
+    # running JetNemotron -- or any other model that binds this kernel -- against
+    # the unified memory pool.
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n).to(tl.int64)
+        idx = tl.load(h0_indices + i_n)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
             p_h0 = (
                 h0_source
-                + idx * stride_h0_slot
+                + idx * HV * K * V
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
@@ -920,7 +934,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Prepare intermediate state cache variables if enabled
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
+        cache_idx = tl.load(intermediate_state_indices + i_n)
 
     step_idx = 0
     for _ in range(0, T):
@@ -994,14 +1008,16 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         p_g += HV
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
-    # Store final state back to h0_source with bounds checking
+    # Store final state back to h0_source with bounds checking.
+    # NOTE: same dense-slot-stride assumption as the read above -- see the TODO
+    # there. Under an envelope-strided state pool this writes the wrong slot.
     # ssm states
     if not DISABLE_STATE_UPDATE:
-        idx = tl.load(h0_indices + i_n).to(tl.int64)
+        idx = tl.load(h0_indices + i_n)
         if idx >= 0:  # Add bounds checking
             p_h0 = (
                 h0_source
-                + idx * stride_h0_slot
+                + idx * HV * K * V
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
@@ -1063,11 +1079,6 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
-        stride_h0_slot=(
-            initial_state_source.stride(0)
-            if initial_state_source is not None
-            else 0
-        ),
         cu_seqlens=cu_seqlens,
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,
