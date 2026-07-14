@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     SpecStateSubPoolSpec,
     UnifiedKVPool,
 )
+from cpu_pool_case import CpuPoolTestCase
 
 _DEV = "cpu"
 
@@ -83,7 +84,7 @@ def _spec_state_spec(name="spec_state", layer_num=2, num_draft_tokens=3):
     )
 
 
-class TestGoldenTwoPoolLayout(unittest.TestCase):
+class TestGoldenTwoPoolLayout(CpuPoolTestCase):
     """Spec-OFF 2-pool geometry must match the pre-N-pool formulae exactly."""
 
     def _check_golden(self, specs, total_bytes):
@@ -120,7 +121,7 @@ class TestGoldenTwoPoolLayout(unittest.TestCase):
         self.assertEqual([s.name for s in pool.sub_pool_specs], ["swa", "full"])
 
 
-class TestThreePoolChain(unittest.TestCase):
+class TestThreePoolChain(CpuPoolTestCase):
     def test_chain_order_and_views(self):
         full = _mha_spec("full", "down")
         mamba = _mamba_spec("mamba", "up")
@@ -190,7 +191,7 @@ class TestThreePoolChain(unittest.TestCase):
         self.assertFalse(torch.any(nz[(k + 1) * entry :]))
 
 
-class TestUnifiedMambaPoolSpecViews(unittest.TestCase):
+class TestUnifiedMambaPoolSpecViews(CpuPoolTestCase):
     """Step-6 gate: with spec decoding on, UnifiedMambaPool's intermediate_*
     are strided views into the SAME `_raw` byte buffer (the spec_state band
     sub-pool), not private torch.zeros."""
@@ -293,7 +294,7 @@ class TestUnifiedMambaPoolSpecViews(unittest.TestCase):
         self.assertFalse(hasattr(mamba_pool.mamba_cache, "intermediate_ssm"))
 
 
-class TestSweepValidation(unittest.TestCase):
+class TestSweepValidation(CpuPoolTestCase):
     def test_rejects_two_up_pools(self):
         with self.assertRaises(AssertionError):
             UnifiedKVPool(

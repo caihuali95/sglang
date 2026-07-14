@@ -8,11 +8,12 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from cpu_pool_case import CpuPoolMixin
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestHostKVCache(CustomTestCase):
+class TestHostKVCache(CpuPoolMixin, CustomTestCase):
     def setUp(self):
         self.page_size = 2
         # Small device pool is enough to construct the host pool.

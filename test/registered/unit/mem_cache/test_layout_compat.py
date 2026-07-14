@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
 )
+from cpu_pool_case import CpuPoolTestCase
 
 _DEV = "cpu"
 
@@ -70,7 +71,7 @@ def _make_mamba_spec(name, grow, layer_num=2):
     )
 
 
-class TestMHASpecLayerOffsets(unittest.TestCase):
+class TestMHASpecLayerOffsets(CpuPoolTestCase):
     """Verify ``layer_k_offset_in_page`` / ``layer_v_offset_in_page`` math."""
 
     def test_offsets_at_page_size_1_match_envelope(self):
@@ -113,7 +114,7 @@ class TestMHASpecLayerOffsets(unittest.TestCase):
             self.assertEqual(spec.page_bytes(ps), ps * spec.entry_bytes())
 
 
-class TestBuildMHAViews(unittest.TestCase):
+class TestBuildMHAViews(CpuPoolTestCase):
     """Verify the 4-D view shape + strides at both page sizes."""
 
     def _build(self, page_size, layer_num=3, head_num=2, head_dim=4, n_full_slots=64):
@@ -205,7 +206,7 @@ class TestBuildMHAViews(unittest.TestCase):
         self.assertTrue(torch.all(k_views[0][1, 3] == 0.0))
 
 
-class TestMoveKVCacheNative4D(unittest.TestCase):
+class TestMoveKVCacheNative4D(CpuPoolTestCase):
     """Verify ``move_kv_cache_native`` handles 4-D buffers at both
     page_size=1 (degenerate envelope) and page_size>1 (layer-major)."""
 
@@ -299,7 +300,7 @@ class TestMoveKVCacheNative4D(unittest.TestCase):
             self.assertTrue(torch.all(v[L][7] == -float(L + 1)))
 
 
-class TestByteIdentityAtPageSize1(unittest.TestCase):
+class TestByteIdentityAtPageSize1(CpuPoolTestCase):
     """Verify that at page_size=1 the new 4-D view describes the SAME
     physical bytes as the old 3-D view would have. The view
     semantics differ (4-D vs 3-D shape) but the underlying byte layout is

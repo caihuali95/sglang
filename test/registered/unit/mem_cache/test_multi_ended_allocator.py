@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     SpecStateSubPoolSpec,
     UnifiedKVPool,
 )
+from cpu_pool_case import CpuPoolTestCase
 
 _DEV = "cpu"
 
@@ -82,7 +83,7 @@ class _FakeKVCache:
         self.buf[dst_loc] = self.buf[src_loc].clone()
 
 
-class TestUnifiedKVPoolViews(unittest.TestCase):
+class TestUnifiedKVPoolViews(CpuPoolTestCase):
     def test_min_slot_index_and_disjoint_bytes(self):
         full = _make_mha_spec("full", "up", layer_num=4)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
@@ -156,7 +157,7 @@ class TestUnifiedKVPoolViews(unittest.TestCase):
         self.assertTrue(torch.all(temporal_view[2, 6] == -1.25))
 
 
-class TestMultiEndedAllocator(unittest.TestCase):
+class TestMultiEndedAllocator(CpuPoolTestCase):
     def _build_pair(self, n_full_slots=64, n_mamba_slots=16):
         full = _make_mha_spec("full", "up", layer_num=2)
         mamba = _make_mamba_spec("mamba", "down", layer_num=2)
@@ -569,7 +570,7 @@ class _FakeUnifiedSWAKVPool:
         self._swa_allocator = swa_allocator
 
 
-class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
+class TestUnifiedSWATokenToKVPoolAllocator(CpuPoolTestCase):
     """Tests for the SWA composite — joint byte-budget, slot-conservation
     leak invariant, tombstone semantics for `free_swa`, divergent compaction
     of the two sub-pools, and the alloc-rollback path.
@@ -992,7 +993,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPagedMultiEndedAllocator(unittest.TestCase):
+class TestPagedMultiEndedAllocator(CpuPoolTestCase):
     """Per-sub-pool paged tests for `MultiEndedAllocator(page_size=...)`.
 
     All tests use ``page_size = 8`` against a buffer sized for ~16 pages per
@@ -1988,7 +1989,7 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
         )
 
 
-class TestLazyCompaction(unittest.TestCase):
+class TestLazyCompaction(CpuPoolTestCase):
     """Lazy compaction invariants and lazy-vs-eager
     equivalence harness. CPU-only (no GPU events; the conservative Phase A
     `_flush` uses `wait_stream(forward_stream)` only when `forward_stream is
@@ -2361,41 +2362,46 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(len(fa._pending_reuse), 0)
         self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
 
+    @unittest.skipUnless(
+        torch.cuda.is_available(), "urgent drain calls stream.wait_event"
+    )
     def test_lazy_pending_reuse_urgent_wait(self):
-        """Under urgent drain, an unfired event triggers wait_event; we
-        simulate this by checking that the drain ALSO releases unfired
-        entries (with a fake event whose `query` is False — `wait_event` is
-        a no-op in CPU mode since there's no current stream's wait_event for
-        a FakeEvent, so we test the release path)."""
+        """An urgent drain must release pages whose event has NOT fired.
+
+        The non-urgent path only releases entries whose event has already
+        fired; the urgent path instead makes the current stream wait on the
+        event and releases the pages anyway. This pins that second path.
+
+        The event must be a REAL `torch.cuda.Event`, because the drain hands it
+        to `stream.wait_event`, which rejects a duck-typed stand-in. Subclass it
+        so `query()` reports not-yet-fired while the object stays a genuine
+        event: recording it and then overriding `query()` is the only way to be
+        both a valid `wait_event` argument and deterministically unfired.
+        """
         _pool, fa, _kv = self._make_full(lazy=True)
         a = fa.alloc(4)
 
-        class _FakeEvent:
-            def __init__(self):
-                self.waited = False
-
+        class _NeverQueriesReady(torch.cuda.Event):
             def query(self):
-                return False  # never fires
+                return False
 
-        # Inject ONE batch entry into _pending_reuse keyed by
-        # Event. Value is `(cpu_list, gpu_tensor)`. The parallel CPU
-        # set must also be updated.
-        # (Simulates a prior compaction whose event hasn't fired.)
+        # Simulate a prior compaction whose event hasn't fired: one batch entry
+        # in _pending_reuse, keyed by the event, valued (cpu_list, gpu_tensor).
+        # The parallel CPU set must be updated too.
         p = int(fa.virtual_to_physical[int(a[2].item())].item())
         # Clear v2p/p2v so post-drain reuse is safe.
         fa.virtual_to_physical[int(a[2].item())] = -1
         fa.physical_to_virtual[p] = -1
-        ev = _FakeEvent()
-        gpu_t = torch.tensor([p], dtype=torch.int64, device=fa.device)
-        fa._pending_reuse[ev] = ([p], gpu_t)
+
+        ev = _NeverQueriesReady()
+        ev.record()
+        fa._pending_reuse[ev] = ([p], torch.tensor([p], dtype=torch.int64, device=fa.device))
         fa._pending_reuse_pages_cpu.add(p)
-        # Urgent drain — should release p despite event.query()=False.
-        # (CPU shim: torch.cuda.current_stream() may not exist; wrap try.)
-        try:
-            fa._drain_pending_reuse(urgent=True)
-        except Exception:
-            # CPU: wait_event may not work; this test is GPU-only.
-            self.skipTest("wait_event requires CUDA")
+
+        # Urgent: releases p despite query() == False. Any exception here is a
+        # real failure -- do NOT swallow it into a skip.
+        fa._drain_pending_reuse(urgent=True)
+
         self.assertEqual(len(fa._pending_reuse), 0)
         self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
 
@@ -2413,7 +2419,7 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertGreaterEqual(moves, 1)
 
 
-class TestO3FusedAllocBind(unittest.TestCase):
+class TestO3FusedAllocBind(CpuPoolTestCase):
     """Fused take_physical_pages + bind_pages.
 
     GPU-only tests (Triton kernel requires CUDA). Exercise the helper
@@ -2806,7 +2812,7 @@ def _make_mamba_spec2(name, grow, layer_num=2):
     )
 
 
-class TestChainFrontierBackCompat(unittest.TestCase):
+class TestChainFrontierBackCompat(CpuPoolTestCase):
     """N=2 gap math must be byte-identical through the chain helpers."""
 
     def test_two_pool_available_matches_manual_gap(self):
@@ -2849,7 +2855,7 @@ class TestChainFrontierBackCompat(unittest.TestCase):
             self.assertEqual(a.available_size(), min(pages_by_bytes, index_room))
 
 
-class TestSpecStateBandAllocator(unittest.TestCase):
+class TestSpecStateBandAllocator(CpuPoolTestCase):
     def test_empty_band_is_transparent(self):
         pool, ma, band, fa, _ = _make_3pool_chain()
         self.assertTrue(band._is_frontier_transparent())
@@ -2956,7 +2962,7 @@ class TestSpecStateBandAllocator(unittest.TestCase):
                 call()
 
 
-class TestFloatMultiEndedAllocator(unittest.TestCase):
+class TestFloatMultiEndedAllocator(CpuPoolTestCase):
     """General per-slot float middle pool: smart-direction alloc +
     tighter-side compaction. Unit-validated; production use arrives with the
     first cache-class middle pool."""
@@ -3053,7 +3059,7 @@ class _FakeHybridLinearKVPool:
         self.mamba_pool = _FakeKVCache(full_slots)
 
 
-class TestUnifiedMambaCompositeWithBand(unittest.TestCase):
+class TestUnifiedMambaCompositeWithBand(CpuPoolTestCase):
     def _make(self, spec_on=True, total_bytes=6336):
         from sglang.srt.mem_cache.multi_ended_allocator import (
             UnifiedMambaTokenToKVPoolAllocator,
@@ -3155,22 +3161,35 @@ class TestUnifiedMambaCompositeWithBand(unittest.TestCase):
             torch.equal(kvcache.full_kv_pool.buf[tgt_phys], src_v)
         )
 
-    def test_mamba_slot_cost_reserves_band_entry(self):
-        # Admission must charge each request's band slot alongside its mamba
-        # slot, or the ends out-grow the band's budget (review finding #1).
+    def test_band_entry_charged_separately_from_mamba_slot(self):
+        # The two admission charges are deliberately NOT folded together.
+        #
+        # A mamba slot is owed only by a request that takes a FRESH state; a
+        # request whose state comes from the radix cache owes none. A band slot
+        # is owed by EVERY running request, because every verify-row occupies
+        # one regardless of where its mamba state came from.
+        #
+        # Folding the band into the mamba charge therefore under-reserves the
+        # band exactly when the radix cache is hitting, and the next decode
+        # step's band placement fails. Keep them separate; the admission path
+        # adds them (see PrefillAdder).
         _, comp_spec, _ = self._make(spec_on=True)
         _, comp_off, _ = self._make(spec_on=False)
         full_entry = comp_off.full_attn_allocator.entry_bytes
         mamba_entry = comp_off.mamba_allocator.entry_bytes_per_page
         spec_entry = comp_spec.spec_state_allocator.entry_bytes_per_page
+
+        # The mamba charge is the mamba slot alone, and spec does not change it.
+        mamba_cost = -(-mamba_entry // full_entry)
+        self.assertEqual(comp_off.mamba_slot_full_token_cost(), mamba_cost)
+        self.assertEqual(comp_spec.mamba_slot_full_token_cost(), mamba_cost)
+
+        # The band is charged on its own, and only when spec is on.
         self.assertEqual(
-            comp_off.mamba_slot_full_token_cost(),
-            -(-mamba_entry // full_entry),
+            comp_spec.spec_band_full_token_cost(),
+            -(-spec_entry // full_entry),
         )
-        self.assertEqual(
-            comp_spec.mamba_slot_full_token_cost(),
-            -(-(mamba_entry + spec_entry) // full_entry),
-        )
+        self.assertEqual(comp_off.spec_band_full_token_cost(), 0)
 
     def test_flush_opportunistic_does_not_park_band(self):
         # Per-loop flushes must not churn a live band (review finding #5);
@@ -3188,7 +3207,7 @@ class TestUnifiedMambaCompositeWithBand(unittest.TestCase):
         self.assertEqual(comp.spec_state_allocator.num_placed_slots, 3)
 
 
-class TestBandPlacementSemantics(unittest.TestCase):
+class TestBandPlacementSemantics(CpuPoolTestCase):
     def test_identity_placement_is_stable(self):
         pool, ma, band, fa, _ = _make_3pool_chain()
         self.assertTrue(band.place_band(4))

@@ -8,6 +8,7 @@ import torch
 from sglang.srt.mem_cache.chunk_cache import PureSWAChunkCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from cpu_pool_case import CpuPoolMixin
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -29,7 +30,7 @@ class _FakeReq:
         return 8
 
 
-class TestPureSWAChunkCache(CustomTestCase):
+class TestPureSWAChunkCache(CpuPoolMixin, CustomTestCase):
     def test_finished_req_skips_already_evicted_swa_range(self):
         cache = PureSWAChunkCache.__new__(PureSWAChunkCache)
         cache.req_to_token_pool = SimpleNamespace(

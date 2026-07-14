@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.layout.page_major import (
     spec_state_entry_bytes,
 )
 from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
+from cpu_pool_case import CpuPoolTestCase
 
 _DEV = "cpu"
 _DT = torch.float32
@@ -57,7 +58,7 @@ def _make_mha_views(layer_num, head_num, head_dim, v_head_dim, page_size, num_pa
     return raw, k, v
 
 
-class TestPageMajorMHAViews(unittest.TestCase):
+class TestPageMajorMHAViews(CpuPoolTestCase):
     def test_view_shapes(self):
         _, k, v = _make_mha_views(3, 2, 4, 4, page_size=2, num_pages=4)
         self.assertEqual(len(k), 3)
@@ -99,7 +100,7 @@ class TestPageMajorMHAViews(unittest.TestCase):
         self.assertEqual(tuple(v[0].shape), (3, 1, 2, 4))
 
 
-class TestPageMajorMove(unittest.TestCase):
+class TestPageMajorMove(CpuPoolTestCase):
     def test_move_ps1(self):
         slots = 6
         _, k, v = _make_mha_views(2, 1, 4, 4, page_size=1, num_pages=slots)
@@ -128,7 +129,7 @@ class TestPageMajorMove(unittest.TestCase):
         self.assertEqual(float(k[0][1, 1, 0, 0].item()), 8.0)
 
 
-class TestMambaEnvelopeViews(unittest.TestCase):
+class TestMambaEnvelopeViews(CpuPoolTestCase):
     def test_conv_temporal_shapes_no_alias(self):
         layers, slots = 2, 4
         conv_shapes = [(2, 3)]
@@ -161,7 +162,7 @@ class TestMambaEnvelopeViews(unittest.TestCase):
                 self.assertTrue(torch.all(temporal[L, s] == float(s + L * 10 + 1)))
 
 
-class TestSpecStateEnvelopeViews(unittest.TestCase):
+class TestSpecStateEnvelopeViews(CpuPoolTestCase):
     _LAYERS, _SLOTS, _STEPS = 2, 4, 3
     _CONV_SHAPES = [(2, 3)]
     _SSM_SHAPE = (2, 2, 2)

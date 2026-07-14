@@ -113,9 +113,12 @@ class TestFusedMove(CustomTestCase):
         _stamp(host_k + host_v, tgt, page_size, 0.0)
         _stamp(draft_k + draft_v, tgt, page_size, 0.0)
 
+        # device="cpu" is REQUIRED, not decorative: this is a CPU pool, but on a
+        # CUDA box an ambient default-device context sends a bare torch.tensor()
+        # to cuda:0, and indexing a CPU buffer with a CUDA index raises.
         pool.move_kv_cache(
-            torch.tensor([tgt], dtype=torch.int64),
-            torch.tensor([src], dtype=torch.int64),
+            torch.tensor([tgt], dtype=torch.int64, device="cpu"),
+            torch.tensor([src], dtype=torch.int64, device="cpu"),
         )
 
         for t in _read(host_k + host_v, tgt, page_size):
@@ -138,8 +141,8 @@ class TestFusedMove(CustomTestCase):
         ) + 1
         _stamp(host_k + host_v, src, 1, 2.5)
         pool.move_kv_cache(
-            torch.tensor([tgt], dtype=torch.int64),
-            torch.tensor([src], dtype=torch.int64),
+            torch.tensor([tgt], dtype=torch.int64, device="cpu"),
+            torch.tensor([src], dtype=torch.int64, device="cpu"),
         )
         for t in _read(host_k + host_v, tgt, 1):
             self.assertTrue(torch.all(t == 2.5))
