@@ -2498,6 +2498,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kv_cache_dtype=self.kv_cache_dtype,
             attn_tp_size=get_attention_tp_size(),
         )
+        if self.draft_kv_geometry is None:
+            # We only get here when the gate above already established that
+            # unified memory is on and the algorithm CARRIES draft KV, so a
+            # geometry we cannot resolve is a config error, not a "no fusion"
+            # answer. Falling through would silently seat the run on the
+            # private-pool + reserve path, which sizes the draft pool over the
+            # whole virtual-id space and does not charge admission for it -- the
+            # run then boots, looks healthy, and quietly over-commits GPU memory.
+            # A config drift (e.g. num_nextn_predict_layers going missing from a
+            # nested config) must not be able to do that silently.
+            raise ValueError(
+                f"--enable-unified-memory with speculative algorithm "
+                f"{self.spec_algorithm} requires a resolvable draft KV geometry, "
+                "but none could be derived from the draft/target config (missing "
+                "layer count, head dim, or num_nextn_predict_layers). Fix the "
+                "config, or set SGLANG_DISABLE_FUSED_DRAFT_KV=1 to opt out "
+                "explicitly."
+            )
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""

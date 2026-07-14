@@ -830,6 +830,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     o,
     h0_source,
     h0_indices,
+    # Slot stride of h0_source, in elements. A dense pool has HV*K*V; the unified
+    # pool's temporal view is an envelope slice whose slot stride is the WHOLE
+    # mamba entry (all layers interleaved), so it must be passed, not assumed.
+    stride_h0_slot,
     cu_seqlens,
     scale,
     intermediate_states_buffer,
@@ -901,12 +905,12 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_slot
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
@@ -916,7 +920,7 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Prepare intermediate state cache variables if enabled
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
     for _ in range(0, T):
@@ -993,11 +997,11 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Store final state back to h0_source with bounds checking
     # ssm states
     if not DISABLE_STATE_UPDATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:  # Add bounds checking
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_slot
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
@@ -1059,6 +1063,11 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        stride_h0_slot=(
+            initial_state_source.stride(0)
+            if initial_state_source is not None
+            else 0
+        ),
         cu_seqlens=cu_seqlens,
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,

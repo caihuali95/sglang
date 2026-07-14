@@ -805,9 +805,25 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         # here raw.
         # `full_loc` is the pre-translated PHYSICAL loc; a bare `loc` is already
         # physical.
+        was_write_loc = isinstance(loc, KVWriteLoc)
         loc, _, full_loc = unwrap_write_loc(loc)
         if full_loc is not None:
             loc = full_loc
+        elif was_write_loc:
+            # A KVWriteLoc carrying no full_loc means the backend never ran the
+            # virtual->physical translate, so `loc` holds VIRTUAL ids. Writing
+            # them as physical does not crash -- it silently scribbles KV into
+            # whatever slots the virtual ids happen to name, and only shows up
+            # later as a degraded accept length. Backends that translate always
+            # populate full_loc; a backend that does not (any non-Triton one) has
+            # no business reaching this pool. Fail here rather than corrupt.
+            raise RuntimeError(
+                "unified pool received a KVWriteLoc with no physical loc "
+                "(full_loc=None): the attention backend did not translate the "
+                "virtual slot ids. The unified memory pool requires the Triton "
+                "attention backend on every path, including "
+                "--speculative-draft-attention-backend."
+            )
         # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't
         # merge our 4-D layer-major view (stride[0]=page_bytes) at page_size>1. Call
         # store_cache_4d_kernel directly. `loc` is PHYSICAL token ids — no v2p translate.
