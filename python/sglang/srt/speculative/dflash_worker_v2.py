@@ -982,25 +982,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Fused draft KV: this is the ONE draft KV write that
         # bypasses attention metadata, so the virtual->physical translate
         # happens here: every loc reaching a unified pool method must already be
-        # PHYSICAL. Same pool-capability rule as TritonAttnBackend;
-        # probed at call time because pools bind after __init__
-        # (alloc_memory_pool). Every id in cache_loc/cache_loc_2d is a real
-        # pre-allocated slot of the verify block (commit_lens only limits
+        # PHYSICAL. Probed at call time because pools bind after __init__
+        # (alloc_memory_pool); non-unified allocators have no translate_kv_loc,
+        # so this is a no-op for them. Every id in cache_loc/cache_loc_2d is a
+        # real pre-allocated slot of the verify block (commit_lens only limits
         # which rows are WRITTEN), so translating the dense tensors is safe.
-        if not getattr(
-            self.draft_model_runner.token_to_kv_pool, "kv_ids_are_virtual", False
-        ):
-            translate_kv_loc = getattr(
-                self.draft_model_runner.token_to_kv_pool_allocator,
-                "translate_kv_loc",
-                None,
-            )
-            if translate_kv_loc is not None:
-                cache_loc = translate_kv_loc(cache_loc)
-                if cache_loc_2d is not None:
-                    cache_loc_2d = translate_kv_loc(
-                        cache_loc_2d.reshape(-1)
-                    ).view(cache_loc_2d.shape)
+        translate_kv_loc = getattr(
+            self.draft_model_runner.token_to_kv_pool_allocator,
+            "translate_kv_loc",
+            None,
+        )
+        if translate_kv_loc is not None:
+            cache_loc = translate_kv_loc(cache_loc)
+            if cache_loc_2d is not None:
+                cache_loc_2d = translate_kv_loc(cache_loc_2d.reshape(-1)).view(
+                    cache_loc_2d.shape
+                )
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)

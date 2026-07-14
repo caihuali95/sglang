@@ -944,8 +944,8 @@ class ModelConfig:
             # sizes a 1-layer MTP draft's KV at the FULL target's depth. The KV
             # bytes charged per token then jump by (1 + target_layers) / 2 --
             # for a 32-layer target that is a ~5x per-token cell inflation,
-            # which halves the admitted batch on the fused path and oversizes
-            # the private draft pool by 32x on the non-fused one. Fall back to
+            # which halves the admitted batch under the unified pool's fused
+            # draft KV and oversizes a baseline draft pool by 32x. Fall back to
             # `hf_config` so the value surfaces for nested configs too.
             self.num_nextn_predict_layers = getattr(
                 self.hf_config, "num_nextn_predict_layers", None

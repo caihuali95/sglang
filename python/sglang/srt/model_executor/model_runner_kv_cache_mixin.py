@@ -71,15 +71,6 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
-def _should_enable_fused_draft_kv() -> bool:
-    """Fused draft KV is ON by default, unless `SGLANG_DISABLE_FUSED_DRAFT_KV=1`
-    (escape hatch for A/B / rollback to the private-pool + reserve path). The
-    ONLY env read site — everything downstream keys on
-    `draft_kv_geometry is not None`.
-    """
-    return not envs.SGLANG_DISABLE_FUSED_DRAFT_KV.get()
-
-
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
@@ -110,10 +101,9 @@ class UnifiedSpecAdmission(msgspec.Struct):
     hard_mamba_slots: int
     headroom_slots: int
     mamba_slots: int  # hard + radix headroom (possibly explicit-capped)
-    band_bytes: int  # spec-state band at max_num_reqs (raw, un-inflated)
-    draft_reserve_bytes: int  # draft-pool backing for mamba+band bytes
-    deducted_bytes: int  # profile deduction: band + mamba, draft-inflated
-    token_budget_bytes: int  # rest - deducted (converted by the SCALED cell)
+    band_bytes: int  # spec-state band at max_num_reqs
+    deducted_bytes: int  # profile deduction: band + mamba bytes
+    token_budget_bytes: int  # rest - deducted (converted by the fused cell)
 
 
 def solve_unified_spec_admission(
@@ -125,42 +115,24 @@ def solve_unified_spec_admission(
     hard_slots: int,
     mamba_ratio: int,
     cell_size: int,
-    base_cell_size: int,
     margin_slots: int,
     explicit_mamba_slots: Optional[int] = None,
 ) -> UnifiedSpecAdmission:
     """Joint hard-floor admission solve for unified-pool speculative decoding.
 
-    Every byte granted to the mamba slots or the spec-state band extends the
-    unified buffer, and the DFLASH/EAGLE draft worker's PRIVATE KV pool is
-    sized to the buffer's full VIRTUAL-id capacity (zero-translate:
-    total_bytes // base_cell_size ids x draft bytes/token). The configurator's
-    draft-scaled `cell_size` (= base + draft bytes/token) already reserves the
-    draft share of every TOKEN; the mamba/band bytes' share is charged here by
-    inflating those terms with cell_size/base_cell_size.
-
-    LIMITATION (deliberate): the virtual-id sizing makes the draft pool span
-    ids that mostly back mamba/band bytes and can never hold draft KV (the vast
-    majority of the pool for a heavy draft like DFLASH), so this reserve makes
-    the waste honest rather than removing it. TODO: reclaim it via either a
-    draft-side v2p translate with a compact draft allocator, or by fusing the
-    draft KV into the full-KV slot layout.
+    All charges are in raw unified-buffer bytes. The draft's KV needs no
+    separate accounting: it is fused into the full-KV slot entry, so
+    `cell_size` (the fused entry, bytes per token across all layers) already
+    carries the draft's per-token cost, and the mamba/band bytes have no
+    draft-pool backing to reserve — there is no separate draft pool.
     """
-    assert cell_size >= base_cell_size > 0
-
-    def with_draft_backing(nbytes: int) -> int:
-        # Draft-pool bytes backing the virtual ids that `nbytes` of buffer
-        # occupies: nbytes/base ids x (cell - base) draft bytes each.
-        return nbytes * cell_size // base_cell_size
+    assert cell_size > 0
 
     token_floor_bytes = UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
-    band_const_bytes = with_draft_backing(
-        (1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
-    )
+    band_const_bytes = (1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
     per_req_bytes = (
-        with_draft_backing((hard_slots + num_draft_tokens) * mamba_bytes_per_req)
-        + token_floor_bytes
-    )
+        hard_slots + num_draft_tokens
+    ) * mamba_bytes_per_req + token_floor_bytes
     n = (rest_bytes - band_const_bytes) // per_req_bytes
     n = min(requested, n)
     if explicit_mamba_slots is not None:
@@ -174,7 +146,6 @@ def solve_unified_spec_admission(
             headroom_slots=0,
             mamba_slots=0,
             band_bytes=0,
-            draft_reserve_bytes=0,
             deducted_bytes=0,
             token_budget_bytes=0,
         )
@@ -185,33 +156,29 @@ def solve_unified_spec_admission(
     # the token floor, capped at the base ratio's allowance. The grant is
     # itemization, not a fence — at runtime the frontiers share bytes
     # freely. Accounting invariant vs the factory: the factory re-adds the
-    # RAW band + mamba bytes into total_bytes; this solve deducts them
-    # INFLATED (x cell/base). The difference — the draft-pool backing —
-    # therefore never enters the unified buffer and stays free for the
-    # draft allocation (accounting must not drift on either side).
+    # band + mamba bytes into total_bytes; this solve deducts exactly the
+    # same bytes (accounting must not drift on either side).
     leftover = (
         rest_bytes
-        - with_draft_backing(band_bytes)
-        - with_draft_backing(hard_mamba_slots * mamba_bytes_per_req)
+        - band_bytes
+        - hard_mamba_slots * mamba_bytes_per_req
         - n * token_floor_bytes
     )
     headroom_slots = min(
-        max(0, leftover) // with_draft_backing(mamba_bytes_per_req),
+        max(0, leftover) // mamba_bytes_per_req,
         n * mamba_ratio - hard_mamba_slots,
     )
     mamba_slots = int(hard_mamba_slots + headroom_slots)
     if explicit_mamba_slots is not None:
         mamba_slots = min(mamba_slots, explicit_mamba_slots)
 
-    mamba_band_bytes = band_bytes + mamba_slots * mamba_bytes_per_req
-    deducted_bytes = with_draft_backing(mamba_band_bytes)
+    deducted_bytes = band_bytes + mamba_slots * mamba_bytes_per_req
     return UnifiedSpecAdmission(
         max_num_reqs=int(n),
         hard_mamba_slots=int(hard_mamba_slots),
         headroom_slots=int(headroom_slots),
         mamba_slots=mamba_slots,
         band_bytes=band_bytes,
-        draft_reserve_bytes=deducted_bytes - mamba_band_bytes,
         deducted_bytes=deducted_bytes,
         token_budget_bytes=rest_bytes - deducted_bytes,
     )
@@ -457,17 +424,12 @@ class ModelRunnerKVCacheMixin:
         hard_slots = 1 + max(0, ratio - MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO)
 
         # Per-token full-KV bytes from the SAME configurator class that sizes
-        # the token pool right after this returns. `_cell_size` includes the
-        # EAGLE/DFLASH draft-KV per-token scaling; `_base_cell_size` is the
-        # target-only pool entry — their difference is the draft's per-token
-        # KV cost, which prices the virtual-id draft-pool reserve.
+        # the token pool right after this returns. Under the unified pool the
+        # draft's KV is fused into the full-KV slot entry, so `_cell_size` IS
+        # the fused entry (target + draft bytes per token) — one cell prices
+        # everything; no separate draft pool exists to reserve for.
         configurator = create_memory_pool_configurator(self)
         cell_size = configurator._cell_size
-        base_cell_size = getattr(configurator, "_base_cell_size", None)
-        assert base_cell_size is not None, (
-            "mambaish models must use DefaultPoolConfigurator "
-            f"(got {type(configurator).__name__})"
-        )
 
         rest_bytes = int(total_rest_memory * (1 << 30))
         explicit_mamba_slots = (
@@ -483,23 +445,20 @@ class ModelRunnerKVCacheMixin:
             hard_slots=hard_slots,
             mamba_ratio=ratio,
             cell_size=cell_size,
-            base_cell_size=base_cell_size,
             margin_slots=SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
             explicit_mamba_slots=explicit_mamba_slots,
         )
         n = admission.max_num_reqs
         if n <= 0:
             per_req_floor_bytes = (
-                (hard_slots + D) * per_req * cell_size // base_cell_size
-                + UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
-            )
+                hard_slots + D
+            ) * per_req + UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
             raise RuntimeError(
                 f"Not enough GPU memory for unified-pool speculative decoding: "
                 f"joint hard-floor solve admits {n} requests "
                 f"(rest={total_rest_memory:.2f} GiB, per-request floor="
                 f"{per_req_floor_bytes / (1 << 30):.2f} GiB: {hard_slots} mamba "
                 f"slots + {D} band rows x {per_req / (1 << 20):.1f} MiB "
-                f"(x{cell_size / base_cell_size:.2f} draft-pool backing) "
                 f"+ {UNIFIED_SPEC_MIN_TOKENS_PER_REQ} tokens x {cell_size} B). "
                 f"Try: (1) increase --mem-fraction-static, "
                 f"(2) reduce --speculative-num-draft-tokens, or "
@@ -516,16 +475,10 @@ class ModelRunnerKVCacheMixin:
             # never overwritten (_resolve_max_num_reqs min's + warns instead).
             server_args.max_running_requests = int(n * dp)
 
-        # Fused draft KV: cell == base, the draft KV is part of
-        # every fused slot — no separate pool, no reserve to report.
         draft_note = (
             f"draft KV fused into cell ({cell_size} B/token)"
             if self.draft_kv_geometry is not None
-            else (
-                f"draft-KV reserve "
-                f"{admission.draft_reserve_bytes / (1 << 30):.2f} GiB "
-                f"(cell {cell_size}/{base_cell_size} B/token)"
-            )
+            else f"no draft KV ({cell_size} B/token)"
         )
         logger.info(
             "[unified-memory-pool] joint admission solve: max_num_reqs=%d "
@@ -545,34 +498,6 @@ class ModelRunnerKVCacheMixin:
             UNIFIED_SPEC_MIN_TOKENS_PER_REQ,
             admission.token_budget_bytes / (1 << 30),
         )
-        # Warn only when the config is DRAFT-WASTE-bound, not merely
-        # spec-heavy. The band (∝ N) is large by design but is a runtime
-        # SHARED gap (exact-fit at bs, ceded to full/mamba between verifies),
-        # so a low token-pool *fraction* is normal for the hard-floor solve
-        # and is NOT a warning. The draft pool, by contrast, is a fixed
-        # private allocation that is truly lost: draft_pool = q/(1+q) x rest
-        # where q = (cell/base − 1). Fire when it exceeds the usable token
-        # pool — then the mostly-wasted draft KV outweighs the cache it
-        # protects, and only a reclaim or fewer draft tokens helps (a lower
-        # mfs does not — the pool scales with the budget).
-        draft_pool_bytes = rest_bytes - rest_bytes * base_cell_size // cell_size
-        if draft_pool_bytes > admission.token_budget_bytes:
-            logger.warning(
-                "[unified-memory-pool] draft-waste-bound config: the "
-                "virtual-index draft KV pool (~%.1f GiB, q=draft/target "
-                "per-token = %.2f) exceeds the token pool it backs (%.1f GiB) "
-                "at mem-fraction-static=%.2f, D=%d — most of the draft pool "
-                "can never hold draft KV. A higher/lower mfs does NOT help "
-                "(the pool scales with the budget); consider (1) fewer "
-                "--speculative-num-draft-tokens or (2) an explicit "
-                "--max-running-requests below %d.",
-                draft_pool_bytes / (1 << 30),
-                (cell_size / base_cell_size) - 1.0,
-                admission.token_budget_bytes / (1 << 30),
-                server_args.mem_fraction_static,
-                D,
-                n,
-            )
         return total_rest_memory - admission.deducted_bytes / (1 << 30)
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
@@ -860,8 +785,24 @@ class ModelRunnerKVCacheMixin:
         unified_buffer = getattr(
             self.token_to_kv_pool_allocator, "unified_buffer", None
         )
-        if unified_buffer is None or not unified_buffer.has_draft_region("full"):
+        if unified_buffer is None:
+            # Baseline (non-unified) target: the draft builds its own private
+            # pool below, indexed by the physical ids the shared allocator
+            # mints. Nothing unified-specific applies.
             return False
+        if not unified_buffer.has_draft_region("full"):
+            # A unified target with a draft worker but no draft region cannot
+            # happen by construction: resolve_draft_kv_geometry either returns
+            # a geometry (the factory then attaches the region) or the target
+            # raises at init. Falling through would build a private pool
+            # indexed as if the shared allocator's VIRTUAL ids were physical —
+            # silent wrong-slot KV. Fail here instead.
+            raise RuntimeError(
+                "unified-memory draft worker found no draft region on the "
+                "target's full sub-pool. The target must attach one whenever "
+                "the speculative algorithm carries draft KV (fused draft KV "
+                "has no fallback path)."
+            )
 
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
         from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
@@ -937,53 +878,12 @@ class ModelRunnerKVCacheMixin:
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
-        # Fused draft KV: when the target's unified full sub-pool
-        # carries a draft region, the draft worker binds views instead of
-        # allocating a private pool — the vcap bump and every construction
-        # path below are then irrelevant.
+        # Draft worker under a unified-pool target: the draft's KV is fused
+        # into the target's full-KV slot entry, so the draft worker binds
+        # views of the target's unified sub-pool instead of allocating a pool
+        # of its own — every construction path below is then irrelevant.
         if self._init_unified_draft_pool():
             return
-
-        # DRAFT worker under a unified-pool TARGET: the shared allocator mints
-        # VIRTUAL token ids in [0, max_slots) — larger than
-        # max_total_num_tokens because the byte budget also covers the
-        # mamba/spec bands. The draft's PRIVATE KV pool is virtual-indexed
-        # (its attention backends skip the v2p translate; see
-        # TritonAttnBackend), so it must span the whole virtual-id space.
-        # KNOWN WASTE: only max_total_num_tokens of these ids ever hold draft
-        # KV — the rest back mamba/band bytes (most of the pool for a heavy
-        # DFLASH draft). The target's admission solve charges this full
-        # footprint (_handle_max_mamba_cache_unified draft-KV reserve) so it
-        # can't OOM, but the bytes are dead weight. TODO: give the draft pool
-        # its own v2p translate + compact allocator, or fuse the draft KV into
-        # the full-KV slot layout, to reclaim it.
-        if self.is_draft_worker and self.token_to_kv_pool_allocator is not None:
-            from sglang.srt.mem_cache.multi_ended_allocator import (
-                MultiEndedAllocator,
-            )
-
-            full_mea = getattr(
-                self.token_to_kv_pool_allocator, "full_attn_allocator", None
-            )
-            # isinstance, not just attribute presence: the NON-unified SWA
-            # composite also exposes `full_attn_allocator`, but as a plain
-            # TokenToKVPoolAllocator (physical ids, no num_pages). Only a
-            # MultiEndedAllocator mints virtual ids the draft must span.
-            if isinstance(full_mea, MultiEndedAllocator):
-                virtual_capacity = full_mea.num_pages * full_mea.page_size
-                if virtual_capacity > self.max_total_num_tokens:
-                    logger.info(
-                        "[unified-memory-pool] draft worker: sizing the private "
-                        "KV pool to the shared virtual-id capacity %d "
-                        "(was max_total_num_tokens=%d; overshoot %.1f%% on the "
-                        "draft's few layers).",
-                        virtual_capacity,
-                        self.max_total_num_tokens,
-                        100.0
-                        * (virtual_capacity - self.max_total_num_tokens)
-                        / max(1, self.max_total_num_tokens),
-                    )
-                    self.max_total_num_tokens = virtual_capacity
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
@@ -1694,17 +1594,6 @@ class ModelRunnerKVCacheMixin:
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
                 "and --kv-cache-dtype != fp4_e2m1."
             )
-
-        # NON-fused draft only (the fused path returned above): a draft worker
-        # reaching here built a PRIVATE pool indexed by VIRTUAL token ids, whose
-        # bytes never move (compaction relocates target-pool bytes only). Declare
-        # the capability so attention backends skip the v2p translate for it (see
-        # TritonAttnBackend); translating would address the wrong draft slots.
-        # The capability lives on the POOL, not the worker role; harmless no-op
-        # for non-unified allocators (their probe finds no translate_kv_loc
-        # either way). Retires with the private-pool fallback.
-        if self.is_draft_worker:
-            self.token_to_kv_pool.kv_ids_are_virtual = True
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.

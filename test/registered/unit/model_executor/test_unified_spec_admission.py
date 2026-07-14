@@ -3,13 +3,14 @@
 only, pure integer arithmetic.
 
 The solve charges, per admitted request: hard mamba slots + D spec-band rows
-(both inflated by cell/base to back the virtual-id draft pool) + a token
-floor priced at the draft-scaled cell. These tests pin:
-  1. d=0 (no separate draft pool, e.g. NGRAM) is byte-identical to the
-     legacy formula the solve replaced,
-  2. the fit-by-construction guarantee: target buffer + draft pool
-     (sized to the buffer's virtual-id capacity) never exceeds rest,
-  3. boundary behavior (requested cap, explicit mamba slots, infeasible).
++ a token floor priced at the fused cell (the full-KV slot entry, which
+already carries the draft's per-token bytes -- the draft KV is fused into the
+slot layout, so there is no separate draft pool and nothing else to reserve).
+These tests pin:
+  1. the solve against a verbatim transcription of its formula (an executable
+     spec: any accounting drift in either direction fails byte-exactly),
+  2. boundary behavior (requested cap, explicit mamba slots, infeasible),
+  3. the radix-headroom grant's base-ratio cap.
 """
 
 import unittest
@@ -27,7 +28,7 @@ GIB = 1 << 30
 MIB = 1 << 20
 
 
-def _legacy_solve(
+def _reference_solve(
     *,
     rest_bytes,
     requested,
@@ -39,8 +40,7 @@ def _legacy_solve(
     margin_slots,
     explicit_mamba_slots=None,
 ):
-    """The pre-draft-reserve solve, transcribed verbatim. With cell == base the
-    new solve must reproduce it byte-for-byte."""
+    """The solve's formula, transcribed verbatim as an executable spec."""
     token_floor_bytes = UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
     band_const_bytes = (1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
     per_req_bytes = (
@@ -71,15 +71,15 @@ def _legacy_solve(
     return n, mamba_slots, deducted
 
 
-# Production-shaped bases: Qwen3.5-9B-class GDN. base cell 32768 B/token;
-# EAGLE draft +4096 (1 MTP layer), DFLASH draft +24576 (6 layers).
+# Production-shaped cells: Qwen3.5-9B-class GDN. The fused cell = host entry
+# 32768 B/token + the draft region: EAGLE +4096 (1 MTP layer), DFLASH +24576
+# (6 layers). NGRAM carries no draft KV, so its cell is the host entry alone.
 QWEN_EAGLE = dict(
     mamba_bytes_per_req=49 * MIB,
     num_draft_tokens=4,
     hard_slots=3,
     mamba_ratio=5,
     cell_size=36864,
-    base_cell_size=32768,
     margin_slots=3,
 )
 QWEN_DFLASH = dict(
@@ -88,124 +88,85 @@ QWEN_DFLASH = dict(
     hard_slots=1,
     mamba_ratio=1,
     cell_size=57344,
-    base_cell_size=32768,
+    margin_slots=3,
+)
+QWEN_NGRAM = dict(
+    mamba_bytes_per_req=49 * MIB,
+    num_draft_tokens=4,
+    hard_slots=3,
+    mamba_ratio=5,
+    cell_size=32768,
     margin_slots=3,
 )
 
 
 class TestUnifiedSpecAdmissionSolve(CustomTestCase):
-    def test_no_draft_pool_matches_legacy_formula(self):
-        """d = 0 (cell == base, e.g. NGRAM): the draft-backing inflation is
-        the identity and the solve must equal the pre-reserve formula exactly
-        -- across a grid including tight, ample, and clamped budgets."""
-        for rest_gib in (2, 10, 35, 55):
-            for requested in (8, 48, 256):
-                for explicit in (None, 40):
-                    kwargs = dict(
-                        rest_bytes=rest_gib * GIB,
-                        requested=requested,
-                        mamba_bytes_per_req=49 * MIB,
-                        num_draft_tokens=4,
-                        hard_slots=3,
-                        mamba_ratio=5,
-                        cell_size=32768,
-                        margin_slots=3,
-                        explicit_mamba_slots=explicit,
-                    )
-                    a = solve_unified_spec_admission(
-                        base_cell_size=32768, **kwargs
-                    )
-                    n, mamba_slots, deducted = _legacy_solve(**kwargs)
-                    with self.subTest(rest_gib=rest_gib, requested=requested):
-                        self.assertEqual(a.max_num_reqs, n)
-                        if n > 0:
-                            self.assertEqual(a.mamba_slots, mamba_slots)
-                            self.assertEqual(a.deducted_bytes, deducted)
-                            self.assertEqual(a.draft_reserve_bytes, 0)
+    def test_matches_reference_formula(self):
+        """Byte-exact against the transcribed formula, across fused-EAGLE,
+        fused-DFLASH and no-draft-KV cells and tight/ample/clamped budgets."""
+        for params in (QWEN_EAGLE, QWEN_DFLASH, QWEN_NGRAM):
+            for rest_gib in (2, 10, 35, 55):
+                for requested in (8, 48, 256):
+                    for explicit in (None, 40):
+                        kwargs = dict(
+                            rest_bytes=rest_gib * GIB,
+                            requested=requested,
+                            explicit_mamba_slots=explicit,
+                            **params,
+                        )
+                        a = solve_unified_spec_admission(**kwargs)
+                        n, mamba_slots, deducted = _reference_solve(**kwargs)
+                        with self.subTest(
+                            cell=params["cell_size"],
+                            rest_gib=rest_gib,
+                            requested=requested,
+                            explicit=explicit,
+                        ):
+                            self.assertEqual(a.max_num_reqs, n)
+                            if n > 0:
+                                self.assertEqual(a.mamba_slots, mamba_slots)
+                                self.assertEqual(a.deducted_bytes, deducted)
+                                self.assertEqual(
+                                    a.token_budget_bytes,
+                                    rest_gib * GIB - deducted,
+                                )
 
-    def test_draft_pool_fits_by_construction(self):
-        """The core draft-reserve guarantee: reconstruct the factory's buffer
-        (tokens x base + band + mamba) and the draft pool (virtual-id
-        capacity x draft bytes/token); their sum must fit in rest. Without the
-        reserve, a heavy DFLASH draft pool (a large fraction of the buffer)
-        overflows and OOMs."""
+    def test_token_floor_fits_the_budget(self):
+        """Whatever the solve admits, the per-request token floor must fit in
+        the token budget it leaves behind -- the floor is a guarantee, not an
+        aspiration."""
         for params, rest_gib, requested in (
-            (QWEN_EAGLE, 35, 256),  # EAGLE high-mfs-shaped
-            (QWEN_DFLASH, 55, 256),  # DFLASH high-mfs-shaped (the OOM case)
-            (QWEN_DFLASH, 36, 48),  # DFLASH mid-mfs-shaped
-            (QWEN_EAGLE, 6, 48),  # tight budget
+            (QWEN_EAGLE, 35, 256),
+            (QWEN_DFLASH, 55, 256),
+            (QWEN_DFLASH, 36, 48),
+            (QWEN_EAGLE, 6, 48),
         ):
-            rest_bytes = rest_gib * GIB
             a = solve_unified_spec_admission(
-                rest_bytes=rest_bytes, requested=requested, **params
+                rest_bytes=rest_gib * GIB, requested=requested, **params
             )
             with self.subTest(rest_gib=rest_gib, cell=params["cell_size"]):
                 self.assertGreater(a.max_num_reqs, 0)
-                cell = params["cell_size"]
-                base = params["base_cell_size"]
-                tokens = a.token_budget_bytes // cell
-                buffer_bytes = (
-                    tokens * base
-                    + a.band_bytes
-                    + a.mamba_slots * params["mamba_bytes_per_req"]
-                )
-                draft_pool_bytes = (buffer_bytes // base) * (cell - base)
-                # <= rest + one token's bytes (integer-flooring slack).
-                self.assertLessEqual(buffer_bytes + draft_pool_bytes, rest_bytes + cell)
-                # The floor tokens must actually fit the budget.
+                tokens = a.token_budget_bytes // params["cell_size"]
                 self.assertGreaterEqual(
                     tokens, a.max_num_reqs * UNIFIED_SPEC_MIN_TOKENS_PER_REQ
                 )
-                if cell > base:
-                    self.assertGreater(a.draft_reserve_bytes, 0)
 
-    def test_dflash_reserve_admits_fewer_than_unreserved(self):
-        """Charging the draft backing must shrink admission (that shrink IS
-        the reserve); DFLASH (q=0.75) shrinks much harder than EAGLE
-        (q=0.125)."""
+    def test_heavier_fused_cell_admits_fewer(self):
+        """A heavier draft region (DFLASH's 24576 B/token vs EAGLE's 4096)
+        raises the fused cell and must shrink admission monotonically -- the
+        cell is the ONLY place the draft's cost enters the solve."""
         rest_bytes = 55 * GIB
-        dflash = solve_unified_spec_admission(
-            rest_bytes=rest_bytes, requested=1024, **QWEN_DFLASH
+        base = dict(QWEN_EAGLE, num_draft_tokens=4, hard_slots=3, mamba_ratio=5)
+        light = solve_unified_spec_admission(
+            rest_bytes=rest_bytes, requested=1024, **base
         )
-        no_reserve = solve_unified_spec_admission(
+        heavy = solve_unified_spec_admission(
             rest_bytes=rest_bytes,
             requested=1024,
-            **{**QWEN_DFLASH, "cell_size": QWEN_DFLASH["base_cell_size"]},
+            **{**base, "cell_size": QWEN_DFLASH["cell_size"]},
         )
-        self.assertLess(dflash.max_num_reqs, no_reserve.max_num_reqs)
-        # q=0.75: byte terms inflate ~1.75x, so admission lands well below
-        # 2/3 of the unreserved count.
-        self.assertLess(dflash.max_num_reqs * 3, no_reserve.max_num_reqs * 2)
-
-    def test_fused_draft_kv_beats_reserve(self):
-        """Fused draft KV: the draft rides inside the fused slot,
-        so the solve runs with cell == base == fused entry — no reserve
-        (draft_reserve_bytes == 0) and mamba/band bytes charged RAW. For the
-        SAME per-token layout cost, fusion must admit at least as many
-        requests as the reserve-mode solve (which additionally inflates every
-        mamba/band byte by cell/base to back the virtual-id overshoot); for a
-        heavy DFLASH draft (q=0.75) the win is strict."""
-        rest_bytes = 55 * GIB
-        for base_kwargs in (QWEN_EAGLE, QWEN_DFLASH):
-            fused_cell = base_kwargs["cell_size"]  # same physical bytes/token
-            fused = solve_unified_spec_admission(
-                rest_bytes=rest_bytes,
-                requested=1024,
-                **{
-                    **base_kwargs,
-                    "cell_size": fused_cell,
-                    "base_cell_size": fused_cell,
-                },
-            )
-            reserve = solve_unified_spec_admission(
-                rest_bytes=rest_bytes, requested=1024, **base_kwargs
-            )
-            with self.subTest(cell=fused_cell):
-                self.assertEqual(fused.draft_reserve_bytes, 0)
-                self.assertGreaterEqual(fused.max_num_reqs, reserve.max_num_reqs)
-                if base_kwargs is QWEN_DFLASH:
-                    # Reserve inflates byte terms ~1.75x; fusion charges raw.
-                    self.assertGreater(fused.max_num_reqs, reserve.max_num_reqs)
+        self.assertLess(heavy.max_num_reqs, light.max_num_reqs)
+        self.assertGreater(heavy.max_num_reqs, 0)
 
     def test_requested_caps_admission(self):
         a = solve_unified_spec_admission(

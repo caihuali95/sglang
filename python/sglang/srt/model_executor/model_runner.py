@@ -481,13 +481,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and not self.is_draft_worker
         ):
             # MTP / NEXTN self-draft (no --speculative-draft-model-path): the
-            # target's own MTP head runs as the draft, but it STILL allocates a
-            # private, virtual-index-sized draft KV pool. Its per-token cost is
-            # `num_nextn_predict_layers` of attention KV, so surface it as
-            # eagle_draft_num_layers to scale the configurator's cell_size and
-            # let the unified admission solve reserve it. Without this, cell ==
-            # base leaves the pool unreserved — it fits the 1-mfs slack at
-            # moderate mfs but OOMs at higher N / lower mfs.
+            # target's own MTP head runs as the draft, and its KV still costs
+            # `num_nextn_predict_layers` of attention KV per token. Surface it
+            # as eagle_draft_num_layers so the NON-unified configurator's
+            # draft scaling prices the draft pool (under the unified pool the
+            # fused cell is computed from draft_kv_geometry instead and this
+            # value is unused). Without it the baseline sizes its token budget
+            # as if spec were off, and the draft pool built afterwards comes
+            # out of bytes nobody budgeted for.
             nnpl = self.model_config.num_nextn_predict_layers
             if nnpl is not None and int(nnpl) > 0:
                 self.eagle_draft_num_layers = int(nnpl)
@@ -2442,28 +2443,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         and before the memory pools are built (the unified factories attach
         the geometry to the host sub-pool spec).
         """
-        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-            _should_enable_fused_draft_kv,
-        )
-
-        # Gate here so `draft_kv_geometry is not None` <=> fusion enabled —
-        # the single condition every consumer (factories, configurators,
-        # _init_unified_draft_pool via has_draft_region) keys on. Algorithm
-        # eligibility is the server_args unified spec allow-list (EAGLE /
-        # EAGLE3 / DFLASH carry draft KV; NGRAM has none).
+        # Gate here so `draft_kv_geometry is not None` <=> the run carries
+        # draft KV — the single condition every consumer (factories,
+        # configurators, _init_unified_draft_pool via has_draft_region) keys
+        # on. Algorithm eligibility is the server_args unified spec allow-list
+        # (EAGLE / EAGLE3 / DFLASH carry draft KV; NGRAM has none).
         if (
             self.is_draft_worker
             or not self.server_args.enable_unified_memory
             or self.spec_algorithm.is_none()
             or not self.spec_algorithm.has_draft_kv()
         ):
-            return
-        if not _should_enable_fused_draft_kv():
-            logger.info(
-                "[unified-memory-pool] fused draft KV disabled "
-                "(SGLANG_DISABLE_FUSED_DRAFT_KV=1): falling back to the "
-                "virtual-index-sized private draft pool + admission reserve."
-            )
             return
 
         from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -2502,19 +2492,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # We only get here when the gate above already established that
             # unified memory is on and the algorithm CARRIES draft KV, so a
             # geometry we cannot resolve is a config error, not a "no fusion"
-            # answer. Falling through would silently seat the run on the
-            # private-pool + reserve path, which sizes the draft pool over the
-            # whole virtual-id space and does not charge admission for it -- the
-            # run then boots, looks healthy, and quietly over-commits GPU memory.
-            # A config drift (e.g. num_nextn_predict_layers going missing from a
-            # nested config) must not be able to do that silently.
+            # answer. There is no fallback: the draft's KV lives inside the
+            # target's fused slot entry, so without a geometry there is
+            # nowhere for the draft to write. A config drift (e.g.
+            # num_nextn_predict_layers going missing from a nested config)
+            # must fail here, at boot, not later and quietly.
             raise ValueError(
                 f"--enable-unified-memory with speculative algorithm "
                 f"{self.spec_algorithm} requires a resolvable draft KV geometry, "
                 "but none could be derived from the draft/target config (missing "
                 "layer count, head dim, or num_nextn_predict_layers). Fix the "
-                "config, or set SGLANG_DISABLE_FUSED_DRAFT_KV=1 to opt out "
-                "explicitly."
+                "config, or disable speculative decoding / unified memory."
             )
 
     def init_cublas(self):

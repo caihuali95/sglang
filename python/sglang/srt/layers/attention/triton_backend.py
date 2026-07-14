@@ -151,21 +151,14 @@ class TritonAttnBackend(AttentionBackend):
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
-        # kernels need PHYSICAL. Applied eagerly so the captured graph has no translate.
-        # Capability on the POOL, not the worker role: a pool that declares
-        # `kv_ids_are_virtual` (the NON-fused private draft pool)
-        # opts out — its KV is indexed by VIRTUAL ids (relocation-stable;
-        # compaction moves target-pool bytes only, so translating would read
-        # the wrong draft slots). Absent => translate: target pools and the
-        # FUSED draft view pool, whose bytes ride in the target's
-        # relocatable slots) both need physical ids; non-unified allocators
-        # have no translate_kv_loc so the probe degenerates to None. Draft
-        # mamba states keep their own translate (_translate_mamba_indices)
-        # either way.
-        self._translate_kv_loc = (
-            None
-            if getattr(self.token_to_kv_pool, "kv_ids_are_virtual", False)
-            else getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
+        # kernels need PHYSICAL. Applied eagerly so the captured graph has no
+        # translate. Every pool bound to a unified allocator needs it — target
+        # pools and the fused draft view pool alike, since both ride in the
+        # target's relocatable slots. Non-unified allocators have no
+        # translate_kv_loc, so the probe degenerates to None. Draft mamba
+        # states keep their own translate (_translate_mamba_indices).
+        self._translate_kv_loc = getattr(
+            self.token_to_kv_pool_allocator, "translate_kv_loc", None
         )
         if self._translate_kv_loc is not None:
             # Unified pool: the CG replay-prep translate needs the exact filled
@@ -2015,25 +2008,19 @@ class TritonMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
-        # Fused draft KV: same pool capability gate as
-        # TritonAttnBackend, but the READ translate is fused INTO
+        # Fused draft KV: the READ translate is fused INTO
         # generate_draft_decode_kv_indices (the v2p table rides into the
         # kernel), so all steps' kv_indices emerge PHYSICAL from the single
         # metadata-build/replay-prep launch. The v2p mapping is fixed across
         # the whole spec step (all alloc/free happens scheduler-side before
-        # the forward), so one pass covers every step.
+        # the forward), so one pass covers every step. Non-unified allocators
+        # have no v2p table, so this degenerates to None.
         full_mea = getattr(
             model_runner.token_to_kv_pool_allocator, "full_attn_allocator", None
         )
         self._kv_v2p_table = (
             full_mea.virtual_to_physical
-            if (
-                full_mea is not None
-                and hasattr(full_mea, "virtual_to_physical")
-                and not getattr(
-                    model_runner.token_to_kv_pool, "kv_ids_are_virtual", False
-                )
-            )
+            if full_mea is not None and hasattr(full_mea, "virtual_to_physical")
             else None
         )
         self.cuda_graph_out_cache_loc_phys: Optional[torch.Tensor] = None

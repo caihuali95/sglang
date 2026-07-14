@@ -6330,13 +6330,12 @@ class ServerArgs:
         # write/commit band translation is target-side and algorithm-agnostic.
         # This allow-list is ALSO the fused-draft-KV eligibility set:
         # EAGLE/EAGLE3 (incl. multi-layer) and DFLASH drafts fuse their KV
-        # into the full sub-pool's slot entries by default
-        # (SGLANG_DISABLE_FUSED_DRAFT_KV=1 falls back to the private pool +
-        # admission reserve); NGRAM has no draft KV to fuse.
+        # into the full sub-pool's slot entries — fusion is the only mode;
+        # NGRAM has no draft KV to fuse.
         # Everything else stays a loud error:
         # - FROZEN_KV_MTP hides inside is_eagle() — excluded by identity: its
-        #   draft aliases the TARGET pool, which the unified draft rule
-        #   (virtual-indexed private pool) has not been validated against.
+        #   draft aliases the TARGET pool, which the fused draft-KV layout
+        #   has not been validated against.
         # - STANDALONE runs a full-model draft; its pool sizing/translation
         #   story is unvalidated (and its many-layer draft would inflate the
         #   fused entry prohibitively).

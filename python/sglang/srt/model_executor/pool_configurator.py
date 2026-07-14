@@ -143,29 +143,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
-        # Target-only bytes/token (the physical pool entry), BEFORE the spec
-        # draft scalings below. The unified-pool spec admission solve
-        # (_handle_max_mamba_cache_unified) uses `_cell_size - _base_cell_size`
-        # as the draft's per-token KV cost to reserve the draft-private pool's
-        # bytes (which the scaled cell only covers for the TOKEN share, not the
-        # virtual-id overshoot backing mamba/band bytes).
-        self._base_cell_size = self._cell_size
 
-        # Fused draft KV: the draft's KV is part of the full-KV
-        # slot entry, so the per-token cell IS the fused entry — exact, from
-        # the draft's own geometry, via the same helper the physical layout
-        # uses (no drift). cell == base by construction: mamba/band bytes
-        # carry no draft backing and the admission solve's draft reserve
-        # degenerates to zero (there is no separate draft pool to back).
-        # `draft_kv_geometry is not None` <=> fusion enabled (gated in
-        # maybe_init_draft_kv_geometry); the ratio approximations below then
-        # price only the NON-fused private-pool fallback.
+        # Unified memory: the draft's KV is part of the full-KV slot entry, so
+        # the per-token cell IS the fused entry — exact, from the draft's own
+        # geometry, via the same helper the physical layout uses (no drift).
+        # `draft_kv_geometry is not None` <=> the run carries draft KV under
+        # the unified pool (gated in maybe_init_draft_kv_geometry, which
+        # raises rather than resolve nothing); the ratio approximations below
+        # then price only NON-unified runs.
         draft_kv_geometry = _resolve_fused_draft_geometry(mr)
         if draft_kv_geometry is not None and not mr.is_draft_worker:
             from sglang.srt.mem_cache.unified_memory_pool import fused_entry_bytes
 
             self._cell_size = fused_entry_bytes(self._cell_size, draft_kv_geometry)
-            self._base_cell_size = self._cell_size
             return
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.

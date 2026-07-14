@@ -304,14 +304,6 @@ class Envs:
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
-    # Escape hatch: disable fused draft KV (the draft model's KV rides inside
-    # the unified full-KV slot entry, [target KV | draft KV]) and fall back to
-    # the virtual-index-sized private draft pool + admission reserve.
-    # Default False (fusion on for the supported matrix: unified memory x
-    # EAGLE/EAGLE3/DFLASH incl. multi-layer EAGLE and DFLASH draft-window).
-    # Used for A/B and rollback;
-    # retires with the reserve path once fusion is the only mode.
-    SGLANG_DISABLE_FUSED_DRAFT_KV = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
@@ -1040,6 +1032,9 @@ def _convert_SGL_to_SGLANG():
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
+    # Fused draft KV became the only mode under the unified memory pool; the
+    # private-draft-pool fallback this disabled no longer exists.
+    _print_deprecated_env("SGLANG_DISABLE_FUSED_DRAFT_KV")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
     _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(
