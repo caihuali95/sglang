@@ -1578,14 +1578,6 @@ class Scheduler(
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
                 pop_and_process()
-                # Opportunistic flush at the disable_overlap sync boundary:
-                # forward_stream is idle (prev forward drained, next not launched),
-                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
-                if self.server_args.enable_unified_memory:
-                    try:
-                        self.token_to_kv_pool_allocator.flush_opportunistic()
-                    except Exception:
-                        pass
 
             # Launch the current batch
             if batch:
@@ -3254,31 +3246,14 @@ class Scheduler(
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
-                        if self.server_args.enable_unified_memory:
-                            # Record a `forward_done` event after the forward (before
-                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
-                            allocator = self.token_to_kv_pool_allocator
-                            forward_done = self.device_module.Event()
-                            forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(forward_done)
-                            # Write-set classification: hand the allocator this
-                            # forward's virtual out_cache_loc as a tensor ref (no GPU work).
-                            # Fused draft KV is covered by construction:
-                            # the write-set is SLOT/page-granular and the draft writes
-                            # its byte region at the SAME out_cache_loc ids the target
-                            # writes, while forward_done records after the WHOLE spec
-                            # step (multi-step draft, draft-extend, and DFLASH KV
-                            # materialization all enqueue on forward_stream inside
-                            # forward_batch_generation). Draft writes at COMMITTED
-                            # positions (draft-extend / DFLASH re-materialization)
-                            # target still-allocated pages, which are never flush
-                            # candidates — same safety argument as the target's own
-                            # accept-move destinations.
-                            allocator.set_inflight_forward(
-                                forward_done,
-                                batch.out_cache_loc,
-                            )
+                        # Allocator lifecycle: the forward's kernels are all
+                        # enqueued at this point, and nothing else (frees of
+                        # the previous batch, new allocations) has run yet —
+                        # allocators that relocate pages under in-flight
+                        # forwards rely on being told HERE (base no-op).
+                        self.token_to_kv_pool_allocator.on_forward_launched(
+                            self.forward_stream, batch.out_cache_loc
+                        )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
@@ -3531,19 +3506,9 @@ class Scheduler(
         if not self.is_fully_idle():
             return
 
-        if self.server_args.enable_unified_memory:
-            try:
-                # Park an unpinned spec-state band while fully idle:
-                # its bytes flow back to the end pools until the next decode
-                # step re-places it. Mamba composite only (SWA has no band).
-                park_spec_state_band = getattr(
-                    self.token_to_kv_pool_allocator, "park_spec_state_band", None
-                )
-                if park_spec_state_band is not None:
-                    park_spec_state_band()
-                self.token_to_kv_pool_allocator.flush_opportunistic()
-            except Exception:
-                pass
+        # Idle housekeeping for allocators that defer work while running (the
+        # unified memory pool compacts its lazy holes here); no-op otherwise.
+        self.token_to_kv_pool_allocator.on_idle_proceed()
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).

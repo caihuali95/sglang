@@ -2389,13 +2389,6 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return False
         return band.place_band(0)
 
-    def park_spec_state_band(self) -> None:
-        """Idle housekeeping: park an unpinned band so its bytes
-        flow back to the end pools while nothing is running. Called from
-        `Scheduler.on_idle` — NOT per scheduler loop, or a continuously
-        decoding band would churn park→re-place every step."""
-        self._reclaim_spec_state_band()
-
     def _alloc_with_spec_band_reclaim(self, alloc_fn):
         """Run `alloc_fn`; on shortfall, park an unpinned spec-state band
         (zero-copy) and retry exactly once. One helper so every composite
@@ -2520,6 +2513,33 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     # -- Lazy compaction hooks --
 
+    def on_forward_launched(
+        self,
+        forward_stream: torch.Stream,
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        """Arm lazy compaction's write-race defense for the just-launched forward.
+
+        Records `forward_done` at the current tail of ``forward_stream`` — the
+        scheduler calls this hook after `forward_batch_generation` has enqueued
+        the WHOLE step, so for a speculative step the event covers the
+        multi-step draft, draft-extend, and DFLASH KV materialization too. The
+        event gates when a compaction-moved page's SOURCE may be reused
+        (readers must have drained); the write-set keeps the forward's own
+        write pages out of `_flush`'s move candidates entirely.
+
+        Fused draft KV is covered by construction: the write-set is SLOT/page-
+        granular and the draft writes its byte region at the SAME
+        `out_cache_loc` ids the target writes. Draft writes at COMMITTED
+        positions (draft-extend / DFLASH re-materialization) target
+        still-allocated pages, which are never flush candidates — the same
+        safety argument as the target's own accept-move destinations.
+        """
+        forward_done = torch.get_device_module(self.device).Event()
+        forward_done.record(forward_stream)
+        self.set_latest_forward_done_event(forward_done)
+        self.set_inflight_forward(forward_done, out_cache_loc)
+
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
         with record_function("UnifiedMambaAlloc.set_latest_forward_done_event"):
@@ -2541,13 +2561,13 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
             self.mamba_allocator.set_inflight_forward(forward_done, None)
 
+    def on_idle_proceed(self) -> None:
+        """Idle housekeeping: compact lazy holes while nothing is running."""
+        self.flush_opportunistic()
+
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free. Composite empty-set
-        fast-path skips both calls when neither side has work. Does NOT touch
-        the spec-state band: this runs every scheduler loop, and parking a
-        continuously-decoding band here would churn park→re-place per step —
-        idle parking is `park_spec_state_band` (Scheduler.on_idle), and
-        under-pressure parking is the alloc-shortfall reclaim.
+        fast-path skips both calls when neither side has work.
         """
         with record_function("UnifiedMambaAlloc.flush_opportunistic"):
             fa = self.full_attn_allocator
@@ -3066,6 +3086,21 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- Lazy compaction hooks --
 
+    def on_forward_launched(
+        self,
+        forward_stream: torch.Stream,
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        """Arm lazy compaction's write-race defense for the just-launched
+        forward. Same contract as the Mamba composite's hook (see it for the
+        event/write-set semantics and the fused-draft-KV coverage argument);
+        here both sub-pools derive their write-sets from `out_cache_loc`, each
+        via its own v2p."""
+        forward_done = torch.get_device_module(self.device).Event()
+        forward_done.record(forward_stream)
+        self.set_latest_forward_done_event(forward_done)
+        self.set_inflight_forward(forward_done, out_cache_loc)
+
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
         with record_function("UnifiedSWAAlloc.set_latest_forward_done_event"):
@@ -3088,6 +3123,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.set_inflight_forward(
                 forward_done, out_cache_loc_virtual
             )
+
+    def on_idle_proceed(self) -> None:
+        """Idle housekeeping: compact lazy holes while nothing is running."""
+        self.flush_opportunistic()
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free. Composite empty-set

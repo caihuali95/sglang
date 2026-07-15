@@ -885,12 +885,13 @@ class ModelRunnerKVCacheMixin:
         if self._init_unified_draft_pool():
             return
 
-        # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
-        # from one byte buffer, then return. Gated to the target worker
-        # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
+        # Unified-pool fast path: build req_to_token + token_to_kv pool +
+        # allocator, then return. Gated to the target worker (req_to_token_pool
+        # is None; PD disaggregation is already rejected at argument parsing).
+        # Supports hybrid Mamba and hybrid SWA (not DSV4); everything else fails
+        # loud.
         if (
             self.server_args.enable_unified_memory
-            and self.server_args.disaggregation_mode == "null"
             and self.req_to_token_pool is None
         ):
             if self.mambaish_config is not None:
@@ -899,36 +900,16 @@ class ModelRunnerKVCacheMixin:
             if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 self._init_unified_swa_pools(max_num_reqs)
                 return
-            if (
-                self.use_mla_backend
-                or is_deepseek_v4(self.model_config.hf_config)
-            ):
-                # MLA-family / DSV4: their pool stacks (latent KV,
-                # compress-state rings) have no unified layout yet — fail
-                # loud, not silently fall through.
-                raise ValueError(
-                    "--enable-unified-memory does not support MLA-family or "
-                    "DeepSeek-V4 models yet; the current model "
-                    f"({self.model_config.hf_config.architectures}) is one. "
-                    "Drop --enable-unified-memory for this model."
-                )
-            # NON-HYBRID dense model: a single KV pool has nothing to share, so
-            # the unified machinery (virtual-id translation) would be pure
-            # overhead. Gracefully fall back to the standard pools/allocators —
-            # keeping the page-major envelope KV layout, which works for a
-            # single pool with identity addressing
-            # (enable_page_major_kv_layout stays True; the standard path picks
-            # PageMajorMHATokenToKVPool). Flip the flag so the scheduler's
-            # unified-only allocator hooks (flush_opportunistic /
-            # set_inflight_forward) see the real mode.
-            logger.warning(
-                "[unified-memory-pool] %s is not a hybrid model; falling back "
-                "to standard pools/allocators with the page-major envelope KV "
-                "layout (no virtual-id translation). Speculative decoding uses "
-                "the standard path.",
-                self.model_config.hf_config.architectures,
+            raise ValueError(
+                "--enable-unified-memory requires a hybrid model "
+                "(full-attention + Mamba-family state, or full + sliding-"
+                "window KV); the current model "
+                f"({self.model_config.hf_config.architectures}) is not one "
+                "(dense, MLA-family, and DeepSeek-V4 models are unsupported, "
+                "and --disable-hybrid-swa-memory disables the SWA pairing). "
+                "Drop --enable-unified-memory for this model — plain "
+                "--enable-page-major-kv-layout still works."
             )
-            self.server_args.enable_unified_memory = False
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:

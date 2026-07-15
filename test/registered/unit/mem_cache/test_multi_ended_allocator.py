@@ -3192,18 +3192,22 @@ class TestUnifiedMambaCompositeWithBand(CpuPoolTestCase):
         self.assertEqual(comp_off.spec_band_full_token_cost(), 0)
 
     def test_flush_opportunistic_does_not_park_band(self):
-        # Per-loop flushes must not churn a live band (review finding #5);
-        # parking is the explicit on_idle hook.
+        # Flushes must not churn a live band: they can run every scheduler
+        # loop, and a continuously-decoding band would park->re-place per
+        # step. Parking happens ONLY on alloc shortfall
+        # (_reclaim_spec_state_band, wired into every full-KV and mamba-slot
+        # alloc path); there is no idle-time parking.
         _, comp, _ = self._make()
         self.assertTrue(comp.place_spec_state_band(4))
         comp.flush_opportunistic()
         self.assertEqual(comp.spec_state_allocator.num_placed_slots, 4)
-        comp.park_spec_state_band()
+        self.assertTrue(comp._reclaim_spec_state_band())
         self.assertEqual(comp.spec_state_allocator.num_placed_slots, 0)
-        # A pinned band survives even the explicit park.
+        # A pinned band survives even the shortfall reclaim: a verify batch is
+        # in flight, so its scratch must not be pulled out from under it.
         self.assertTrue(comp.place_spec_state_band(3))
         comp.pin_spec_state_band()
-        comp.park_spec_state_band()
+        self.assertFalse(comp._reclaim_spec_state_band())
         self.assertEqual(comp.spec_state_allocator.num_placed_slots, 3)
 
 
