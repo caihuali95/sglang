@@ -1383,7 +1383,6 @@ def init_unified_mamba_pools(
     speculative_num_draft_tokens: Optional[int],
     disable_overlap_schedule: bool,
     need_sort: bool,
-    mamba_full_memory_ratio: Optional[float] = None,  # informational only
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     spec_state_size: Optional[int] = None,
@@ -1559,12 +1558,6 @@ def init_unified_mamba_pools(
         max_num_reqs,
         speculative_num_draft_tokens,
     )
-    if mamba_full_memory_ratio is not None:
-        logger.info(
-            "[unified-memory-pool]   mamba_full_memory_ratio=%s governs the total budget only, "
-            "not the runtime split.",
-            mamba_full_memory_ratio,
-        )
     logger.info(
         "[unified-memory-pool] ============================================================"
     )
@@ -1853,8 +1846,15 @@ def init_unified_swa_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     draft_kv_geometry: Optional[MHARegionGeometry] = None,
+    total_bytes: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
-    """Build the SWA-hybrid unified-memory-pool stack."""
+    """Build the SWA-hybrid unified-memory-pool stack.
+
+    `total_bytes`, when given, is the buffer's byte budget DIRECTLY (the
+    ratio-free path: the token counts are feasibility/label values,
+    not a partition — re-summing them would silently re-derive a split that
+    no longer means anything). When None, fall back to re-summing the counts
+    (legacy callers and unit tests)."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
         UnifiedSWATokenToKVPoolAllocator,
     )
@@ -1893,10 +1893,11 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
-    total_bytes = (
-        full_max_total_num_tokens * full_spec.entry_bytes()
-        + swa_max_total_num_tokens * swa_spec.entry_bytes()
-    )
+    if total_bytes is None:
+        total_bytes = (
+            full_max_total_num_tokens * full_spec.entry_bytes()
+            + swa_max_total_num_tokens * swa_spec.entry_bytes()
+        )
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],

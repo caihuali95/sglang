@@ -789,6 +789,16 @@ class TestUnifiedSWATokenToKVPoolAllocator(CpuPoolTestCase):
             n_full_slots=48, n_swa_slots=24, full_layer_num=3, swa_layer_num=3
         )
         live = []  # list of (virtual-id tensor)
+        # Independent conservation ledger. The dynamic leak totals are
+        # `size_x = schedulable_x + allocated_count()` BY CONSTRUCTION, so
+        # asserting that identity against the allocator's own views would be
+        # a tautology — the checker's invariant genuinely reduces to
+        # `allocated == live tokens the RADIX layer believes it holds`, and
+        # this ledger plays the radix layer's role: it must match
+        # `allocated_count()` on both sides after every op, under holes,
+        # compaction, borrowing, and one-sided free_swa.
+        full_live_tokens = 0
+        swa_live_tokens = 0
         for _ in range(400):
             r = rng.random()
             if r < 0.5 or not live:  # alloc
@@ -796,10 +806,15 @@ class TestUnifiedSWATokenToKVPoolAllocator(CpuPoolTestCase):
                 v = self._alloc(allocator, kvcache, n)
                 if v is not None:
                     live.append(("live", v))
+                    full_live_tokens += int(v.numel())
+                    swa_live_tokens += int(v.numel())
             elif r < 0.8:  # composite free
                 idx = rng.randrange(len(live))
                 kind, v = live.pop(idx)
                 self._free(allocator, kvcache, v)
+                full_live_tokens -= int(v.numel())
+                if kind == "live":  # swa side already released for tombstones
+                    swa_live_tokens -= int(v.numel())
             else:  # free_swa on some entries
                 idx = rng.randrange(len(live))
                 kind, v = live[idx]
@@ -810,6 +825,7 @@ class TestUnifiedSWATokenToKVPoolAllocator(CpuPoolTestCase):
                 kvcache.swa_kv_pool.buf[swa_phys] = -1
                 allocator.free_swa(v)
                 live[idx] = ("swa_tomb", v)
+                swa_live_tokens -= int(v.numel())
             # Invariants after every op.
             self._check_sub_pool_invariants(
                 allocator.full_attn_allocator, kvcache.full_kv_pool
@@ -817,25 +833,133 @@ class TestUnifiedSWATokenToKVPoolAllocator(CpuPoolTestCase):
             self._check_sub_pool_invariants(
                 allocator.swa_attn_allocator, kvcache.swa_kv_pool
             )
-            # Slot-conservation invariant balances at all times. NOTE: the
-            # leak view is now `_conserve_*` — the public `full/swa_available_size()`
-            # returns `min(conserve, schedulable)` (physical), which can be
-            # strictly smaller (e.g. the reserved sink page).
+            # Conservation vs the INDEPENDENT ledger (see above).
             self.assertEqual(
-                allocator._conserve_full_available_size(),
-                allocator._full_max_total_num_tokens
-                - allocator.full_attn_allocator.allocated_count(),
+                allocator.full_attn_allocator.allocated_count(), full_live_tokens
             )
             self.assertEqual(
-                allocator._conserve_swa_available_size(),
-                allocator._swa_max_total_num_tokens
-                - allocator.swa_attn_allocator.allocated_count(),
+                allocator.swa_attn_allocator.allocated_count(), swa_live_tokens
             )
         # Drain.
         for _, v in live:
             self._free(allocator, kvcache, v)
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    # 6b. Cross-charge admission soundness (mechanical byte-conservation check).
+    def test_swa_cross_charge_admission_soundness(self):
+        """Admitting under the CROSS-CHARGED full-token budget — each request
+        charged `T + swa_full_token_cost(S)` — never promises more than the
+        composite can actually allocate; the naive dual per-side budget (no
+        cross-charge) provably over-admits, because both per-side views credit
+        the SAME shared gap. This is the soundness job the deleted
+        `min(conserve, schedulable)` caps used to do."""
+        REQ_TOKENS = 4
+        pool, allocator, kvcache = self._build(
+            n_full_slots=64, n_swa_slots=64, full_layer_num=4, swa_layer_num=2
+        )
+        # The composite allocates every token on BOTH sides: T = S = n.
+        rem_total = allocator.full_available_size()
+        naive_k = min(
+            allocator.full_available_size() // REQ_TOKENS,
+            allocator.swa_available_size() // REQ_TOKENS,
+        )
+        charge = REQ_TOKENS + allocator.swa_full_token_cost(REQ_TOKENS)
+        # e_swa < e_full here (2 vs 4 layers), so the cross-charge is a real,
+        # non-trivial surcharge (ceil(n/2)) — the test dies if it degrades to 0.
+        self.assertGreater(allocator.swa_full_token_cost(REQ_TOKENS), 0)
+        sound_k = rem_total // charge
+        self.assertLess(sound_k, naive_k, "naive dual budget must over-promise")
+
+        # Every cross-charge-admitted request must be allocatable.
+        live = []
+        for i in range(sound_k):
+            v = self._alloc(allocator, kvcache, REQ_TOKENS)
+            self.assertIsNotNone(
+                v, f"request {i}/{sound_k} admitted by the cross-charged "
+                f"budget failed to allocate — the charge under-prices"
+            )
+            live.append(v)
+        # ... and the naive count must NOT be (the shared gap was promised
+        # twice): keep allocating up to naive_k and require a shortfall.
+        over_admitted_ok = 0
+        for _ in range(naive_k - sound_k):
+            v = self._alloc(allocator, kvcache, REQ_TOKENS)
+            if v is None:
+                break
+            live.append(v)
+            over_admitted_ok += 1
+        self.assertLess(
+            over_admitted_ok,
+            naive_k - sound_k,
+            "the naive per-side budgets were fully allocatable — then the "
+            "cross-charge is stricter than physics and over-reserves",
+        )
+        for v in live:
+            self._free(allocator, kvcache, v)
+
+    # 6c. Eviction sizing must use the JOINT view.
+    def test_swa_evict_sizing_uses_joint_view(self):
+        """`evict_from_tree_cache` sized SWA eviction from the per-side views;
+        under the unified composite both views alias the SAME gap, so a state
+        with each side individually >= need but joint < need evicted NOTHING
+        and the caller's alloc died on the fail-loud shortfall. The unified
+        branch must size (and re-check) against the joint `available_size()`."""
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        _, allocator, kvcache = self._build(
+            n_full_slots=64, n_swa_slots=64, full_layer_num=3, swa_layer_num=3
+        )
+
+        # Fill most of the pool, keep a handle on evictable "radix" entries.
+        held = []
+        while True:
+            v = self._alloc(allocator, kvcache, 4)
+            if v is None or allocator.available_size() < 16:
+                if v is not None:
+                    held.append(v)
+                break
+            held.append(v)
+
+        outer = self
+
+        class _FakeTree:
+            """Minimal radix stand-in: evict(params) frees held entries."""
+
+            def __init__(self, alloc):
+                self.token_to_kv_pool_allocator = alloc
+                self.evict_calls = []
+
+            def is_chunk_cache(self):
+                return False
+
+            def full_evictable_size(self):
+                return sum(int(v.numel()) for v in held)
+
+            def swa_evictable_size(self):
+                return sum(int(v.numel()) for v in held)
+
+            def evict(self, params):
+                self.evict_calls.append(params)
+                freed = 0
+                while held and freed < params.num_tokens:
+                    v = held.pop()
+                    freed += int(v.numel())
+                    outer._free(allocator, kvcache, v)
+
+        tree = _FakeTree(allocator)
+        need = allocator.available_size() + 8  # joint shortfall by construction
+        # Per-side views may each exceed `need` (they price the gap at their
+        # own entry size); the joint view must drive the eviction anyway.
+        evict_from_tree_cache(tree, need)
+        self.assertGreater(len(tree.evict_calls), 0, "joint shortfall not seen")
+        self.assertGreaterEqual(
+            allocator.available_size(),
+            need,
+            "eviction under-sized: the subsequent alloc would hit the "
+            "fail-loud extend shortfall",
+        )
+        self.assertIsNotNone(self._alloc(allocator, kvcache, need))
 
     # 7. Joint byte-budget pre-check.
     def test_swa_joint_byte_budget_pre_check(self):
@@ -1706,9 +1830,11 @@ class TestPagedMultiEndedAllocator(CpuPoolTestCase):
         self.assertEqual(full_alloc._allocated_pages(), 2)
 
     # 14. REGRESSION: the leak-invariant terms used by the
-    # scheduler runtime checker must all be in TOKENS. Specifically
-    # `full_available_size() + allocated_tokens == static_cap` must hold for
-    # the SWA composite.
+    # scheduler runtime checker must all be in TOKENS. Specifically the
+    # dynamic self-canceling identity `size_x == full/swa_available_size() +
+    # allocated_count()` must hold in token units for the SWA composite (a
+    # page-count drop anywhere in the chain shows up as a spurious
+    # "pool memory leak detected" crash).
     def test_paged_swa_full_available_size_in_tokens(self):
         from sglang.srt.mem_cache.multi_ended_allocator import (
             UnifiedSWATokenToKVPoolAllocator,
@@ -1755,39 +1881,43 @@ class TestPagedMultiEndedAllocator(CpuPoolTestCase):
             need_sort=False,
             forward_stream=None,
         )
-        # Idle: conserve view == cap (in tokens). (The leak invariant reads
-        # `_conserve_*`; the public `full/swa_available_size()` is now
-        # `min(conserve, schedulable)` and may be smaller — reserved sink page.)
-        self.assertEqual(allocator._conserve_full_available_size(), full_max)
-        self.assertEqual(allocator._conserve_swa_available_size(), swa_max)
+        # Idle: the dynamic totals equal the available views (nothing
+        # allocated), and everything is in TOKENS. The self-canceling
+        # identity `size_x == available_x + allocated_x` must hold at every
+        # step — the checker's leak equation collapses onto it.
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.size_full, allocator.full_available_size())
+        self.assertEqual(allocator.size_swa, allocator.swa_available_size())
+        idle_size_full = allocator.size_full
 
         # Alloc 2 pages = 2*PS tokens.
         v = allocator.alloc(2 * PS)
         self.assertIsNotNone(v)
 
-        # conserve view must drop by 2*PS TOKENS, not by 2 (pages).
+        # allocated_count must rise by 2*PS TOKENS, not by 2 (pages), and the
+        # identity must keep balancing in token units.
         self.assertEqual(
-            allocator._conserve_full_available_size(),
-            full_max - 2 * PS,
-            "REGRESSION: the conserve view must drop by token-count, "
-            "not page-count. A 'pool memory leak detected' crash is "
-            "caused by a page-count drop here.",
+            allocator.full_attn_allocator.allocated_count(),
+            2 * PS,
+            "REGRESSION: allocated_count must be token-granular. A "
+            "'pool memory leak detected' crash is caused by a page-count "
+            "value here.",
+        )
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 2 * PS)
+        self.assertEqual(
+            allocator.size_full,
+            allocator.full_available_size()
+            + allocator.full_attn_allocator.allocated_count(),
         )
         self.assertEqual(
-            allocator._conserve_swa_available_size(),
-            swa_max - 2 * PS,
+            allocator.size_swa,
+            allocator.swa_available_size()
+            + allocator.swa_attn_allocator.allocated_count(),
         )
-
-        # First-principles leak invariant: at this point, allocated tokens
-        # are all "live" (no eviction yet). So:
-        #   total = conserve + allocated_tokens
-        # where allocated_tokens = full_max - conserve.
-        allocated_tokens = full_max - allocator._conserve_full_available_size()
-        self.assertEqual(allocated_tokens, 2 * PS)
-        self.assertEqual(
-            allocated_tokens + allocator._conserve_full_available_size(),
-            full_max,
-        )
+        # Both regions of the fresh allocation came out of the shared buffer,
+        # so the dynamic full total shrinks by the SWA side's byte share
+        # (2*PS swa tokens priced in full-token units) — never grows.
+        self.assertLessEqual(allocator.size_full, idle_size_full)
 
     # 15. REGRESSION: UnifiedMambaTokenToKVPoolAllocator.size
     # must be TOTAL TOKENS (available + allocated, both in tokens). At

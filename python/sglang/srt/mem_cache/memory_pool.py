@@ -937,7 +937,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 mid = self.mamba_allocator.alloc(1)
                 assert (
                     mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                ), f"Not enough space for mamba cache, try to increase --max-mamba-cache-size, --mamba-full-memory-ratio (static partition) or --mem-fraction-static (unified memory). {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
                 # GDN ReplaySSM: a freshly (re)assigned slot starts an empty

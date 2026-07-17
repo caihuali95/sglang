@@ -64,6 +64,8 @@ def _make_model_runner(
     disaggregation_mode="null",
     max_running_requests=None,
     disaggregation_decode_extra_slots=0,
+    enable_unified_memory=False,
+    context_len=8192,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -96,6 +98,7 @@ def _make_model_runner(
     mc.get_num_kv_heads = lambda tp_size: num_kv_heads
     mc.get_swa_num_kv_heads = lambda tp_size: swa_num_kv_heads or num_kv_heads
     mc.hf_config = SimpleNamespace(architectures=["LlamaForCausalLM"])
+    mc.context_len = context_len
     mr.model_config = mc
 
     mr.kv_cache_dtype = "fake_bf16"
@@ -116,6 +119,7 @@ def _make_model_runner(
     sa.disaggregation_mode = disaggregation_mode
     sa.max_running_requests = max_running_requests
     sa.disaggregation_decode_extra_slots = disaggregation_decode_extra_slots
+    sa.enable_unified_memory = enable_unified_memory
     mr.server_args = sa
 
     spec = MagicMock()
@@ -530,6 +534,178 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+
+class TestUnifiedSWASizing(unittest.TestCase):
+    """Ratio-free sizing: under --enable-unified-memory the hybrid
+    SWA configurator prices NOTHING by swa_full_tokens_ratio. The buffer is a
+    direct byte budget (unified_total_bytes); max_total_num_tokens is the
+    single-request feasibility bound (a lone max-length request must
+    fit — full KV + one request's peak swa floor <= B); swa_max is a
+    metrics-label estimate, not a partition."""
+
+    WINDOW = 128
+    CHUNK = 512
+    PAGE = 16
+    B = 1 << 28  # 256 MiB
+
+    def _mr(self, **kw):
+        defaults = dict(
+            num_layers=8,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(4)),
+            swa_attention_layer_ids=list(range(4, 8)),
+            sliding_window_size=self.WINDOW,
+            chunked_prefill_size=self.CHUNK,
+            enable_unified_memory=True,
+            context_len=8192,
+            swa_full_tokens_ratio=0.5,
+        )
+        defaults.update(kw)
+        return _make_model_runner(**defaults)
+
+    def _entries(self, mr):
+        e_f = _full_per_token(mr) * len(mr.model_config.full_attention_layer_ids)
+        e_s = _swa_per_token(mr) * len(mr.model_config.swa_attention_layer_ids)
+        return e_f, e_s
+
+    def test_feasibility_and_ratio_free(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+        )
+
+        with mock_cpu_env():
+            mr = self._mr()
+            cfg = HybridSWAPoolConfigurator(mr).calculate_pool_sizes(
+                self.B, self.PAGE
+            )
+        e_f, e_s = self._entries(mr)
+        # Byte budget passes through DIRECTLY.
+        self.assertEqual(cfg.unified_total_bytes, self.B)
+        # Feasibility: a lone max-length request fits — its full KV
+        # plus one request's swa floor stays within the budget.
+        # floor = 2W + 2*C + interval(4)*1 + 3p (spec off, overlap on).
+        floor = min(8192, 2 * self.WINDOW + 2 * self.CHUNK + 4 + 3 * self.PAGE)
+        self.assertLessEqual(
+            cfg.max_total_num_tokens * e_f + floor * e_s, self.B
+        )
+        # Page-aligned; full == max_total.
+        self.assertEqual(cfg.max_total_num_tokens % self.PAGE, 0)
+        self.assertEqual(cfg.full_max_total_num_tokens, cfg.max_total_num_tokens)
+        # STRICTLY beats the ratio pricing: the old cell was
+        # e_f + 0.5*e_s per token.
+        ratio_tokens = int(self.B // (e_f + 0.5 * e_s))
+        self.assertGreater(cfg.max_total_num_tokens, ratio_tokens)
+        # The label is a sane usage denominator: at least the floor, at most
+        # the whole budget priced at e_s.
+        self.assertGreaterEqual(cfg.swa_max_total_num_tokens, floor - self.PAGE)
+        self.assertLessEqual(cfg.swa_max_total_num_tokens, self.B // e_s)
+
+    def test_window_ge_context_prices_jointly(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+        )
+
+        # Small budget + window >= context: the floor IS a whole request, and
+        # (B - floor*e_s)//e_f < floor, so the solver must fall back to
+        # pricing every token jointly (each occupies BOTH sides forever).
+        b_small = 24 << 20  # 24 MiB
+        with mock_cpu_env():
+            mr = self._mr(sliding_window_size=1 << 20, context_len=4096)
+            cfg = HybridSWAPoolConfigurator(mr).calculate_pool_sizes(
+                b_small, self.PAGE
+            )
+        e_f, e_s = self._entries(mr)
+        expect = (int(b_small // (e_f + e_s)) // self.PAGE) * self.PAGE
+        self.assertEqual(cfg.max_total_num_tokens, expect)
+        # Sanity: the fallback branch was actually exercised.
+        floor = 4096  # min(context, huge window terms)
+        self.assertLess(int((b_small - floor * e_s) // e_f), floor)
+
+    def test_odd_byte_budget_is_aligned(self):
+        """REGRESSION: the profiled byte budget is an arbitrary
+        integer (odd about half the time); the raw buffer is view()'d as the
+        store dtype, so an unaligned total crashes at boot ("size must be
+        divisible by 2 to view Byte as BFloat16"). The solver must align the
+        budget down before recording it."""
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+        )
+
+        with mock_cpu_env():
+            mr = self._mr()
+            configurator = HybridSWAPoolConfigurator(mr)
+            for odd_b in (self.B + 1, self.B + 4095, 65655380377 % (1 << 30) | 1):
+                cfg = configurator.calculate_pool_sizes(odd_b, self.PAGE)
+                self.assertEqual(cfg.unified_total_bytes % 4096, 0)
+                self.assertLessEqual(cfg.unified_total_bytes, odd_b)
+
+    def test_chunked_prefill_disabled_prices_jointly(self):
+        """chunked_prefill_size = -1 (the DISABLE sentinel) means the whole
+        prompt lands in one forward — a request's swa peak is its full length,
+        so the floor must clamp to context (joint pricing), not go negative
+        through the sentinel."""
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+        )
+
+        with mock_cpu_env():
+            mr = self._mr(chunked_prefill_size=-1, context_len=2048)
+            cfg = HybridSWAPoolConfigurator(mr).calculate_pool_sizes(
+                self.B, self.PAGE
+            )
+        e_f, e_s = self._entries(mr)
+        # floor clamps at context=2048; feasibility must hold against it.
+        self.assertLessEqual(cfg.max_total_num_tokens * e_f + 2048 * e_s, self.B)
+        # And the floor is NOT the tiny no-chunk residual (2W + interval + 3p):
+        # that under-estimate would admit a max_total whose lone request
+        # cannot fit its own prefill on the swa side.
+        under = 2 * self.WINDOW + 4 + 3 * self.PAGE
+        self.assertGreater(2048, under)  # the regimes genuinely differ
+        bad_max = (int((self.B - under * e_s) // e_f) // self.PAGE) * self.PAGE
+        self.assertLess(cfg.max_total_num_tokens, bad_max)
+
+    def test_constraint_path_round_trip(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+        )
+
+        with mock_cpu_env():
+            mr = self._mr()
+            configurator = HybridSWAPoolConfigurator(mr)
+            want = 4096
+            cfg = configurator.calculate_pool_sizes_from_max_tokens(
+                want, self.PAGE
+            )
+        e_f, e_s = self._entries(mr)
+        # The derived byte budget backs the requested count (within a page of
+        # alignment) and the re-solve reproduces it.
+        self.assertGreaterEqual(cfg.max_total_num_tokens, want - self.PAGE)
+        self.assertLessEqual(cfg.max_total_num_tokens, want)
+        self.assertGreaterEqual(
+            cfg.unified_total_bytes, cfg.max_total_num_tokens * e_f
+        )
+
+    def test_non_unified_keeps_ratio_verbatim(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            HybridSWAPoolConfigurator,
+        )
+
+        with mock_cpu_env():
+            mr = self._mr(enable_unified_memory=False)
+            cfg = HybridSWAPoolConfigurator(mr).calculate_pool_sizes(
+                self.B, self.PAGE
+            )
+        e_f, e_s = self._entries(mr)
+        # Upstream-verbatim: cell = e_f + ratio*e_s, swa = ratio*full, and no
+        # byte budget is recorded.
+        expect_full = (int(self.B // (e_f + 0.5 * e_s)) // self.PAGE) * self.PAGE
+        self.assertEqual(cfg.max_total_num_tokens, expect_full)
+        self.assertEqual(
+            cfg.swa_max_total_num_tokens,
+            (int(expect_full * 0.5) // self.PAGE) * self.PAGE,
+        )
+        self.assertIsNone(cfg.unified_total_bytes)
 
 
 class TestFactory(unittest.TestCase):

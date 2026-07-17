@@ -63,6 +63,13 @@ class MemoryPoolConfig:
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
 
+    # Unified memory pool (hybrid SWA): the byte budget the shared buffer is
+    # allocated with DIRECTLY. When set, the factory must NOT re-sum the token
+    # counts above into bytes — the counts are feasibility/label values (the
+    # per-request clamp and the usage denominators), not a partition, and the
+    # runtime split across the buffer is fully dynamic.
+    unified_total_bytes: Optional[int] = None
+
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
     c128_max_total_num_tokens: int = 0
@@ -371,6 +378,11 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # this configurator had no draft scaling at all, which could OOM on
         # SWA-hybrid x spec. The non-fused fallback stays upstream-verbatim by
         # design. `draft_kv_geometry is not None` <=> fusion enabled.
+        # `_full_entry_bytes` is the SINGLE full-side per-token price (fused
+        # when applicable) used by every byte computation below and in the
+        # ChunkCap subclass — the ratio cell is priced from it too.
+        self._full_entry_bytes = self._full_per_token * self._full_layers_num
+        self._swa_entry_bytes = self._swa_per_token * self._swa_layers_num
         draft_kv_geometry = _resolve_fused_draft_geometry(mr)
         if (
             draft_kv_geometry is not None
@@ -379,15 +391,77 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         ):
             from sglang.srt.mem_cache.unified_memory_pool import fused_entry_bytes
 
-            fused_full_per_token = fused_entry_bytes(
+            self._full_entry_bytes = fused_entry_bytes(
                 self._full_per_token * self._full_layers_num, draft_kv_geometry
             )
             self._cell_size = (
-                fused_full_per_token
+                self._full_entry_bytes
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num
             )
+
+        # Unified memory pool: the boot split is NOT a runtime partition (the
+        # buffer's frontiers float), so the ratio guess is replaced by a
+        # FEASIBILITY-derived pair: max_total_num_tokens is the largest
+        # single-request full-side length that provably fits alongside one
+        # request's peak swa occupancy (the per-request
+        # max_new_tokens clamp keys off it, and the retract loop's terminal
+        # bs=1 state must be feasible — an under-estimate is a livelock, not
+        # a perf bug). Precompute the page-independent floor terms here;
+        # `calculate_pool_sizes` adds the page margins.
+        self._unified = (
+            getattr(mr.server_args, "enable_unified_memory", False)
+            and self._full_layers_num > 0
+        )
+        if self._unified:
+            sa = mr.server_args
+            self._context_len = mr.model_config.context_len
+            window = mr.sliding_window_size or 0
+            draft_tokens = sa.speculative_num_draft_tokens or 1
+            eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+            if sa.speculative_algorithm is None:
+                # +page added at calculate time (page-dependent).
+                decode_alloc = 0
+            elif sa.disable_overlap_schedule:
+                decode_alloc = spec_decode_alloc_len_per_request(sa)
+            else:
+                decode_alloc = 2 * get_alloc_len_per_decode(sa)
+            chunks_in_flight = 1 if sa.disable_overlap_schedule else 2
+            chunk = sa.chunked_prefill_size or 0
+            if chunk <= 0:
+                # Chunked prefill DISABLED (-1 sentinel / None): the whole
+                # prompt lands in ONE forward, so a request's swa peak is its
+                # full length — substitute the context so the min(context, …)
+                # clamp takes over (degrades to joint pricing; sound).
+                chunk = self._context_len
+            # Peak per-request swa occupancy, page terms excluded:
+            #   2W  — the live window PLUS one radix-locked prefix window
+            #         (released only at finish by default);
+            #   chunks_in_flight * C — prefill chunks not yet tree-cached;
+            #   interval * tokens/step — out-of-window eviction backlog;
+            #   decode_alloc — spec-v2 outstanding allocation.
+            self._swa_floor_base = (
+                2 * window
+                + chunks_in_flight * chunk
+                + eviction_interval * draft_tokens
+                + decode_alloc
+            )
+            # Usage-denominator label sizing (metrics only): one request's
+            # steady-state swa footprint x an admission estimate. NOT the
+            # residual (B - full*e_f)/e_s, which is ~one request's floor and
+            # would push static-denominator usage far past 1. The 3-page term
+            # covers page-granular allocation margins per request (observed
+            # ~3 pages/req at page_size 256 under serving load — without it
+            # steady-state usage reads ~1.3).
+            self._swa_label_per_req = (
+                window
+                + eviction_interval * draft_tokens
+                + decode_alloc
+                + 3 * (mr.page_size or 1)
+            )
+            self._swa_label_reqs = sa.max_running_requests or 512
+            self._swa_label_chunk = chunks_in_flight * chunk
 
     def _solve_pool_sizes(
         self, max_total_num_tokens: int, page_size: int
@@ -426,15 +500,115 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             swa_max_total_num_tokens=swa_tokens,
         )
 
+    def _swa_floor(self, page_size: int) -> int:
+        """Peak swa tokens ONE request can hold (unified path): the base terms
+        from __init__ plus the page margins (tombstone + page-align + the
+        spec-off decode page), clamped at the context length (a window that
+        never slides caps at the whole context)."""
+        return min(
+            self._context_len,
+            self._swa_floor_base + 3 * page_size,
+        )
+
+    def _solve_unified_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        """Unified path: the buffer is ONE byte budget (`unified_total_bytes`);
+        the token counts are feasibility/label values, not a partition.
+
+        max_total_num_tokens = the largest L with L*e_full + swa_floor*e_swa
+        <= B (single-request feasibility): the
+        per-request max_new_tokens clamp keys off it, so every admissible
+        request is guaranteed schedulable alone after the retract loop drains
+        to bs=1. In the window>=context regime the floor IS the request, so
+        the joint (e_f+e_s) pricing takes over.
+        """
+
+        def align_page(x: int) -> int:
+            return (x // page_size) * page_size
+
+        # The raw unified buffer is torch.view()'d as the store dtype and
+        # sliced at page granularity — an ARBITRARY profiled byte count (odd,
+        # in practice, about half the time) crashes at boot with "size must
+        # be divisible by 2 to view Byte as BFloat16". Align the budget down
+        # to a coarse boundary every itemsize divides.
+        UNIFIED_BYTE_ALIGN = 4096
+        available_bytes = (
+            int(available_bytes) // UNIFIED_BYTE_ALIGN * UNIFIED_BYTE_ALIGN
+        )
+
+        e_f = self._full_entry_bytes
+        e_s = self._swa_entry_bytes
+        floor = self._swa_floor(page_size)
+        full_tokens = align_page(int((available_bytes - floor * e_s) // e_f))
+        if full_tokens < floor:
+            # Window (or floor) >= context regime: a request occupies both
+            # sides for its whole length; price jointly.
+            full_tokens = align_page(int(available_bytes // (e_f + e_s)))
+        if full_tokens <= 0:
+            raise RuntimeError(
+                f"Unified SWA sizing: the per-request swa floor ({floor} tokens, "
+                f"{floor * e_s / (1 << 30):.2f} GiB) leaves no room for full KV "
+                f"within {available_bytes / (1 << 30):.2f} GiB. Increase "
+                f"--mem-fraction-static or reduce --chunked-prefill-size."
+            )
+        # Metrics label only (usage denominator; the leak totals are dynamic).
+        swa_tokens = min(
+            self._swa_label_per_req * self._swa_label_reqs
+            + self._swa_label_chunk
+            + page_size,
+            int(available_bytes // e_s),
+        )
+        swa_tokens = max(align_page(int(swa_tokens)), align_page(floor), page_size)
+        logger.info(
+            "Unified SWA memory pool: byte budget %.2f GiB (runtime split fully "
+            "dynamic), single-request feasibility full_tokens=%d (swa floor "
+            "%d tokens), swa usage label=%d tokens.",
+            available_bytes / (1 << 30),
+            full_tokens,
+            floor,
+            swa_tokens,
+        )
+        return MemoryPoolConfig(
+            max_total_num_tokens=full_tokens,
+            full_max_total_num_tokens=full_tokens,
+            swa_max_total_num_tokens=swa_tokens,
+            unified_total_bytes=int(available_bytes),
+        )
+
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._unified:
+            return self._solve_unified_pool_sizes(available_bytes, page_size)
         max_total_num_tokens = int(available_bytes // self._cell_size)
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
+        if self._unified:
+            # Constraint path: invert the sizing formula to a byte budget,
+            # then re-solve so labels/clamps stay consistent. The inversion
+            # must branch on the SAME regime the solve uses — inverting the
+            # feasibility formula for a joint-regime count (want < floor)
+            # would derive a budget LARGER than the profiled bytes (boot
+            # over-commit) and re-solve to a count ABOVE the requested cap
+            # (silently violating --max-total-tokens / the PP sync min).
+            # Both branches round-trip exactly and never exceed the profiled
+            # budget the constrained count came from.
+            floor = self._swa_floor(page_size)
+            if max_total_num_tokens < floor:
+                budget = int(
+                    max_total_num_tokens
+                    * (self._full_entry_bytes + self._swa_entry_bytes)
+                )
+            else:
+                budget = int(
+                    max_total_num_tokens * self._full_entry_bytes
+                    + floor * self._swa_entry_bytes
+                )
+            return self._solve_unified_pool_sizes(budget, page_size)
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
@@ -507,7 +681,10 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
         fixed_swa_bytes = swa_tokens * self._swa_per_token * self._swa_layers_num
-        full_cell_size = self._full_per_token * self._full_layers_num
+        # `_full_entry_bytes` carries the fused draft region when applicable
+        # (pricing the plain full entry here under-counted the fused cell and
+        # over-allocated the shared buffer past the byte budget).
+        full_cell_size = self._full_entry_bytes
         full_tokens = (
             int((available_bytes - fixed_swa_bytes) // full_cell_size) // page_size
         ) * page_size

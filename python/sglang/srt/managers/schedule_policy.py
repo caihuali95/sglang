@@ -493,6 +493,25 @@ class PrefillAdder:
             self._spec_band_slot_cost = (
                 self.token_to_kv_pool_allocator.spec_band_full_token_cost()
             )
+        # Slots a fresh-state admission will consume: the active state slot,
+        # plus — when the radix tree checkpoints mamba states — the tree
+        # checkpoint `cache_unfinished_req` allocates and LOCKS while the
+        # request runs (`_alloc_mamba_slot` is a fail-loud assert, reached
+        # under load when only the active slot is charged). Deeper trees per
+        # request are covered by mamba eviction, mirroring upstream.
+        # (Read the tree cache directly: `self.is_hybrid_ssm_cache` is only
+        # assigned further down in this __init__.)
+        self._mamba_slots_per_admit = (
+            2 if self.tree_cache.supports_mamba() else 1
+        )
+        # Unified SWA joint-budget cross-charge (None on every other
+        # allocator): converts a request's swa-side byte budget into
+        # full-token-equivalents. Both per-side views alias the SAME shared
+        # gap under the unified pool, so the swa bytes must ALSO be charged
+        # against the full-token budget — see `_swa_gap_budget_for_req`.
+        self._swa_full_token_cost = getattr(
+            self.token_to_kv_pool_allocator, "swa_full_token_cost", None
+        )
         if self._spec_band_slot_cost:
             # Constant (per-pass, NOT per-request) band-page ALIGNMENT reserve.
             # `place_band`'s region ceils its low bound and floors its high bound,
@@ -691,8 +710,23 @@ class PrefillAdder:
         # mamba-slot count only for the fresh-mamba portion.
         reserve = self._spec_band_slot_cost
         if self._mamba_slot_cost and req.mamba_pool_idx is None:
-            reserve += self._mamba_slot_cost
+            # Fresh state: active slot + (radix-on) the tree checkpoint the
+            # request will lock — see `_mamba_slots_per_admit`.
+            reserve += self._mamba_slot_cost * self._mamba_slots_per_admit
         return reserve
+
+    def _swa_gap_budget_for_req(self, swa_budget_tokens: int) -> int:
+        """Shared-gap reservation (full-token-equivalents) for a request's
+        swa-side budget. Non-zero only on the unified SWA composite
+        (`swa_full_token_cost` present): there, full and swa share ONE byte
+        buffer and both per-side budget views credit the SAME gap, so a
+        request's swa bytes must also be charged against the full-token gate
+        and offsets or the dual gate promises the gap twice (over-admission →
+        fail-loud extend shortfall). Mirror of `_mamba_gap_budget_for_req`.
+        0 keeps baseline SWA (physically disjoint pools) byte-identical."""
+        if self._swa_full_token_cost is None:
+            return 0
+        return self._swa_full_token_cost(swa_budget_tokens)
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -752,11 +786,22 @@ class PrefillAdder:
             mamba_gap_reserve > self._spec_band_slot_cost
             and self.rem_mamba_slots is not None
         ):
-            self.rem_mamba_slots -= 1
+            self.rem_mamba_slots -= self._mamba_slots_per_admit
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
+            swa_budget = self._swa_budget_for_req(extend_input_len)
+            self.rem_swa_token_offset += swa_budget
+            # Unified SWA composite: the swa bytes leave the SAME shared
+            # buffer the full-token budgets are backed by — charge their
+            # full-token-equivalents to BOTH offsets (mirroring
+            # `mamba_gap_reserve` above; conservative: the full window-floored
+            # budget is charged even though only the extend part is allocated
+            # this pass — the floor part follows at decode rate). 0 on
+            # baseline SWA (disjoint pools), keeping upstream byte-identical.
+            swa_gap_reserve = self._swa_gap_budget_for_req(swa_budget)
+            self.rem_total_token_offset += swa_gap_reserve
+            self.cur_rem_token_offset += swa_gap_reserve
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -852,6 +897,21 @@ class PrefillAdder:
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
+                # Unified SWA composite: this is the one gate that DERIVES the
+                # admitted length from the budget, so the swa cross-charge must
+                # deflate the bound itself — the chunk allocates on BOTH sides
+                # of the shared buffer, and sizing it from the full-side budget
+                # alone over-promises the gap by ~len*e_swa/e_full exactly in
+                # the memory-bound truncation regime. One-shot deflation with
+                # the charge of the UNdeflated candidate is conservative
+                # (the charge is monotone in the length). 0 on baseline SWA.
+                _rem_tokens = min(
+                    _rem_tokens,
+                    int(self.rem_total_tokens)
+                    - self._swa_gap_budget_for_req(
+                        self._swa_budget_for_req(max(0, _rem_tokens))
+                    ),
+                )
                 # alloc_extend needs extend_num_tokens + page_size per request,
                 # so reserve one page here to avoid OOM
                 _rem_tokens = min(
@@ -927,12 +987,17 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
+        swa_needed = 0
+        if self.is_hybrid_swa:
+            swa_needed = self._swa_budget_for_req(cand_extend_input_len)
+            # Unified SWA: cross-charge the swa bytes into the full-token gate
+            # (0 on baseline SWA) — see _swa_gap_budget_for_req.
+            paged_input += self._swa_gap_budget_for_req(swa_needed)
         _budget_floor = min(self.cur_rem_tokens, self.rem_total_tokens)
         if paged_input > _budget_floor:
             return AddReqResult.NO_TOKEN
-        if self.is_hybrid_swa:
-            if self._swa_budget_for_req(cand_extend_input_len) > self.rem_swa_tokens:
-                return AddReqResult.NO_TOKEN
+        if self.is_hybrid_swa and swa_needed > self.rem_swa_tokens:
+            return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1073,6 +1138,15 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
+        swa_needed = 0
+        if self.is_hybrid_swa:
+            swa_needed = self._swa_budget_for_req(
+                cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+            )
+            # Unified SWA composite: the swa bytes come out of the SAME shared
+            # buffer as the full-side tokens — cross-charge them into the
+            # full-token gate too (0 on baseline SWA's disjoint pools).
+            total_tokens += self._swa_gap_budget_for_req(swa_needed)
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
@@ -1082,12 +1156,8 @@ class PrefillAdder:
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        if self.is_hybrid_swa:
-            swa_needed = self._swa_budget_for_req(
-                cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
-            )
-            if swa_needed >= self.rem_swa_tokens:
-                return AddReqResult.NO_TOKEN
+        if self.is_hybrid_swa and swa_needed >= self.rem_swa_tokens:
+            return AddReqResult.NO_TOKEN
 
         if (
             self.rem_chunk_tokens is None
@@ -1238,12 +1308,20 @@ class PrefillAdder:
         )
 
         preemptible_reqs = []
+        extend_len = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
         min_tokens_to_remove = (
-            len(req.full_untruncated_fill_ids)
-            - len(req.prefix_indices)
+            extend_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
+        if self.is_hybrid_swa:
+            # Unified SWA: the candidate's swa bytes are charged against the
+            # full-token budget too (cross-charge, 0 on baseline) — include
+            # them in the demand estimate or preemption frees too little and
+            # add_one_req re-rejects (wasted preemption, not unsoundness).
+            min_tokens_to_remove += self._swa_gap_budget_for_req(
+                self._swa_budget_for_req(extend_len)
+            )
         for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
             priority_diff = (req.priority - running_req.priority) * (-priority_sign)

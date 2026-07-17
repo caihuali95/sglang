@@ -283,16 +283,27 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        allocator = self.token_to_kv_pool_allocator
+        # Leak-invariant terms. The unified SWA composite exposes byte-
+        # coordinated `schedulable_*` views plus DYNAMIC self-canceling totals
+        # (`size_full = schedulable_full + allocated_full`, swa analogue) —
+        # available and total must come from the SAME view or the checker's
+        # identity breaks. Non-unified allocators have no `schedulable_*`
+        # accessor: their public views and static `size_full/size_swa`
+        # (== full/swa_tokens_per_layer) already satisfy the identity.
+        sched_full_fn = getattr(allocator, "schedulable_full_available_size", None)
+        if sched_full_fn is not None:
+            full_available_size = sched_full_fn()
+            swa_available_size = allocator.schedulable_swa_available_size()
+        else:
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
-        full_num_used = self.full_tokens_per_layer - (
+        full_num_used = allocator.size_full - (
             full_available_size + full_evictable_size
         )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
+        swa_num_used = allocator.size_swa - (swa_available_size + swa_evictable_size)
         # FIXME(hisparse): host-backup transiently over-releases the device pool
         # counter, producing negative full_num_used / swa_num_used. We clamp to 0
         # to keep token_usage / leak checks sane, but the underlying accounting
@@ -300,13 +311,18 @@ class SchedulerPoolStatsObserver:
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
+        # Usage DENOMINATORS deliberately stay on the static boot labels:
+        # dynamic totals shrink under deep cross-side borrowing, which would
+        # spike `token_usage` and misdrive PrefillDelayer throttling exactly
+        # when the unified pool is doing its job. num_used (= protected +
+        # session + uncached under the dynamic totals) stays an absolute count.
         if not self.full_tokens_per_layer:
             full_num_used = 0
             full_available_size = 0
             full_token_usage = 0.0
         else:
-            full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+            full_token_usage = full_num_used / max(1, self.full_tokens_per_layer)
+        swa_token_usage = swa_num_used / max(1, self.swa_tokens_per_layer)
 
         return PoolStats(
             is_hybrid_swa=True,

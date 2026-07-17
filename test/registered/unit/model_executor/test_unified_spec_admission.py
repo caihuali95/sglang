@@ -1,22 +1,25 @@
-"""Unit tests for the unified-pool speculative admission solve
+"""Unit tests for the unified-pool joint admission solve
 (`solve_unified_spec_admission` in model_runner_kv_cache_mixin.py) -- CPU
-only, pure integer arithmetic.
+only, pure integer arithmetic. Covers spec ON and spec OFF (D=0).
 
 The solve charges, per admitted request: hard mamba slots + D spec-band rows
 + a token floor priced at the fused cell (the full-KV slot entry, which
 already carries the draft's per-token bytes -- the draft KV is fused into the
 slot layout, so there is no separate draft pool and nothing else to reserve).
+At D=0 (spec OFF) every band term degenerates to exactly zero and the solve
+reduces to hard mamba slots + the token floor.
 These tests pin:
   1. the solve against a verbatim transcription of its formula (an executable
      spec: any accounting drift in either direction fails byte-exactly),
   2. boundary behavior (requested cap, explicit mamba slots, infeasible),
-  3. the radix-headroom grant's base-ratio cap.
+  3. the radix-headroom grant's base-ratio cap,
+  4. the D=0 degeneracy (band bytes exactly zero, deduction = mamba only).
 """
 
 import unittest
 
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
-    UNIFIED_SPEC_MIN_TOKENS_PER_REQ,
+    UNIFIED_MIN_TOKENS_PER_REQ,
     solve_unified_spec_admission,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,7 +44,7 @@ def _reference_solve(
     explicit_mamba_slots=None,
 ):
     """The solve's formula, transcribed verbatim as an executable spec."""
-    token_floor_bytes = UNIFIED_SPEC_MIN_TOKENS_PER_REQ * cell_size
+    token_floor_bytes = UNIFIED_MIN_TOKENS_PER_REQ * cell_size
     band_const_bytes = (1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
     per_req_bytes = (
         hard_slots + num_draft_tokens
@@ -77,7 +80,10 @@ def _reference_solve(
 QWEN_EAGLE = dict(
     mamba_bytes_per_req=49 * MIB,
     num_draft_tokens=4,
-    hard_slots=3,
+    # Floor = the FULL mamba_ratio (active + track + radix-checkpoint slots:
+    # the checkpoint slots are locked by running chunked requests, so they
+    # are part of the per-request floor, not leftover headroom).
+    hard_slots=5,
     mamba_ratio=5,
     cell_size=36864,
     margin_slots=3,
@@ -98,15 +104,42 @@ QWEN_NGRAM = dict(
     cell_size=32768,
     margin_slots=3,
 )
+# Spec-OFF cells (D=0): no draft KV in the cell, no band. The caller passes
+# the FULL mamba_ratio as the floor (active + radix-checkpoint slots; plain
+# radix ratio 3, overlap+lazy extra buffer ratio 4). disable_radix_cache is
+# ratio 1 -> floor 1 (the DFLASH cell above covers that shape).
+QWEN_SPEC_OFF = dict(
+    mamba_bytes_per_req=49 * MIB,
+    num_draft_tokens=0,
+    hard_slots=3,
+    mamba_ratio=3,
+    cell_size=32768,
+    margin_slots=3,
+)
+QWEN_SPEC_OFF_EXTRA_BUF = dict(
+    mamba_bytes_per_req=49 * MIB,
+    num_draft_tokens=0,
+    hard_slots=4,
+    mamba_ratio=4,
+    cell_size=32768,
+    margin_slots=3,
+)
 
 
 class TestUnifiedSpecAdmissionSolve(CustomTestCase):
     def test_matches_reference_formula(self):
         """Byte-exact against the transcribed formula, across fused-EAGLE,
-        fused-DFLASH and no-draft-KV cells and tight/ample/clamped budgets."""
-        for params in (QWEN_EAGLE, QWEN_DFLASH, QWEN_NGRAM):
+        fused-DFLASH, no-draft-KV and spec-OFF (D=0) cells and
+        tight/ample/clamped budgets."""
+        for params in (
+            QWEN_EAGLE,
+            QWEN_DFLASH,
+            QWEN_NGRAM,
+            QWEN_SPEC_OFF,
+            QWEN_SPEC_OFF_EXTRA_BUF,
+        ):
             for rest_gib in (2, 10, 35, 55):
-                for requested in (8, 48, 256):
+                for requested in (8, 48, 256, 4096):
                     for explicit in (None, 40):
                         kwargs = dict(
                             rest_bytes=rest_gib * GIB,
@@ -118,6 +151,8 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
                         n, mamba_slots, deducted = _reference_solve(**kwargs)
                         with self.subTest(
                             cell=params["cell_size"],
+                            d=params["num_draft_tokens"],
+                            hard=params["hard_slots"],
                             rest_gib=rest_gib,
                             requested=requested,
                             explicit=explicit,
@@ -131,6 +166,45 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
                                     rest_gib * GIB - deducted,
                                 )
 
+    def test_spec_off_degenerates_band_to_zero(self):
+        """D=0 (spec OFF): every band term is EXACTLY zero, the deduction is
+        the mamba grant alone, and the token budget is rest minus that grant.
+        This is the arithmetic contract the spec-OFF gate flip relies on."""
+        for params in (QWEN_SPEC_OFF, QWEN_SPEC_OFF_EXTRA_BUF):
+            for rest_gib, requested in ((2, 48), (35, 256), (55, 4096)):
+                a = solve_unified_spec_admission(
+                    rest_bytes=rest_gib * GIB, requested=requested, **params
+                )
+                with self.subTest(
+                    hard=params["hard_slots"],
+                    rest_gib=rest_gib,
+                    requested=requested,
+                ):
+                    self.assertGreater(a.max_num_reqs, 0)
+                    self.assertEqual(a.band_bytes, 0)
+                    self.assertEqual(
+                        a.deducted_bytes,
+                        a.mamba_slots * params["mamba_bytes_per_req"],
+                    )
+                    self.assertEqual(
+                        a.token_budget_bytes,
+                        rest_gib * GIB - a.deducted_bytes,
+                    )
+                    # The hard grant backs every admitted request's slots.
+                    self.assertEqual(
+                        a.hard_mamba_slots,
+                        a.max_num_reqs * params["hard_slots"],
+                    )
+
+    def test_spec_off_headroom_still_ratio_capped(self):
+        """The radix-headroom grant keeps its `n x mamba_ratio` cap at D=0 --
+        leftover bytes beyond it stay in the shared gap (token budget)."""
+        a = solve_unified_spec_admission(
+            rest_bytes=35 * GIB, requested=4, **QWEN_SPEC_OFF
+        )
+        self.assertEqual(a.max_num_reqs, 4)
+        self.assertEqual(a.mamba_slots, 4 * QWEN_SPEC_OFF["mamba_ratio"])
+
     def test_token_floor_fits_the_budget(self):
         """Whatever the solve admits, the per-request token floor must fit in
         the token budget it leaves behind -- the floor is a guarantee, not an
@@ -140,6 +214,8 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
             (QWEN_DFLASH, 55, 256),
             (QWEN_DFLASH, 36, 48),
             (QWEN_EAGLE, 6, 48),
+            (QWEN_SPEC_OFF, 6, 4096),
+            (QWEN_SPEC_OFF_EXTRA_BUF, 35, 4096),
         ):
             a = solve_unified_spec_admission(
                 rest_bytes=rest_gib * GIB, requested=requested, **params
@@ -148,7 +224,7 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
                 self.assertGreater(a.max_num_reqs, 0)
                 tokens = a.token_budget_bytes // params["cell_size"]
                 self.assertGreaterEqual(
-                    tokens, a.max_num_reqs * UNIFIED_SPEC_MIN_TOKENS_PER_REQ
+                    tokens, a.max_num_reqs * UNIFIED_MIN_TOKENS_PER_REQ
                 )
 
     def test_heavier_fused_cell_admits_fewer(self):
@@ -185,9 +261,9 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
             explicit_mamba_slots=30,
             **QWEN_EAGLE,
         )
-        # 30 explicit slots / 3 hard slots per request -> at most 10 admitted,
+        # 30 explicit slots / 5 floor slots per request -> at most 6 admitted,
         # and the grant itself never exceeds the explicit cap.
-        self.assertLessEqual(a.max_num_reqs, 10)
+        self.assertLessEqual(a.max_num_reqs, 6)
         self.assertLessEqual(a.mamba_slots, 30)
 
     def test_infeasible_returns_nonpositive(self):

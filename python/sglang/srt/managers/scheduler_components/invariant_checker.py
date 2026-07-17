@@ -87,7 +87,14 @@ class SchedulerInvariantChecker:
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_full_tokens()
-            total = self.full_tokens_per_layer
+            # `size_full` for `total`: the static boot cap (== the
+            # full_tokens_per_layer this used to read) on non-unified
+            # allocators, the DYNAMIC self-canceling value on the unified
+            # composite — matching the `schedulable` view the observer feeds
+            # into ps.full_available_size, so the check reduces to radix slot
+            # conservation on both. (Same pattern as the hybrid-ssm branch's
+            # `.size` below.)
+            total = self.token_to_kv_pool_allocator.size_full
         elif self.is_hybrid_ssm:
             # Branch on cache type for the protected accessor (MambaRadixCache
             # splits full/mamba; ChunkCache only has the single protected_size).
@@ -143,7 +150,10 @@ class SchedulerInvariantChecker:
             ps.swa_evictable_size,
             self.tree_cache.swa_protected_size(),
             self.pool_stats_observer.session_held_swa_tokens(),
-            self.swa_tokens_per_layer,
+            # Static boot cap on non-unified (== swa_tokens_per_layer),
+            # dynamic self-canceling total on the unified composite — must
+            # match the view behind ps.swa_available_size (see observer).
+            self.token_to_kv_pool_allocator.size_swa,
             uncached,
         )
 

@@ -302,7 +302,39 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     allocator = tree_cache.token_to_kv_pool_allocator
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
-        # Hybrid allocator
+        if getattr(allocator, "swa_full_token_cost", None) is not None:
+            # Unified composite: full and swa share ONE byte buffer, so the
+            # per-side views alias the SAME gap bytes — "each side individually
+            # sufficient" does NOT imply the JOINT alloc fits (every allocated
+            # token costs e_full + e_swa gap bytes). Sizing eviction from the
+            # per-side views evicts NOTHING in exactly that state and the
+            # caller's alloc dies on the fail-loud shortfall (observed under
+            # radix stress: need 6885, full_avail 11264, swa_avail 18944,
+            # joint < need — both sides "sufficient", nothing evicted).
+            # Size against the joint view and RE-CHECK: evicting a full-LRU
+            # node frees both sides, but tombstoned nodes return only
+            # full-side bytes, diluting the joint gain — hence the bounded
+            # progress-checked loop instead of a one-shot.
+            for _ in range(4):
+                joint_available = allocator.available_size()
+                if joint_available >= num_tokens:
+                    break
+                shortfall = num_tokens - joint_available
+                evictable_before = (
+                    tree_cache.full_evictable_size() + tree_cache.swa_evictable_size()
+                )
+                tree_cache.evict(
+                    EvictParams(num_tokens=shortfall, swa_num_tokens=shortfall)
+                )
+                evictable_after = (
+                    tree_cache.full_evictable_size() + tree_cache.swa_evictable_size()
+                )
+                if evictable_after >= evictable_before:
+                    break  # nothing evictable is left; let the caller's gate decide
+            return
+
+        # Non-unified hybrid allocator: physically disjoint pools, per-side
+        # shortfalls are independent and exact.
         full_available_size = allocator.full_available_size()
         swa_available_size = allocator.swa_available_size()
 

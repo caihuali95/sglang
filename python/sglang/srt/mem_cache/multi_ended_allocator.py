@@ -2593,10 +2593,13 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     Capacity views:
     - `available_size()`: joint byte-budget, the only safe `alloc(N)` pre-check
       (N slots cost N*(entry_full + entry_swa) shared-gap bytes).
-    - `_conserve_*`: slot-conservation, for the LEAK invariant only.
-    - `schedulable_*`: byte-coordinated, realizable-with-compaction.
-    - `full_available_size()` / `swa_available_size()`: per-side scheduler view
-      = min(conserve, schedulable).
+    - `schedulable_*` == `full/swa_available_size()`: byte-coordinated,
+      realizable-with-compaction per-side views (NO static-cap clamp — the
+      boot ratio split is not a runtime wall; admission soundness comes from
+      the `swa_full_token_cost` cross-charge in PrefillAdder).
+    - `size_full` / `size_swa`: DYNAMIC self-canceling leak totals
+      (= schedulable + allocated), so the checker's invariant reduces to
+      radix slot conservation at any borrow depth.
     """
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
@@ -2752,33 +2755,37 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
         return K_total * self.page_size
 
-    # Slot-conservation views — the ONLY views the leak invariant should see
-    # (returning the byte-coordinated value would flag spurious leaks).
-    # `allocated_count()` is in TOKENS (the unit the leak check expects).
-    def _conserve_full_available_size(self) -> int:
-        return (
-            self._full_max_total_num_tokens - self.full_attn_allocator.allocated_count()
-        )
-
-    def _conserve_swa_available_size(self) -> int:
-        return (
-            self._swa_max_total_num_tokens - self.swa_attn_allocator.allocated_count()
-        )
-
-    # PHYSICAL per-side views read by scheduling / eviction consumers. The
-    # `min(...)` is sound under dynamic borrowing: the static-conserve cap bounds
-    # the lending side, the byte-coordinated `schedulable_*` bounds the side that
-    # has grown into the shared gap; whichever is tighter wins.
+    # Per-side views read by scheduling / eviction consumers: the byte-
+    # coordinated realizable values, with NO static-cap clamp. The old
+    # `min(boot_cap − allocated, schedulable)` conserve caps enforced the
+    # boot-time swa_full_tokens_ratio split as a runtime wall (the full side
+    # could never borrow the swa side's idle bytes past its boot count). The
+    # caps were ALSO the admission-soundness mechanism — both per-side views
+    # alias the SAME shared gap, so without them the dual PrefillAdder gate
+    # would promise the gap twice. That job now belongs to the
+    # `swa_full_token_cost` cross-charge below (the mamba composite's
+    # `mamba_slot_full_token_cost` pattern): every admitted request's swa-side
+    # bytes are charged into the full-token budget, so the sum of promises
+    # across BOTH sides stays within the realizable bytes, single-counted.
     def full_available_size(self) -> int:
-        return min(
-            self._conserve_full_available_size(),
-            self.schedulable_full_available_size(),
-        )
+        return self.schedulable_full_available_size()
 
     def swa_available_size(self) -> int:
-        return min(
-            self._conserve_swa_available_size(),
-            self.schedulable_swa_available_size(),
+        return self.schedulable_swa_available_size()
+
+    def swa_full_token_cost(self, swa_budget_tokens: int) -> int:
+        """Full-token-equivalents of the shared-buffer bytes `swa_budget_tokens`
+        swa-side tokens consume: ceil(tokens · e_swa / e_full), rounded UP
+        (conservative). The PrefillAdder folds this into the full-token gate
+        and offsets for every admitted request (see `_swa_gap_budget_for_req`),
+        which is what keeps the dual per-side budgets byte-sound now that the
+        static conserve caps are gone. Only on the unified composite — the
+        planner sources it via `getattr(..., None)`, so baseline SWA
+        (physically disjoint pools, no shared gap to double-promise) charges 0
+        and keeps upstream behavior byte-identical."""
+        return -(
+            -(swa_budget_tokens * self.swa_attn_allocator.entry_bytes)
+            // self.full_attn_allocator.entry_bytes
         )
 
     # Byte-coordinated, realizable-with-compaction views (peer drainable holes
@@ -2800,9 +2807,31 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator._flush(urgent=True)
         return need_tokens <= self.available_size()
 
-    # `size_full` / `size_swa` are inherited; they read `_size_full`/`_size_swa`
-    # (set to the static caps). We do NOT report `max_slots - 1`: under unified
-    # memory pool that ~= full_max + swa_max and would over-promise.
+    # Dynamic self-canceling totals for the leak invariant, mirroring the
+    # mamba composite's `size` property: total_x = schedulable_x + allocated_x.
+    # In the checker's identity `available + evictable + protected + ... ==
+    # total`, the observer feeds `available = schedulable_x`, so the
+    # schedulable term appears on BOTH sides and cancels — the check collapses
+    # to pure radix slot conservation (`evictable + protected + ... ==
+    # allocated`), immune to holes/gap state and cross-side borrowing. On the
+    # NON-unified allocator `size_full`/`size_swa` stay the static boot caps
+    # and the same identity holds there because its `available` is exactly
+    # `cap − allocated` (physically disjoint pools). We do NOT report
+    # `max_slots - 1`: under the unified pool that is the whole-buffer index
+    # space (~= full_max + swa_max) and would over-promise.
+    @property
+    def size_full(self) -> int:
+        return (
+            self.schedulable_full_available_size()
+            + self.full_attn_allocator.allocated_count()
+        )
+
+    @property
+    def size_swa(self) -> int:
+        return (
+            self.schedulable_swa_available_size()
+            + self.swa_attn_allocator.allocated_count()
+        )
 
     def debug_print(self) -> str:
         return (
