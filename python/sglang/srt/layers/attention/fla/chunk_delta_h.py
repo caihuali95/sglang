@@ -60,6 +60,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     h,
     initial_state,
     initial_state_indices,
+    stride_istate_slot,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -112,9 +113,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_k = Hg * K
     stride_w = H * K
 
-    index = tl.load(initial_state_indices + i_n).to(tl.int32)
-    h0 = initial_state + index * stride_h
-    ht = initial_state + index * stride_h
+    # Per-slot state stride: `stride_istate_slot` is `initial_state.stride(0)`,
+    # NOT the intermediate-`h` stride `stride_h` (= H*V*K). For a contiguous
+    # [num_slots, H, V, K] state the two are equal, but under the unified memory
+    # pool `initial_state` is an ENVELOPE-strided view whose per-slot stride is
+    # the full mamba entry — using `stride_h` there would scatter the recurrent
+    # state to the wrong slot. int64: the envelope stride is large enough that
+    # index * stride overflows int32.
+    index = tl.load(initial_state_indices + i_n).to(tl.int64)
+    h0 = initial_state + index * stride_istate_slot
+    ht = initial_state + index * stride_istate_slot
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
@@ -338,6 +346,12 @@ def chunk_gated_delta_rule_fwd_h(
         h=h,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        # Real per-slot stride of the state tensor (== H*V*K for a contiguous
+        # state, so baseline/GDN are byte-identical; != H*V*K for the unified
+        # pool's envelope-strided state, which is the bug this fixes).
+        stride_istate_slot=(
+            initial_state.stride(0) if initial_state is not None else 0
+        ),
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
