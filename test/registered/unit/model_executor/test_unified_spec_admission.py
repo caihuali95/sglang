@@ -124,6 +124,20 @@ QWEN_SPEC_OFF_EXTRA_BUF = dict(
     cell_size=32768,
     margin_slots=3,
 )
+# Kimi-Linear-48B-class KDA + MLA hybrid at TP2, spec OFF. The MLA cell is an
+# order of magnitude lighter than an MHA cell (7 MLA layers x 576-dim latent
+# x bf16 = 8064 B/token, single latent region -- no K/V pair); the KDA state
+# (~20 KDA layers, fp32 temporal) dominates the per-request charge. The
+# no_buffer mamba strategy forces non-overlap, so the plain radix ratio 3
+# floor applies.
+KIMI_SPEC_OFF = dict(
+    mamba_bytes_per_req=21 * MIB,
+    num_draft_tokens=0,
+    hard_slots=3,
+    mamba_ratio=3,
+    cell_size=8064,
+    margin_slots=3,
+)
 
 
 class TestUnifiedSpecAdmissionSolve(CustomTestCase):
@@ -137,6 +151,7 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
             QWEN_NGRAM,
             QWEN_SPEC_OFF,
             QWEN_SPEC_OFF_EXTRA_BUF,
+            KIMI_SPEC_OFF,
         ):
             for rest_gib in (2, 10, 35, 55):
                 for requested in (8, 48, 256, 4096):
@@ -170,7 +185,7 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
         """D=0 (spec OFF): every band term is EXACTLY zero, the deduction is
         the mamba grant alone, and the token budget is rest minus that grant.
         This is the arithmetic contract the spec-OFF gate flip relies on."""
-        for params in (QWEN_SPEC_OFF, QWEN_SPEC_OFF_EXTRA_BUF):
+        for params in (QWEN_SPEC_OFF, QWEN_SPEC_OFF_EXTRA_BUF, KIMI_SPEC_OFF):
             for rest_gib, requested in ((2, 48), (35, 256), (55, 4096)):
                 a = solve_unified_spec_admission(
                     rest_bytes=rest_gib * GIB, requested=requested, **params
@@ -216,6 +231,10 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
             (QWEN_EAGLE, 6, 48),
             (QWEN_SPEC_OFF, 6, 4096),
             (QWEN_SPEC_OFF_EXTRA_BUF, 35, 4096),
+            # Kimi-48B at TP2 leaves a narrow KV budget after ~48 GB/rank of
+            # weights -- the solve must still admit a healthy batch there.
+            (KIMI_SPEC_OFF, 12, 256),
+            (KIMI_SPEC_OFF, 4, 48),
         ):
             a = solve_unified_spec_admission(
                 rest_bytes=rest_gib * GIB, requested=requested, **params

@@ -196,6 +196,67 @@ def solve_unified_spec_admission(
 logger = logging.getLogger(__name__)
 
 
+def check_unified_mamba_family_admissible(config) -> None:
+    """Positive model-family allow-list for the unified-pool mamba path.
+
+    The unified pool stores linear-attention state in envelope-strided views
+    addressed by physical slot ids, so every state-touching kernel of an
+    admitted family must honor explicit slot strides (the full view's
+    ``.stride(0)``) instead of assuming dense ``[batch, ...]`` state tensors,
+    and the family's pool/backend wiring must be validated end to end.
+    Families are admitted one by one after that audit; anything else fails
+    loudly here instead of corrupting state silently at runtime.
+
+    ``config`` is the RESOLVED mambaish config (``ModelRunner.mambaish_config``
+    — already unwrapped from any VL wrapper). Notable EXCLUSIONS, kept out on
+    purpose:
+      - JetNemotron / JetVLM: their decode state-update kernel addresses the
+        initial state densely (no slot stride) — silent wrong-slot state under
+        envelope-strided views.
+      - BailingMoeV2_5 (hybrid lightning): mambaish AND MLA-capable, but its
+        lightning-attention backend + overlap path is entirely unvetted here.
+    """
+    from sglang.srt.configs import (
+        FalconH1Config,
+        GraniteMoeHybridConfig,
+        KimiLinearConfig,
+        Lfm2Config,
+        Lfm2MoeConfig,
+        Lfm2VlConfig,
+        NemotronHConfig,
+        Qwen3_5Config,
+        Qwen3NextConfig,
+        ZayaConfig,
+    )
+
+    allowed = (
+        # GDN via the Qwen-family configs specifically (NOT the whole
+        # hybrid_gdn union — that also admits JetNemotron/JetVLM). Subclasses
+        # (e.g. the Qwen3.5-MoE-derived VL configs) are covered by isinstance.
+        Qwen3NextConfig,
+        Qwen3_5Config,
+        # Mamba2 family — shares the stride-aware mamba2 kernel set.
+        FalconH1Config,
+        NemotronHConfig,
+        Lfm2Config,
+        Lfm2MoeConfig,
+        Lfm2VlConfig,
+        ZayaConfig,
+        GraniteMoeHybridConfig,
+        # KDA + MLA hybrid — KDA kernels are stride-aware; the MLA full side
+        # runs the unified MLA sub-pool.
+        KimiLinearConfig,
+    )
+    if not isinstance(config, allowed):
+        raise ValueError(
+            "--enable-unified-memory: model family "
+            f"{type(config).__name__} has not been validated against the "
+            "unified memory pool's state-layout and kernel-stride contracts. "
+            "Drop --enable-unified-memory for this model — plain "
+            "--enable-page-major-kv-layout still works."
+        )
+
+
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -688,9 +749,9 @@ class ModelRunnerKVCacheMixin:
 
         config = self.mambaish_config
         assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
+        # Positive family allow-list — fails loud for unvetted linear-attention
+        # families before any pool is built.
+        check_unified_mamba_family_admissible(config)
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -749,6 +810,14 @@ class ModelRunnerKVCacheMixin:
             # sub-pool so draft KV rides inside the fused slot entries
             # (non-None <=> fusion enabled; gated in maybe_init_draft_kv_geometry).
             draft_kv_geometry=self.draft_kv_geometry,
+            # MLA-hybrid (e.g. Kimi Linear): the full sub-pool stores the MLA
+            # latent — same dim source as the baseline composite's MLA pool.
+            kv_lora_rank=(
+                self.model_config.kv_lora_rank if self.use_mla_backend else None
+            ),
+            qk_rope_head_dim=(
+                self.model_config.qk_rope_head_dim if self.use_mla_backend else None
+            ),
         )
         self.req_to_token_pool = bundle.req_to_token_pool
         self.token_to_kv_pool = bundle.token_to_kv_pool
@@ -978,13 +1047,13 @@ class ModelRunnerKVCacheMixin:
                 return
             raise ValueError(
                 "--enable-unified-memory requires a hybrid model "
-                "(full-attention + Mamba-family state, or full + sliding-"
-                "window KV); the current model "
+                "(full-attention + Mamba-family state — MHA- or MLA-full — "
+                "or full + sliding-window KV); the current model "
                 f"({self.model_config.hf_config.architectures}) is not one "
-                "(dense, MLA-family, and DeepSeek-V4 models are unsupported, "
-                "and --disable-hybrid-swa-memory disables the SWA pairing). "
-                "Drop --enable-unified-memory for this model — plain "
-                "--enable-page-major-kv-layout still works."
+                "(dense, non-hybrid MLA, and DeepSeek-V4 models are "
+                "unsupported, and --disable-hybrid-swa-memory disables the "
+                "SWA pairing). Drop --enable-unified-memory for this model — "
+                "plain --enable-page-major-kv-layout still works."
             )
 
         # Initialize req_to_token_pool

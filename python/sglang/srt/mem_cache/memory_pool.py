@@ -2422,6 +2422,13 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
+        # virtual->physical full-KV translate for the MODEL-SIDE MLA write/read
+        # entry points (`set_mla_kv_buffer`/`get_mla_kv_buffer`): unlike the
+        # backend paths (which carry the physical loc in `KVWriteLoc`), those
+        # are called from model code with `forward_batch.out_cache_loc`
+        # directly. Identity for a static pool (loc already physical); the
+        # allocator's `translate_kv_loc` under the unified pool.
+        self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
@@ -2579,10 +2586,16 @@ class HybridLinearKVPool(KVCache):
                 dcp_kv_mask=dcp_kv_mask,
             )
         else:
+            # Same physical-loc selection as the MHA branch above: `full_loc`
+            # is the unified pool's pre-translated PHYSICAL loc (None for a
+            # static pool, where `loc` is already physical). Dropping it here
+            # would hand VIRTUAL slot ids to the pool as if physical — silent
+            # wrong-slot KV the moment an MLA-hybrid runs unified.
+            write_loc = full_loc if full_loc is not None else loc
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
-                    loc,
+                    write_loc,
                     cache_k,
                     cache_v,
                 )
@@ -2619,6 +2632,10 @@ class HybridLinearKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
+        # Model-side entry point (zero-prefix MHA-mode extends): `loc` is the
+        # scheduler's id space — translate to physical (identity on a static
+        # pool; v2p under the unified pool).
+        loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
@@ -2629,6 +2646,8 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
+        # Model-side entry point — same translate rationale as set_mla_kv_buffer.
+        loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 

@@ -2166,7 +2166,7 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(
             size=full_max - 1,
             page_size=page_size,
-            dtype=unified_buffer.mha_spec("full").store_dtype,
+            dtype=unified_buffer.spec("full").get_dtype(),
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,
@@ -2639,7 +2639,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self,
             size=full_max_total_num_tokens,
             page_size=page_size,
-            dtype=unified_buffer.mha_spec("full").store_dtype,
+            dtype=unified_buffer.spec("full").get_dtype(),
             device=device,
             kvcache=kvcache,
             need_sort=need_sort,

@@ -1412,6 +1412,20 @@ class TritonAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
                 cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
+            elif self._translate_kv_loc is not None:
+                # Unified pool: `out_cache_loc` is VIRTUAL and `get_kv_buffer`
+                # returns a page-major (4-D) view — a bare `k_buffer[cache_loc]`
+                # here would index the PAGE axis with an untranslated id, a
+                # silent-corruption read. No unified-pool model shares KV across
+                # layers (k/v are always recomputed, so this branch is dead for
+                # them); fail loud rather than corrupt. A future KV-sharing
+                # unified model must add a translated, page-aware gather here.
+                raise RuntimeError(
+                    "unified memory pool: cross-layer KV-sharing read "
+                    "(k is None) is unsupported — get_kv_buffer returns a "
+                    "virtual-indexed page-major view. No current unified model "
+                    "reaches this path."
+                )
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
@@ -1856,9 +1870,16 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
+                # Carry the pre-translated physical loc like the non-MLA branch
+                # below (and the MLA extend path): under the unified memory
+                # pool `out_cache_loc` is VIRTUAL, and a bare loc would make
+                # the pool write to wrong slots silently.
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    forward_batch.out_cache_loc,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        full_loc=self.forward_metadata.out_cache_loc_full_physical,
+                    ),
                     k,
                     v,
                 )

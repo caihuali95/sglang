@@ -708,6 +708,34 @@ class TestUnifiedSWASizing(unittest.TestCase):
         self.assertIsNone(cfg.unified_total_bytes)
 
 
+class TestMLACellSingleSourcing(unittest.TestCase):
+    """The MLA per-token cost is single-sourced: the configurator's byte
+    pricing and the unified physical layout both call `mla_entry_bytes`, so
+    budget and layout cannot drift (the `fused_entry_bytes` discipline)."""
+
+    def test_mla_cell_equals_helper(self):
+        from sglang.srt.mem_cache.layout.page_major import mla_entry_bytes
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        with mock_cpu_env():
+            mr = _make_model_runner(num_layers=7)
+            # Kimi-Linear-shaped MLA dims (lora 512 + rope 64 = 576 latent).
+            mr.use_mla_backend = True
+            mr.model_config.kv_lora_rank = 512
+            mr.model_config.qk_rope_head_dim = 64
+            cfg = DefaultPoolConfigurator(mr)
+        self.assertEqual(
+            cfg._cell_size,
+            mla_entry_bytes(
+                layer_num=7, kv_lora_rank=512, qk_rope_head_dim=64, itemsize=KV_SIZE
+            ),
+        )
+        # And the hand-check: 7 layers x 576 latent x itemsize.
+        self.assertEqual(cfg._cell_size, 7 * 576 * KV_SIZE)
+
+
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(is_hybrid_swa=False)

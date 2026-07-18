@@ -46,6 +46,19 @@ def mha_entry_bytes(
     return layer_num * (k_row_bytes + v_row_bytes)
 
 
+def mla_entry_bytes(
+    *, layer_num: int, kv_lora_rank: int, qk_rope_head_dim: int, itemsize: int
+) -> int:
+    """Bytes occupied by one slot across all layers: one latent (nope|rope) row
+    per layer — MLA stores a single compressed KV region, not a K/V pair.
+
+    SINGLE SOURCE OF TRUTH for the MLA per-token cost: both the byte-budget
+    pricing (`DefaultPoolConfigurator._compute_cell_size`) and the physical
+    slot layout (`MLASubPoolSpec.entry_bytes`) call this helper, so budget and
+    layout cannot drift (the `fused_entry_bytes` discipline)."""
+    return layer_num * (kv_lora_rank + qk_rope_head_dim) * itemsize
+
+
 def build_page_major_mha_views(
     raw: torch.Tensor,
     *,
@@ -130,6 +143,74 @@ def build_page_major_mha_views(
             )
         )
     return k_buffer, v_buffer
+
+
+def build_page_major_mla_views(
+    raw: torch.Tensor,
+    *,
+    layer_num: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    store_dtype: torch.dtype,
+    page_size: int,
+    num_pages: int,
+    anchor_bytes: int = 0,
+    page_stride_bytes: Optional[int] = None,
+) -> List[torch.Tensor]:
+    """Per-layer MLA latent views over ``raw`` in the page-major layer-major
+    layout — the single-region analog of ``build_page_major_mha_views``.
+
+    Each returned view is 4-D ``(num_pages, page_size, 1, kv_cache_dim)`` with
+    ``kv_cache_dim = kv_lora_rank + qk_rope_head_dim`` (the ``1`` mirrors the
+    dense ``MLATokenToKVPool`` buffer shape ``(size+ps, 1, kv_cache_dim)`` so
+    every consumer sees the familiar head axis) and constant strides:
+
+        stride[0] = page_stride_bytes / itemsize   # next page
+        stride[1] = kv_cache_dim                   # next slot in layer L's block
+        stride[2] = kv_cache_dim                   # head axis (size 1 — inert)
+        stride[3] = 1                              # next element
+
+    Per-page envelope: ``[L0_latent·ps | L1_latent·ps | … ]`` — one latent
+    region per layer, no K/V pair. A token id ``t`` addresses page
+    ``t // page_size``, slot ``t % page_size`` (two-level, non-affine in ``t``
+    at page_size > 1 — which is why the pool-side writers must be page-aware).
+    The layout is page-size-general by design (user decision: future ps > 1
+    readiness); at ps == 1 it is byte-identical to the dense token-affine form.
+    """
+    itemsize = store_dtype.itemsize
+    kv_cache_dim = kv_lora_rank + qk_rope_head_dim
+    row_bytes = kv_cache_dim * itemsize
+    entry_bytes = layer_num * row_bytes
+    page_bytes = page_size * entry_bytes
+    if page_stride_bytes is None:
+        page_stride_bytes = page_bytes
+    assert page_stride_bytes >= page_bytes, (
+        f"page_stride_bytes ({page_stride_bytes}) must cover this region's "
+        f"page_bytes ({page_bytes})"
+    )
+    assert anchor_bytes % itemsize == 0
+    assert row_bytes % itemsize == 0
+    assert page_stride_bytes % itemsize == 0
+
+    as_dtype_view = raw.view(store_dtype)
+    stride_page = page_stride_bytes // itemsize
+
+    shape = (num_pages, page_size, 1, kv_cache_dim)
+    stride = (stride_page, kv_cache_dim, kv_cache_dim, 1)
+
+    kv_buffer: List[torch.Tensor] = []
+    for layer in range(layer_num):
+        base_bytes = anchor_bytes + layer * page_size * row_bytes
+        assert base_bytes % itemsize == 0
+        kv_buffer.append(
+            torch.as_strided(
+                as_dtype_view,
+                size=shape,
+                stride=stride,
+                storage_offset=base_bytes // itemsize,
+            )
+        )
+    return kv_buffer
 
 
 def mamba_entry_bytes(
