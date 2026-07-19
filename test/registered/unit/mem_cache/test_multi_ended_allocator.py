@@ -846,29 +846,34 @@ class TestUnifiedSWATokenToKVPoolAllocator(CpuPoolTestCase):
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
-    # 6b. Cross-charge admission soundness (mechanical byte-conservation check).
-    def test_swa_cross_charge_admission_soundness(self):
-        """Admitting under the CROSS-CHARGED full-token budget — each request
-        charged `T + swa_full_token_cost(S)` — never promises more than the
-        composite can actually allocate; the naive dual per-side budget (no
-        cross-charge) provably over-admits, because both per-side views credit
-        the SAME shared gap. This is the soundness job the deleted
-        `min(conserve, schedulable)` caps used to do."""
+    # 6b. Joint-byte-budget admission soundness (mechanical byte-conservation
+    # check).
+    def test_swa_joint_byte_budget_admission_soundness(self):
+        """Admitting under the JOINT BYTE budget — each request charged
+        `T x (e_full + e_swa)` bytes against `schedulable_free_bytes()` —
+        never promises more than the composite can actually allocate; the
+        naive dual per-side budget provably over-admits, because both
+        per-side views credit the SAME shared gap. This is the soundness job
+        the deleted `min(conserve, schedulable)` caps (and later the
+        full-token cross-charge) used to do — now held by the single byte
+        ledger, with no per-request ceil rounding."""
         REQ_TOKENS = 4
         pool, allocator, kvcache = self._build(
             n_full_slots=64, n_swa_slots=64, full_layer_num=4, swa_layer_num=2
         )
         # The composite allocates every token on BOTH sides: T = S = n.
-        rem_total = allocator.full_available_size()
         naive_k = min(
             allocator.full_available_size() // REQ_TOKENS,
             allocator.swa_available_size() // REQ_TOKENS,
         )
-        charge = REQ_TOKENS + allocator.swa_full_token_cost(REQ_TOKENS)
-        # e_swa < e_full here (2 vs 4 layers), so the cross-charge is a real,
-        # non-trivial surcharge (ceil(n/2)) — the test dies if it degrades to 0.
-        self.assertGreater(allocator.swa_full_token_cost(REQ_TOKENS), 0)
-        sound_k = rem_total // charge
+        charge_bytes = allocator.alloc_tokens_to_bytes(REQ_TOKENS)
+        # e_swa < e_full here (2 vs 4 layers) — both sides must be priced,
+        # and the swa side must be a real, non-trivial surcharge.
+        self.assertGreater(
+            charge_bytes,
+            REQ_TOKENS * allocator.full_attn_allocator.entry_bytes,
+        )
+        sound_k = allocator.schedulable_free_bytes() // charge_bytes
         self.assertLess(sound_k, naive_k, "naive dual budget must over-promise")
 
         # Every cross-charge-admitted request must be allocatable.
@@ -3309,17 +3314,28 @@ class TestUnifiedMambaCompositeWithBand(CpuPoolTestCase):
         mamba_entry = comp_off.mamba_allocator.entry_bytes_per_page
         spec_entry = comp_spec.spec_state_allocator.entry_bytes_per_page
 
-        # The mamba charge is the mamba slot alone, and spec does not change it.
-        mamba_cost = -(-mamba_entry // full_entry)
-        self.assertEqual(comp_off.mamba_slot_full_token_cost(), mamba_cost)
-        self.assertEqual(comp_spec.mamba_slot_full_token_cost(), mamba_cost)
+        def state_band_bytes(comp, fresh_slots):
+            cost = comp.new_request_prefill_cost_bytes(
+                extend_tokens_paged=0,
+                max_new_tokens=0,
+                page_size=0,
+                fresh_mamba_slots=fresh_slots,
+            )
+            return cost.immediate_bytes  # extend/page are 0 → state + band only
 
-        # The band is charged on its own, and only when spec is on.
+        # A radix-reused state (fresh_slots=0) is charged the BAND alone —
+        # and only when spec is on.
+        self.assertEqual(state_band_bytes(comp_spec, 0), spec_entry)
+        self.assertEqual(state_band_bytes(comp_off, 0), 0)
+
+        # A fresh state adds exactly the mamba slot bytes ON TOP of the band —
+        # the band charge never disappears into the mamba charge.
         self.assertEqual(
-            comp_spec.spec_band_full_token_cost(),
-            -(-spec_entry // full_entry),
+            state_band_bytes(comp_spec, 1), spec_entry + mamba_entry
         )
-        self.assertEqual(comp_off.spec_band_full_token_cost(), 0)
+        self.assertEqual(state_band_bytes(comp_off, 1), mamba_entry)
+        # Sanity: the byte charges are exact — no full-token ceil rounding.
+        self.assertNotEqual(mamba_entry % full_entry, 0)
 
     def test_flush_opportunistic_does_not_park_band(self):
         # Flushes must not churn a live band: they can run every scheduler
@@ -3420,6 +3436,439 @@ class TestBandPlacementSemantics(CpuPoolTestCase):
         # PINNED band: nothing beyond it is reachable.
         band2.pin_band()
         self.assertEqual(fa_lazy._peer_drainable_hole_bytes(), 0)
+
+
+class TestByteAdmissionSurface(CpuPoolTestCase):
+    """The composites' byte-denominated admission surface (`schedulable_free_
+    bytes`, `new_request_prefill_cost_bytes`, `new_token_decode_cost_bytes`,
+    `alloc_tokens_to_bytes`, `shortfall_to_evict_params`).
+
+    Equivalence contract vs the token-equivalent converters (both APIs
+    coexist until the byte admission flip): every byte cost equals the
+    UN-ceiled numerator of its converter — i.e.
+    `byte_cost <= token_equiv * e_full` with the difference strictly below
+    one full token's bytes per ceil() the converter applied. These tests pin
+    both the byte values (hand math) and that contract, so deleting the
+    converters later cannot silently change admission pricing."""
+
+    # -- mamba composite -----------------------------------------------------
+
+    def _make_mamba_comp(self, spec_on=True, total_bytes=6336):
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedMambaTokenToKVPoolAllocator,
+        )
+
+        full = _make_mha_spec("full", "down", layer_num=2, head_num=2, head_dim=4)
+        mamba = _make_mamba_spec2("mamba", "up")
+        specs = [full, mamba]
+        if spec_on:
+            specs.append(_make_spec_state_spec())
+        pool = UnifiedKVPool(
+            total_bytes=total_bytes,
+            sub_pool_specs=specs,
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        kvcache = _FakeHybridLinearKVPool(pool.max_slots("full"))
+        comp = UnifiedMambaTokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            spec_state_sub_pool="spec_state" if spec_on else None,
+        )
+        return comp
+
+    def test_mamba_prefill_cost_hand_math_and_equivalence(self):
+        for spec_on in (True, False):
+            comp = self._make_mamba_comp(spec_on=spec_on)
+            e_f = comp.full_attn_allocator.entry_bytes
+            e_m = comp.mamba_allocator.entry_bytes_per_page
+            e_b = (
+                comp.spec_state_allocator.entry_bytes_per_page if spec_on else 0
+            )
+            for fresh_slots in (0, 1, 2):
+                cost = comp.new_request_prefill_cost_bytes(
+                    extend_tokens_paged=96,
+                    max_new_tokens=64,
+                    page_size=1,
+                    fresh_mamba_slots=fresh_slots,
+                )
+                expect_imm = (96 + 1) * e_f + fresh_slots * e_m + e_b
+                self.assertEqual(cost.immediate_bytes, expect_imm)
+                self.assertEqual(cost.lifetime_bytes, expect_imm + 64 * e_f)
+                self.assertEqual(cost.fresh_mamba_slots, fresh_slots)
+
+                # Equivalence vs the RETIRED token converters (formulas
+                # inlined): the byte state+band cost is the un-ceiled
+                # numerator of ceil(entry / e_f) per resource.
+                state_band_bytes = fresh_slots * e_m + e_b
+                token_equiv = fresh_slots * -(-e_m // e_f) + (
+                    -(-e_b // e_f) if spec_on else 0
+                )
+                self.assertLessEqual(state_band_bytes, token_equiv * e_f)
+                # Ceil slack: < e_f per applied ceil (one per fresh slot
+                # bundle + one for the band).
+                n_ceils = (1 if fresh_slots else 0) + (1 if e_b else 0)
+                self.assertLess(
+                    token_equiv * e_f - state_band_bytes,
+                    (n_ceils + 1) * e_f,
+                )
+
+    def test_mamba_decode_cost_equivalence(self):
+        comp = self._make_mamba_comp(spec_on=True)
+        e_f = comp.full_attn_allocator.entry_bytes
+        e_b = comp.spec_state_allocator.entry_bytes_per_page
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
+        )
+
+        for bs, new_tokens in ((1, 1), (4, 4), (7, 16)):
+            got = comp.new_token_decode_cost_bytes(num_reqs=bs, new_tokens=new_tokens)
+            self.assertEqual(
+                got,
+                new_tokens * e_f
+                + (bs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * e_b,
+            )
+            # vs the RETIRED converter (formula inlined): un-ceiled
+            # numerator contract.
+            band_tokens = (bs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * -(
+                -e_b // e_f
+            )
+            self.assertLessEqual(got, (new_tokens + band_tokens) * e_f)
+
+        comp_off = self._make_mamba_comp(spec_on=False)
+        self.assertEqual(
+            comp_off.new_token_decode_cost_bytes(num_reqs=5, new_tokens=3),
+            3 * comp_off.full_attn_allocator.entry_bytes,
+        )
+
+    def test_mamba_schedulable_free_bytes_band_states(self):
+        comp = self._make_mamba_comp(spec_on=True)
+        up, down = comp.sub_allocators[0], comp.sub_allocators[-1]
+        gap = down._byte_low_frontier() - up._byte_high_frontier()
+        # Clean state: free == whole inter-end gap (no holes, no band).
+        self.assertEqual(comp.schedulable_free_bytes(), gap)
+
+        # Band placed + UNPINNED: reclaimable, so free is unchanged.
+        self.assertTrue(comp.place_spec_state_band(2))
+        self.assertEqual(comp.schedulable_free_bytes(), gap)
+
+        # PINNED: the band's live bytes leave the schedulable pool.
+        comp.pin_spec_state_band()
+        band = comp.spec_state_allocator
+        band_live = band._allocated_pages() * band.entry_bytes_per_page
+        self.assertGreater(band_live, 0)
+        self.assertEqual(comp.schedulable_free_bytes(), gap - band_live)
+        comp.unpin_spec_state_band()
+        self.assertEqual(comp.schedulable_free_bytes(), gap)
+
+    def test_mamba_alloc_tokens_and_evict_params(self):
+        comp = self._make_mamba_comp(spec_on=False)
+        e_f = comp.full_attn_allocator.entry_bytes
+        self.assertEqual(comp.alloc_tokens_to_bytes(17), 17 * e_f)
+        p = comp.shortfall_to_evict_params(10 * e_f + 1)
+        self.assertEqual(p.num_tokens, 11)  # ceil
+
+    # -- SWA composite -------------------------------------------------------
+
+    def _make_swa_comp(self, n_full_slots=32, n_swa_slots=16):
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            UnifiedSWATokenToKVPoolAllocator,
+        )
+
+        full_spec = MHASubPoolSpec(
+            name="full",
+            layer_num=4,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="up",
+        )
+        swa_spec = MHASubPoolSpec(
+            name="swa",
+            layer_num=2,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.float16,
+            grow_direction="down",
+        )
+        total = (
+            n_full_slots * full_spec.entry_bytes()
+            + n_swa_slots * swa_spec.entry_bytes()
+        )
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full_spec, swa_spec],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        kvcache = _FakeUnifiedSWAKVPool(pool)
+        return UnifiedSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=kvcache,
+            device=_DEV,
+            full_max_total_num_tokens=n_full_slots,
+            swa_max_total_num_tokens=n_swa_slots,
+            need_sort=False,
+            forward_stream=None,
+        )
+
+    def test_swa_prefill_cost_hand_math_and_equivalence(self):
+        comp = self._make_swa_comp()
+        e_f = comp.full_attn_allocator.entry_bytes
+        e_s = comp.swa_attn_allocator.entry_bytes
+        cost = comp.new_request_prefill_cost_bytes(
+            extend_tokens_paged=48,
+            max_new_tokens=32,
+            page_size=1,
+            swa_budget_tokens=70,
+        )
+        self.assertEqual(cost.immediate_bytes, (48 + 1) * e_f + 70 * e_s)
+        self.assertEqual(cost.lifetime_bytes, cost.immediate_bytes + 32 * e_f)
+        self.assertEqual(cost.fresh_mamba_slots, 0)
+        # Equivalence vs the RETIRED cross-charge (formula inlined): swa
+        # bytes are the un-ceiled numerator of ceil(tokens * e_s / e_f).
+        cross_charge = -(-(70 * e_s) // e_f)
+        self.assertLessEqual(70 * e_s, cross_charge * e_f)
+        self.assertLess(cross_charge * e_f - 70 * e_s, e_f)
+
+    def test_swa_decode_and_alloc_costs_price_both_sides(self):
+        comp = self._make_swa_comp()
+        e_f = comp.full_attn_allocator.entry_bytes
+        e_s = comp.swa_attn_allocator.entry_bytes
+        self.assertEqual(
+            comp.new_token_decode_cost_bytes(num_reqs=9, new_tokens=5),
+            5 * (e_f + e_s),
+        )
+        self.assertEqual(comp.alloc_tokens_to_bytes(5), 5 * (e_f + e_s))
+        p = comp.shortfall_to_evict_params(3 * (e_f + e_s) + 1)
+        self.assertEqual(p.num_tokens, 4)
+        self.assertEqual(p.swa_num_tokens, 4)
+
+    # -- ByteAdmissionBudget end-to-end (real composite + adder stub) --------
+
+    class _AdderStub:
+        """Minimal PrefillAdder surface the budget consumes."""
+
+        def __init__(self, tree_cache, page_size=1, new_token_ratio=1.0,
+                     num_mixed=0, window=8):
+            self.tree_cache = tree_cache
+            self.page_size = page_size
+            self.new_token_ratio = new_token_ratio
+            self.num_mixed_decode_tokens = num_mixed
+            self._window = window
+
+        def ceil_paged_tokens(self, tokens):
+            return -(-tokens // self.page_size) * self.page_size
+
+        def _swa_budget_for_req(self, extend, swa_host_hit_length=0):
+            return max(extend, self._window) + self.page_size
+
+    class _TreeStub:
+        def __init__(self, full_evict=0, swa_evict=0, mamba_evict=0,
+                     supports_mamba=False, window=8):
+            self._f, self._s, self._m = full_evict, swa_evict, mamba_evict
+            self._sm = supports_mamba
+            self.sliding_window_size = window
+
+        def full_evictable_size(self):
+            return self._f
+
+        def swa_evictable_size(self):
+            return self._s
+
+        def mamba_evictable_size(self):
+            return self._m
+
+        def supports_mamba(self):
+            return self._sm
+
+        def is_chunk_cache(self):
+            return False
+
+    class _ReqStub:
+        def __init__(self, max_new, out_len=0, mamba_idx=None):
+            class _SP:
+                pass
+
+            self.sampling_params = _SP()
+            self.sampling_params.max_new_tokens = max_new
+            self.output_ids = [0] * out_len
+            self.mamba_pool_idx = mamba_idx
+
+    def test_byte_budget_end_to_end_mamba(self):
+        comp = self._make_mamba_comp(spec_on=True)
+        e_f = comp.full_attn_allocator.entry_bytes
+        e_m = comp.mamba_allocator.entry_bytes_per_page
+        e_b = comp.spec_state_allocator.entry_bytes_per_page
+        from sglang.srt.mem_cache.multi_ended_allocator import (
+            SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
+        )
+
+        tree = self._TreeStub(full_evict=3, mamba_evict=2, supports_mamba=True)
+        adder = self._AdderStub(tree)
+        budget = comp.make_admission_budget(adder)
+
+        # Construction: band alignment margin charged to both offsets;
+        # rem_mamba_slots = schedulable + mamba-evictable.
+        margin = SPEC_BAND_ALIGNMENT_MARGIN_SLOTS * e_b
+        self.assertEqual(budget.lifetime_offset_bytes, margin)
+        self.assertEqual(budget.immediate_offset_bytes, margin)
+        self.assertEqual(
+            budget.rem_mamba_slots,
+            comp.mamba_allocator.schedulable_available_size() + 2,
+        )
+
+        free = comp.schedulable_free_bytes()
+        evict = 3 * e_f
+        self.assertEqual(budget.lifetime_remaining(), free + evict - margin)
+
+        # Running charge: est tokens x e_f + band per req.
+        budget.charge_running([self._ReqStub(10, out_len=4)])
+        self.assertEqual(
+            budget.lifetime_offset_bytes, margin + 6 * e_f + e_b
+        )
+
+        # Admit a fresh-state request: gate, then charge tracks hand math.
+        req = self._ReqStub(5, mamba_idx=None)
+        cost = budget.prefill_cost(req, 4, 5)
+        self.assertEqual(
+            cost.lifetime_bytes, (4 + 1) * e_f + 2 * e_m + e_b + 5 * e_f
+        )
+        self.assertTrue(budget.fits(cost))
+        slots_before = budget.rem_mamba_slots
+        imm_before = budget.immediate_offset_bytes
+        budget.charge(cost, 4, 5)
+        self.assertEqual(budget.rem_mamba_slots, slots_before - 2)
+        self.assertEqual(
+            budget.immediate_offset_bytes,
+            imm_before + (4 + 1) * e_f + 2 * e_m + e_b,
+        )
+
+        # Radix-reused state: no slot decrement, band still charged.
+        req2 = self._ReqStub(5, mamba_idx=7)
+        cost2 = budget.prefill_cost(req2, 4, 5)
+        self.assertEqual(cost2.fresh_mamba_slots, 0)
+        budget.charge(cost2, 4, 5)
+        self.assertEqual(budget.rem_mamba_slots, slots_before - 2)
+
+        # Chunk cap closed form: (rem - fixed) // e_f, capped by chunk budget.
+        rem = budget.lifetime_remaining()
+        fixed = 1 * e_f + 2 * e_m + e_b  # page + fresh state + band
+        self.assertEqual(
+            budget.chunk_memory_cap(10_000, req), min(10_000, (rem - fixed) // e_f)
+        )
+
+        # Exhaustion: drive the ledger past the availability.
+        budget.lifetime_offset_bytes += rem + 1
+        self.assertTrue(budget.exhausted())
+
+    def test_byte_budget_end_to_end_swa(self):
+        comp = self._make_swa_comp()
+        e_f = comp.full_attn_allocator.entry_bytes
+        e_s = comp.swa_attn_allocator.entry_bytes
+
+        tree = self._TreeStub(full_evict=4, swa_evict=6, window=8)
+        adder = self._AdderStub(tree, window=8)
+        budget = comp.make_admission_budget(adder)
+
+        self.assertIsNone(budget.rem_mamba_slots)
+        free = comp.schedulable_free_bytes()
+        evict = 4 * e_f + 6 * e_s  # BOTH sides' evictable bytes credited
+        self.assertEqual(budget.lifetime_remaining(), free + evict)
+
+        # Prefill cost prices both sides (window-floored swa budget).
+        req = self._ReqStub(3)
+        cost = budget.prefill_cost(req, 4, 3)
+        swa_budget = max(4, 8) + 1  # window floor + page
+        self.assertEqual(
+            cost.lifetime_bytes, (4 + 1) * e_f + swa_budget * e_s + 3 * e_f
+        )
+        budget.charge(cost, 4, 3)
+        self.assertEqual(
+            budget.lifetime_offset_bytes,
+            (4 + 1) * e_f + swa_budget * e_s + 3 * e_f,
+        )
+
+        # Chunk cap: regime A (v >= W) when roomy — v = rem//(e_f+e_s) - page.
+        rem = budget.lifetime_remaining()
+        v_a = rem // (e_f + e_s) - 1
+        if v_a >= 8:
+            self.assertEqual(budget.chunk_memory_cap(10_000, req), v_a)
+        # Regime B (v < W): starve the ledger until below the window boundary.
+        budget.lifetime_offset_bytes += rem - (8 + 1) * (e_f + e_s) // 2
+        rem_b = budget.lifetime_remaining()
+        v_a2 = rem_b // (e_f + e_s) - 1
+        if v_a2 < 8:
+            expect = (rem_b - (8 + 1) * e_s) // e_f - 1
+            self.assertEqual(budget.chunk_memory_cap(10_000, req), expect)
+
+    # -- byte-accounting self-check (idle leak check) ------------------------
+
+    def test_verify_byte_accounting_clean_and_band_states(self):
+        comp = self._make_mamba_comp(spec_on=True)
+        self.assertEqual(comp.verify_byte_accounting(), [])
+        # Placed band inside the gap, unpinned: still healthy.
+        self.assertTrue(comp.place_spec_state_band(2))
+        self.assertEqual(comp.verify_byte_accounting(), [])
+        # Pinned at idle is NOT flagged — a stale pin is a self-healing
+        # condition (recover_stale_pin), not a byte leak; flagging it under
+        # strict-raise would crash on a recoverable state.
+        comp.pin_spec_state_band()
+        self.assertEqual(comp.verify_byte_accounting(), [])
+        comp.unpin_spec_state_band()
+        self.assertEqual(comp.verify_byte_accounting(), [])
+        # Spec-off composite: no band terms at all.
+        comp_off = self._make_mamba_comp(spec_on=False)
+        self.assertEqual(comp_off.verify_byte_accounting(), [])
+
+    def test_verify_byte_accounting_tolerates_exterior_pending(self):
+        # An idle following an urgent absorb can leave compaction-src pages in
+        # `_pending_reuse` ABOVE the watermark (outside the span). The check
+        # must NOT flag that (the old span==live+holes+pending equation did).
+        comp = self._make_mamba_comp(spec_on=False)
+        up = comp.sub_allocators[0]
+        if up.lazy_compaction:
+            # Simulate an un-reaped exterior pending page: live+holes unchanged,
+            # pending non-empty. The bound 0<=live<=span still holds.
+            up._pending_reuse_pages_cpu.add(10_000)
+            self.assertEqual(comp.verify_byte_accounting(), [])
+            up._pending_reuse_pages_cpu.discard(10_000)
+
+    def test_verify_byte_accounting_trips_on_frontier_corruption(self):
+        comp = self._make_mamba_comp(spec_on=False)
+        up = comp.sub_allocators[0]
+        # Corrupt the up end's watermark past the down end's low frontier.
+        up.watermark_physical = up.num_pages + 10
+        problems = comp.verify_byte_accounting()
+        self.assertTrue(problems, "corrupted frontier not detected")
+        self.assertTrue(
+            any("frontier" in p or "collision" in p for p in problems), problems
+        )
+
+    def test_verify_byte_accounting_swa_clean(self):
+        comp = self._make_swa_comp()
+        self.assertEqual(comp.verify_byte_accounting(), [])
+
+    def test_swa_schedulable_free_bytes_and_now_view_rename(self):
+        comp = self._make_swa_comp()
+        fa, sa = comp.full_attn_allocator, comp.swa_attn_allocator
+        gap = sa._byte_low_frontier() - fa._byte_high_frontier()
+        self.assertEqual(comp.schedulable_free_bytes(), gap)
+        # The public NOW view still delegates to the private 3-phase formula
+        # (facade flips to schedulable-derived only with the byte admission
+        # flip).
+        self.assertEqual(
+            comp.available_size(), comp._joint_realizable_now_tokens()
+        )
+        # Soundness-lemma spot check (eager, clean): NOW tokens == what the
+        # byte sum affords at the joint per-token cost, up to index caps.
+        e_f = fa.entry_bytes_per_page
+        e_s = sa.entry_bytes_per_page
+        R_f = fa.num_pages - fa.min_page_index - fa._allocated_pages()
+        R_s = sa.num_pages - sa.min_page_index - sa._allocated_pages()
+        expect = min(gap // (e_f + e_s), R_f, R_s) * comp.page_size
+        self.assertEqual(comp.available_size(), expect)
 
 
 if __name__ == "__main__":

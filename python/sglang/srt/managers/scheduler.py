@@ -3519,6 +3519,9 @@ class Scheduler(
             if has_leak:
                 self.invariant_checker._report_leak("pool", "\n".join(messages))
             self.invariant_checker._check_req_pool()
+            # Byte-level buffer conservation (allocator-owned; no-op for
+            # allocators without a shared byte buffer).
+            self.invariant_checker.check_unified_byte_accounting()
 
         # tree cache sanity check
         self.invariant_checker._check_tree_cache()

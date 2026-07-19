@@ -32,6 +32,8 @@ from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
+import msgspec
+
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
@@ -51,10 +53,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     zero_match_result,
-)
-from sglang.srt.mem_cache.multi_ended_allocator import (
-    SPEC_BAND_ALIGNMENT_MARGIN_SLOTS,
-    UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -429,6 +427,174 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
+class TokenPrefillCost(msgspec.Struct):
+    """Admission cost of one prefill candidate under the default
+    `TokenAdmissionBudget` (token-denominated). Opaque to the `PrefillAdder` —
+    it is produced by `budget.prefill_cost(...)` and consumed only by the same
+    budget's `fits*`/`charge` methods, so a specialized budget can substitute
+    its own cost carrier without the adder knowing."""
+
+    total_tokens: int  # extend + max_new + page overhead
+    paged_input_tokens: int  # page-ceiled extend — ignore-eos gate
+    swa_needed: int  # swa-side token budget (0 off hybrid-SWA)
+
+
+class TokenAdmissionBudget:
+    """Default admission budget: the scheduler's token-denominated gates and
+    offset bookkeeping, extracted from the `PrefillAdder` main flow.
+
+    One instance per prefill pass. The adder routes every memory admission
+    decision through the budget protocol (`prefill_cost` / `fits` /
+    `fits_immediate` / `charge` / `exhausted` / `chunk_memory_cap` /
+    `charge_running` / preemption helpers), so an allocator can substitute a
+    different accounting via
+    `BaseTokenToKVPoolAllocator.make_admission_budget` without any
+    allocator-specific logic in the adder — the unified memory pool supplies
+    a byte-denominated budget (`ByteAdmissionBudget`) this way.
+
+    This default implementation reads the adder's token budget views
+    (`rem_total_tokens` / `cur_rem_tokens` / `rem_swa_tokens` — which stay on
+    the adder, they are upstream logic) and mutates the adder's token
+    offsets, reproducing the pre-extraction upstream behavior bit-for-bit.
+    """
+
+    def __init__(self, adder: "PrefillAdder"):
+        self.adder = adder
+
+    # -- running-batch charges --
+
+    def _running_request_total_token_offset(self, req: Req) -> int:
+        return (
+            min(
+                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            * self.adder.new_token_ratio
+        )
+
+    def charge_running(self, reqs: List[Req]) -> None:
+        """Charge every running request's estimated remaining tokens to the
+        lifetime budget."""
+        self.adder.rem_total_token_offset += sum(
+            self._running_request_total_token_offset(r) for r in reqs
+        )
+
+    # -- per-candidate cost / gates / charge --
+
+    def prefill_cost(
+        self,
+        req: Req,
+        cand_extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int = 0,
+    ) -> TokenPrefillCost:
+        """Admission cost of one candidate. `total_tokens` mirrors
+        `add_one_req`'s gate quantity; `paged_input_tokens` mirrors
+        `add_one_req_ignore_eos`'s."""
+        adder = self.adder
+        swa_needed = 0
+        if adder.is_hybrid_swa:
+            swa_needed = adder._swa_budget_for_req(
+                cand_extend_input_len, swa_host_hit_length=swa_host_hit_length
+            )
+        return TokenPrefillCost(
+            total_tokens=cand_extend_input_len + max_new_tokens + adder.page_size,
+            paged_input_tokens=adder.ceil_paged_tokens(cand_extend_input_len),
+            swa_needed=swa_needed,
+        )
+
+    def fits(self, cost: TokenPrefillCost) -> bool:
+        """`add_one_req`'s memory gate (lifetime budget + swa side)."""
+        adder = self.adder
+        if cost.total_tokens >= adder.rem_total_tokens:
+            return False
+        if adder.is_hybrid_swa and cost.swa_needed >= adder.rem_swa_tokens:
+            return False
+        return True
+
+    def fits_immediate(self, cost: TokenPrefillCost) -> bool:
+        """`add_one_req_ignore_eos`'s memory gate (immediate + lifetime floor)."""
+        adder = self.adder
+        if cost.paged_input_tokens > min(
+            adder.cur_rem_tokens, adder.rem_total_tokens
+        ):
+            return False
+        if adder.is_hybrid_swa and cost.swa_needed > adder.rem_swa_tokens:
+            return False
+        return True
+
+    def charge(
+        self,
+        cost: TokenPrefillCost,
+        extend_input_len: int,
+        max_new_tokens: int,
+    ) -> None:
+        """Charge an admitted candidate to the budget. `extend_input_len` is
+        the page-ceiled admitted length (may be truncated vs the cost's
+        candidate length — chunked prefill). The swa-side budget is
+        recomputed from the ADMITTED length, mirroring pre-extraction
+        behavior."""
+        adder = self.adder
+        # alloc_extend reserves an extra page_size per request to make sure
+        # the budget doesn't over-commit.
+        page_overhead = adder.page_size
+        adder.rem_total_token_offset += (
+            extend_input_len + max_new_tokens + page_overhead
+        )
+        adder.cur_rem_token_offset += extend_input_len + page_overhead
+        if adder.is_hybrid_swa:
+            adder.rem_swa_token_offset += adder._swa_budget_for_req(
+                extend_input_len
+            )
+
+    def exhausted(self) -> bool:
+        """`budget_state`'s no-token condition."""
+        adder = self.adder
+        no_token = adder.rem_total_tokens <= 0 or adder.cur_rem_tokens <= 0
+        if not no_token and adder.is_hybrid_swa:
+            no_token = adder.rem_swa_tokens <= 0
+        return no_token
+
+    def immediate_token_equiv(self) -> int:
+        """This-pass remaining budget in tokens — the ignore-eos solvency
+        heuristic's input."""
+        return self.adder.cur_rem_tokens
+
+    # -- chunked-prefill length derivation --
+
+    def chunk_memory_cap(self, chunk_cap: int, req: Req) -> int:
+        """Memory-bound cap on a chunked-prefill admission this pass (the one
+        gate that DERIVES the admitted length from the budget)."""
+        adder = self.adder
+        v = min(chunk_cap, int(adder.rem_total_tokens))
+        if adder.is_hybrid_swa:
+            # alloc_extend needs extend_num_tokens + page_size per request,
+            # so reserve one page here to avoid OOM.
+            v = min(v, int(adder.rem_swa_tokens) - adder.page_size)
+        return v
+
+    # -- preemption --
+
+    def preemption_demand(self, req: Req, extend_len: int) -> int:
+        """Tokens that must be freed by preemption for `req` to fit
+        (<= 0 == already fits)."""
+        return (
+            extend_len
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            - self.adder.rem_total_tokens
+        )
+
+    def running_request_credit(self, req: Req) -> int:
+        """Budget credit released by preempting one running request."""
+        return self._running_request_total_token_offset(req)
+
+    def uncharge_running(self, req: Req) -> None:
+        """Release a preempted running request's per-pass charge."""
+        self.adder.rem_total_token_offset -= (
+            self._running_request_total_token_offset(req)
+        )
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -464,6 +630,7 @@ class PrefillAdder:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
+        self.num_mixed_decode_tokens = num_mixed_decode_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -475,66 +642,29 @@ class PrefillAdder:
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
 
-        # Unified-pool joint budget costs — computed BEFORE the running-batch
-        # loop below because `_get_running_request_total_token_offset` charges
-        # each running request's spec-band slot (see `_spec_band_slot_cost`).
-        self._mamba_slot_cost = 0
-        # Per-running-request spec-state band charge (0 when spec is off). Kept
-        # SEPARATE from `_mamba_slot_cost` because a fresh mamba slot is owed only
-        # by requests with no cached state, whereas a band slot is owed by EVERY
-        # verify-row (see `_mamba_gap_budget_for_req`).
-        self._spec_band_slot_cost = 0
-        if isinstance(
-            self.token_to_kv_pool_allocator, UnifiedMambaTokenToKVPoolAllocator
-        ):
-            self._mamba_slot_cost = (
-                self.token_to_kv_pool_allocator.mamba_slot_full_token_cost()
-            )
-            self._spec_band_slot_cost = (
-                self.token_to_kv_pool_allocator.spec_band_full_token_cost()
-            )
-        # Slots a fresh-state admission will consume: the active state slot,
-        # plus — when the radix tree checkpoints mamba states — the tree
-        # checkpoint `cache_unfinished_req` allocates and LOCKS while the
-        # request runs (`_alloc_mamba_slot` is a fail-loud assert, reached
-        # under load when only the active slot is charged). Deeper trees per
-        # request are covered by mamba eviction, mirroring upstream.
-        # (Read the tree cache directly: `self.is_hybrid_ssm_cache` is only
-        # assigned further down in this __init__.)
-        self._mamba_slots_per_admit = (
-            2 if self.tree_cache.supports_mamba() else 1
+        # Admission budget: ONE object owns every memory admission gate/charge
+        # this pass. The allocator may supply a specialized budget via the
+        # `make_admission_budget` base hook (the unified memory pool); the
+        # default is the token budget, which carries the pre-extraction token
+        # arithmetic bit-for-bit. Constructed BEFORE the running-batch charge
+        # below because per-pass constant reserves (e.g. the spec-band
+        # alignment margin) are applied at construction. TYPE-level lookup so
+        # bare test mocks (no spec=) fall through to the default budget
+        # instead of returning an auto-created mock.
+        _make_budget = getattr(
+            type(token_to_kv_pool_allocator), "make_admission_budget", None
         )
-        # Unified SWA joint-budget cross-charge (None on every other
-        # allocator): converts a request's swa-side byte budget into
-        # full-token-equivalents. Both per-side views alias the SAME shared
-        # gap under the unified pool, so the swa bytes must ALSO be charged
-        # against the full-token budget — see `_swa_gap_budget_for_req`.
-        self._swa_full_token_cost = getattr(
-            self.token_to_kv_pool_allocator, "swa_full_token_cost", None
+        self.budget = (
+            _make_budget(token_to_kv_pool_allocator, self)
+            if _make_budget is not None
+            else None
         )
-        if self._spec_band_slot_cost:
-            # Constant (per-pass, NOT per-request) band-page ALIGNMENT reserve.
-            # `place_band`'s region ceils its low bound and floors its high bound,
-            # losing up to 2 band slots of the byte gap; admission must keep that
-            # headroom free ON TOP of the per-request band charges, or a full-bs
-            # placement fails exactly at the reserve boundary when band-page
-            # rounding eats the last slot of the aligned region. Charged to BOTH
-            # budgets — capacity-side margin alone provably cannot widen the
-            # runtime gap (a capacity shift leaves the runtime gap identical).
-            _align_reserve = (
-                SPEC_BAND_ALIGNMENT_MARGIN_SLOTS * self._spec_band_slot_cost
-            )
-            self.rem_total_token_offset += _align_reserve
-            self.cur_rem_token_offset += _align_reserve
+        if self.budget is None:
+            self.budget = TokenAdmissionBudget(self)
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
-            self.rem_total_token_offset += sum(
-                [
-                    self._get_running_request_total_token_offset(r)
-                    for r in running_batch.reqs
-                ]
-            )
+            self.budget.charge_running(running_batch.reqs)
 
         # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
         # exposes the full SWA allocator interface.
@@ -561,24 +691,6 @@ class PrefillAdder:
 
         self.rem_swa_token_offset = 0
 
-        # (Unified-pool joint-budget costs `_mamba_slot_cost` /
-        # `_spec_band_slot_cost` are computed ABOVE the running-batch offset
-        # loop — running requests carry their band slot in every pass.)
-
-        # `mamba_gap_reserve` is charged to `rem_total_tokens`, which INCLUDES
-        # `full_evictable_size()` — but `alloc_req_slots` can only recover
-        # MAMBA-recoverable bytes for a mamba slot (shared gap + peer holes +
-        # mamba-evictable radix), NOT full-evictable. Gate new mamba slots on
-        # that mamba-recoverable budget separately or an over-admit hits the
-        # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
-        self.rem_mamba_slots = None
-        if self._mamba_slot_cost:
-            self.rem_mamba_slots = (
-                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
-            )
-            if self.is_hybrid_ssm_cache:
-                self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
-
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
@@ -597,21 +709,6 @@ class PrefillAdder:
         max_running_reqs = dllm_config.max_running_requests
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
-
-    def _get_running_request_total_token_offset(self, req: Req) -> int:
-        # `_spec_band_slot_cost`: a RUNNING request occupies one spec-state band
-        # slot at every verify step, so each pass's budget must keep its band
-        # bytes free. Charging only at admission is insufficient — offsets are
-        # per-pass, so later passes would admit new requests into the running
-        # requests' band reserve.
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * self.new_token_ratio
-            + self._spec_band_slot_cost
-        )
 
     @property
     def rem_total_tokens(self):
@@ -692,54 +789,11 @@ class PrefillAdder:
             budget += self.ceil_paged_tokens(swa_host_hit_length)
         return budget
 
-    def _mamba_gap_budget_for_req(self, req: Req) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's new
-        mamba state. Charged only on the SHARED Mamba pool (`_mamba_slot_cost > 0`)
-        and only when the req has no state yet (`mamba_pool_idx is None`, mirroring
-        `HybridReqToTokenPool.alloc`); 0 keeps baseline / SWA / non-Mamba unchanged.
-
-        Conservative by design (`_mamba_slot_cost` rounds UP). Does NOT reserve
-        radix COW headroom or locked-but-evictable bytes — that residual is
-        backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
-        over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
-        # Spec-state band: EVERY verify-row occupies a band slot when spec is on,
-        # whether the mamba state is fresh or radix-reused — so charge it
-        # unconditionally — radix cache hits must not skip it, or admission
-        # over-admits and `place_band(bs)` fails. `_update_prefill_budget` decrements the
-        # mamba-slot count only for the fresh-mamba portion.
-        reserve = self._spec_band_slot_cost
-        if self._mamba_slot_cost and req.mamba_pool_idx is None:
-            # Fresh state: active slot + (radix-on) the tree checkpoint the
-            # request will lock — see `_mamba_slots_per_admit`.
-            reserve += self._mamba_slot_cost * self._mamba_slots_per_admit
-        return reserve
-
-    def _swa_gap_budget_for_req(self, swa_budget_tokens: int) -> int:
-        """Shared-gap reservation (full-token-equivalents) for a request's
-        swa-side budget. Non-zero only on the unified SWA composite
-        (`swa_full_token_cost` present): there, full and swa share ONE byte
-        buffer and both per-side budget views credit the SAME gap, so a
-        request's swa bytes must also be charged against the full-token gate
-        and offsets or the dual gate promises the gap twice (over-admission →
-        fail-loud extend shortfall). Mirror of `_mamba_gap_budget_for_req`.
-        0 keeps baseline SWA (physically disjoint pools) byte-identical."""
-        if self._swa_full_token_cost is None:
-            return 0
-        return self._swa_full_token_cost(swa_budget_tokens)
-
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
-        no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
-        if not no_token and self.is_hybrid_swa:
-            no_token = self.rem_swa_tokens <= 0
-        # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
-        # cover a mamba slot, which needs mamba-recoverable bytes (see __init__).
-        if not no_token and self.rem_mamba_slots is not None:
-            no_token = self.rem_mamba_slots <= 0
-        if no_token:
+        if self.budget.exhausted():
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
@@ -760,48 +814,17 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
-        mamba_gap_reserve: int = 0,
+        cost=None,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
-        # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
-        # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
-        # immediately (counts against `cur_rem`) and held for the request lifetime
-        # (counts against `rem_total`). See `_mamba_gap_budget_for_req`.
-        self.rem_total_token_offset += (
-            extend_input_len + max_new_tokens + page_overhead + mamba_gap_reserve
-        )
-        self.cur_rem_token_offset += (
-            extend_input_len + page_overhead + mamba_gap_reserve
-        )
-        # The new mamba slot also consumes one mamba-recoverable slot (gated
-        # separately so full_evictable can't cover it — see __init__). Decrement
-        # ONLY when a FRESH mamba slot was taken: `mamba_gap_reserve` exceeding the
-        # band-only charge means the mamba portion is present (a radix-reused state
-        # charges the band alone and consumes no mamba slot).
-        if (
-            mamba_gap_reserve > self._spec_band_slot_cost
-            and self.rem_mamba_slots is not None
-        ):
-            self.rem_mamba_slots -= self._mamba_slots_per_admit
+        # Charge the admitted candidate to the admission budget (offsets /
+        # byte ledger — budget-owned). `cost` comes from the SAME budget's
+        # `prefill_cost(...)`; call sites without a memory gate pass the
+        # charge-only cost for the request.
+        self.budget.charge(cost, extend_input_len, max_new_tokens)
         self.rem_input_tokens -= extend_input_len
-
-        if self.is_hybrid_swa:
-            swa_budget = self._swa_budget_for_req(extend_input_len)
-            self.rem_swa_token_offset += swa_budget
-            # Unified SWA composite: the swa bytes leave the SAME shared
-            # buffer the full-token budgets are backed by — charge their
-            # full-token-equivalents to BOTH offsets (mirroring
-            # `mamba_gap_reserve` above; conservative: the full window-floored
-            # budget is charged even though only the extend part is allocated
-            # this pass — the floor part follows at decode rate). 0 on
-            # baseline SWA (disjoint pools), keeping upstream byte-identical.
-            swa_gap_reserve = self._swa_gap_budget_for_req(swa_budget)
-            self.rem_total_token_offset += swa_gap_reserve
-            self.cur_rem_token_offset += swa_gap_reserve
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -846,7 +869,7 @@ class PrefillAdder:
             trunc_len,
             0,
             req.retracted_stain,
-            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            cost=self.budget.prefill_cost(req, 0, 0),
         )
 
     def _req_inc_lock_ref(self, req: Req):
@@ -881,7 +904,7 @@ class PrefillAdder:
             req.extend_range.length,
             max_new_tokens,
             req.retracted_stain,
-            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            cost=self.budget.prefill_cost(req, 0, 0),
         )
 
         # Return based on remaining token availability
@@ -895,28 +918,11 @@ class PrefillAdder:
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
-            _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-            if self.is_hybrid_swa:
-                # Unified SWA composite: this is the one gate that DERIVES the
-                # admitted length from the budget, so the swa cross-charge must
-                # deflate the bound itself — the chunk allocates on BOTH sides
-                # of the shared buffer, and sizing it from the full-side budget
-                # alone over-promises the gap by ~len*e_swa/e_full exactly in
-                # the memory-bound truncation regime. One-shot deflation with
-                # the charge of the UNdeflated candidate is conservative
-                # (the charge is monotone in the length). 0 on baseline SWA.
-                _rem_tokens = min(
-                    _rem_tokens,
-                    int(self.rem_total_tokens)
-                    - self._swa_gap_budget_for_req(
-                        self._swa_budget_for_req(max(0, _rem_tokens))
-                    ),
-                )
-                # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM
-                _rem_tokens = min(
-                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
-                )
+            # The one gate that DERIVES the admitted length from the memory
+            # budget — the budget owns the derivation (token impl: min with
+            # the lifetime budget + the hybrid-SWA deflation/clamp; byte impl:
+            # closed form over the byte ledger).
+            _rem_tokens = self.budget.chunk_memory_cap(self.rem_chunk_tokens, req)
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
@@ -956,7 +962,7 @@ class PrefillAdder:
                 else 0
             ),
             req.retracted_stain,
-            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+            cost=self.budget.prefill_cost(req, 0, 0),
         )
 
         # Return if chunked prefill not finished
@@ -983,20 +989,8 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        paged_input = self.ceil_paged_tokens(cand_extend_input_len)
-        # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
-        # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
-        paged_input += self._mamba_gap_budget_for_req(req)
-        swa_needed = 0
-        if self.is_hybrid_swa:
-            swa_needed = self._swa_budget_for_req(cand_extend_input_len)
-            # Unified SWA: cross-charge the swa bytes into the full-token gate
-            # (0 on baseline SWA) — see _swa_gap_budget_for_req.
-            paged_input += self._swa_gap_budget_for_req(swa_needed)
-        _budget_floor = min(self.cur_rem_tokens, self.rem_total_tokens)
-        if paged_input > _budget_floor:
-            return AddReqResult.NO_TOKEN
-        if self.is_hybrid_swa and swa_needed > self.rem_swa_tokens:
+        cost = self.budget.prefill_cost(req, cand_extend_input_len, 0)
+        if not self.budget.fits_immediate(cost):
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -1035,7 +1029,7 @@ class PrefillAdder:
         if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
+            cur_rem_tokens = self.budget.immediate_token_equiv() - self.ceil_paged_tokens(
                 cand_extend_input_len
             )
             tokens_freed = 0
@@ -1074,7 +1068,7 @@ class PrefillAdder:
                 req.extend_range.length,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
-                mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                cost=cost,
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -1094,7 +1088,7 @@ class PrefillAdder:
                 trunc_len,
                 0,
                 req.retracted_stain,
-                mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                cost=cost,
             )
 
         return self.budget_state()
@@ -1134,29 +1128,25 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
-        # Shared Mamba pool: fold the new mamba state's shared-gap cost into
-        # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
-        total_tokens += self._mamba_gap_budget_for_req(req)
-        swa_needed = 0
-        if self.is_hybrid_swa:
-            swa_needed = self._swa_budget_for_req(
-                cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
-            )
-            # Unified SWA composite: the swa bytes come out of the SAME shared
-            # buffer as the full-side tokens — cross-charge them into the
-            # full-token gate too (0 on baseline SWA's disjoint pools).
-            total_tokens += self._swa_gap_budget_for_req(swa_needed)
+        cost = self.budget.prefill_cost(
+            req,
+            cand_extend_input_len,
+            max_new,
+            # Only the hybrid-SWA path consults the swa host-hit length; read it
+            # lazily so the non-SWA path never dereferences it (matches the
+            # pre-extraction behavior — the old gate accessed it only inside
+            # `if self.is_hybrid_swa`).
+            swa_host_hit_length=(
+                req.swa_host_hit_length if self.is_hybrid_swa else 0
+            ),
+        )
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
-            return AddReqResult.NO_TOKEN
-
-        if self.is_hybrid_swa and swa_needed >= self.rem_swa_tokens:
+        if not self.budget.fits(cost):
             return AddReqResult.NO_TOKEN
 
         if (
@@ -1170,16 +1160,9 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            # The budget views may decrease after the lock acquisition
+            if not self.budget.fits(cost):
                 return AddReqResult.NO_TOKEN
-
-            if self.is_hybrid_swa:
-                swa_needed = self._swa_budget_for_req(
-                    cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
-                )
-                if swa_needed >= self.rem_swa_tokens:
-                    return AddReqResult.NO_TOKEN
 
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
@@ -1233,7 +1216,7 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    cost=cost,
                 )
             else:
                 # Make sure at least one page is available
@@ -1274,7 +1257,7 @@ class PrefillAdder:
                     trunc_len,
                     0,
                     req.retracted_stain,
-                    mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+                    cost=cost,
                 )
 
         return self.budget_state()
@@ -1309,26 +1292,14 @@ class PrefillAdder:
 
         preemptible_reqs = []
         extend_len = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
-        min_tokens_to_remove = (
-            extend_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            - self.rem_total_tokens
-        )
-        if self.is_hybrid_swa:
-            # Unified SWA: the candidate's swa bytes are charged against the
-            # full-token budget too (cross-charge, 0 on baseline) — include
-            # them in the demand estimate or preemption frees too little and
-            # add_one_req re-rejects (wasted preemption, not unsoundness).
-            min_tokens_to_remove += self._swa_gap_budget_for_req(
-                self._swa_budget_for_req(extend_len)
-            )
+        min_tokens_to_remove = self.budget.preemption_demand(req, extend_len)
         for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
             priority_diff = (req.priority - running_req.priority) * (-priority_sign)
 
             if priority_diff > self.priority_scheduling_preemption_threshold:
                 preemptible_reqs.append(running_req)
-                min_tokens_to_remove -= self._get_running_request_total_token_offset(
+                min_tokens_to_remove -= self.budget.running_request_credit(
                     running_req
                 )
                 if min_tokens_to_remove <= 0:
@@ -1346,9 +1317,7 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
-                self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(running_req)
-                )
+                self.budget.uncharge_running(running_req)
                 release_counter += 1
                 self.running_batch.release_req(
                     i, len(self.running_batch.reqs) - release_counter, server_args

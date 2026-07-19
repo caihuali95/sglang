@@ -27,6 +27,7 @@ import logging
 import os
 from typing import Dict, List, Optional, Set, Tuple
 
+import msgspec
 import torch
 from torch.profiler import record_function
 
@@ -49,10 +50,340 @@ logger = logging.getLogger(__name__)
 # page-aligned placement: `SpecStateBandAllocator._region_bounds_pages` ceils the
 # low frontier and floors the high frontier, losing up to 2 band slots of the byte
 # gap. The reserve is enforced where it actually bounds the RUNTIME gap — the
-# admission/decode token budgets (schedule_policy / check_decode_mem) — since a
+# admission/decode budgets (schedule_policy / check_decode_capacity) — since a
 # capacity-side margin provably cannot widen the runtime gap (a capacity
 # shift leaves the runtime gap byte-identical).
 SPEC_BAND_ALIGNMENT_MARGIN_SLOTS = 3
+
+
+def _verify_two_end_byte_accounting(
+    up: "MultiEndedAllocator",
+    down: "MultiEndedAllocator",
+    band,  # Optional[SpecStateBandAllocator]
+    total_bytes: int,
+) -> List[str]:
+    """Idle-time byte-conservation invariants of a two-end (+ optional float
+    band) shared buffer. Returns problem strings (empty == healthy). Runs
+    AFTER `on_idle_proceed()`.
+
+    These invariants add the buffer-level STRUCTURE the token-identity leak
+    check is blind to (its dynamic self-canceling totals eliminate the
+    free-space term). They are chosen to be ROBUSTLY idle-true — they never
+    false-positive on a healthy pool — because the checker raises under
+    `SGLANG_ENABLE_STRICT_UNIFIED_BYTE_CHECK`:
+
+    - (A) is a BOUND `0 <= live <= span`, NOT the exact page equation
+      `span == live + holes + pending`. The exact equation is path-dependent:
+      the urgent single-pass absorb retreats the watermark PAST reclaimed
+      pages while their compaction srcs sit in `_pending_reuse` — so pending
+      pages are then OUTSIDE the span, and the equation is off by `pending`
+      at an idle that follows an urgent absorb. The bound catches gross
+      live-count corruption (negative / exceeding the span) without depending
+      on the interior-vs-exterior split.
+    - (D) pinned-band-at-idle is deliberately NOT flagged: a stale pin is a
+      SELF-HEALING condition (`recover_stale_pin` in prepare_for_decode
+      re-places the band), not a byte leak — raising on it would crash on a
+      state the system is designed to recover from.
+
+    Radix-side slot conservation stays with the token identity (kept running
+    for unified during validation).
+    """
+    problems: List[str] = []
+
+    def side(a: "MultiEndedAllocator", name: str):
+        # (A) live pages are a subset of the watermark span (bound, not the
+        # exact equation — see the docstring). Lazy mode only; eager keeps no
+        # holes and does not maintain live_page_count.
+        if a.lazy_compaction:
+            span = a._allocated_pages()
+            live = a.live_page_count
+            if not (0 <= live <= span):
+                problems.append(
+                    f"[{name}] live page count out of range: "
+                    f"live={live} not in [0, span={span}]"
+                )
+        # (C) frontier sanity per side.
+        lo, hi = a._byte_low_frontier(), a._byte_high_frontier()
+        if not (0 <= lo <= hi <= total_bytes):
+            problems.append(
+                f"[{name}] frontier out of bounds: low={lo} high={hi} "
+                f"total={total_bytes}"
+            )
+
+    side(up, f"up:{up.sub_pool_name}")
+    side(down, f"down:{down.sub_pool_name}")
+
+    # (C/E) inter-end ordering: up's high frontier must not cross down's low.
+    gap = down._byte_low_frontier() - up._byte_high_frontier()
+    if gap < 0:
+        problems.append(
+            f"frontier collision: up_high={up._byte_high_frontier()} > "
+            f"down_low={down._byte_low_frontier()}"
+        )
+
+    if band is not None:
+        band_live = band._allocated_pages() * band.entry_bytes_per_page
+        if band_live > 0:
+            # (E) a placed band must sit INSIDE the inter-end gap.
+            b_lo, b_hi = band._byte_low_frontier(), band._byte_high_frontier()
+            if not (up._byte_high_frontier() <= b_lo <= b_hi <= down._byte_low_frontier()):
+                problems.append(
+                    f"band outside the inter-end gap: band=[{b_lo},{b_hi}] "
+                    f"gap=[{up._byte_high_frontier()},{down._byte_low_frontier()}]"
+                )
+            if band_live > max(0, gap):
+                problems.append(
+                    f"band live bytes exceed the gap: band_live={band_live} "
+                    f"gap={gap}"
+                )
+
+    return problems
+
+
+class PrefillCostBytes(msgspec.Struct):
+    """Byte cost of admitting one request to prefill on a unified composite.
+
+    Returned by the composites' `new_request_prefill_cost_bytes(...)` and
+    consumed by the byte admission budget: `immediate_bytes` is charged to the
+    this-pass budget (the request's extend allocation + page overhead + any
+    state/band bytes taken at admission), `lifetime_bytes` additionally
+    carries the estimated decode output (>= immediate). `fresh_mamba_slots`
+    counts NEW mamba state slots (0 = radix-reused state or non-mamba family)
+    — a distinct gated resource: full-evictable bytes cannot produce a mamba
+    slot at alloc time."""
+
+    immediate_bytes: int
+    lifetime_bytes: int
+    fresh_mamba_slots: int = 0
+
+
+class ByteAdmissionBudget:
+    """Byte-denominated admission budget for the unified composites (the
+    allocator's native currency), returned by `make_admission_budget` and
+    consumed by the `PrefillAdder` through the same protocol as the default
+    token budget.
+
+    One instance per prefill pass. The ledger tracks two byte offsets
+    (immediate = this pass's allocations; lifetime = + estimated decode
+    output) against a single availability view:
+    `schedulable_free_bytes() + evictable bytes` — free and evictable bytes
+    are single-counted by construction (ONE ledger, no per-side
+    full-token-equivalent cross-charges, no ceil rounding). The
+    fresh-mamba-slot gate survives as a slot count INSIDE the budget: it
+    gates a distinct resource (full-evictable bytes cannot produce a mamba
+    slot at alloc time; only gap/hole/band/mamba-evictable bytes can).
+
+    Index-space caps are deliberately ignored: under the unified pool every
+    sub-pool's index space spans the whole buffer
+    (max_slots = total_bytes // entry_bytes), so byte feasibility implies
+    index feasibility; the alloc-time machinery (evict / retract / band probe
+    / fail-loud) backstops the planner as before.
+    """
+
+    def __init__(self, allocator, adder):
+        self.allocator = allocator
+        self.adder = adder
+        self.is_swa = hasattr(allocator, "swa_attn_allocator")
+        self.lifetime_offset_bytes = 0
+        self.immediate_offset_bytes = 0
+        self._e_f = allocator.full_attn_allocator.entry_bytes
+        self._e_s = (
+            allocator.swa_attn_allocator.entry_bytes if self.is_swa else 0
+        )
+        band = getattr(allocator, "spec_state_allocator", None)
+        self._band_epp = band.entry_bytes_per_page if band is not None else 0
+        self._mamba_epp = (
+            allocator.mamba_allocator.entry_bytes_per_page
+            if not self.is_swa
+            else 0
+        )
+        # Slots a fresh-state admission consumes: the active state slot, plus
+        # (radix-on) the tree checkpoint the request will lock.
+        self._mamba_slots_per_admit = (
+            2 if (not self.is_swa and adder.tree_cache.supports_mamba()) else 1
+        )
+        if self._band_epp:
+            # Per-pass band-page ALIGNMENT reserve (see
+            # SPEC_BAND_ALIGNMENT_MARGIN_SLOTS): charged once to both offsets.
+            reserve = SPEC_BAND_ALIGNMENT_MARGIN_SLOTS * self._band_epp
+            self.lifetime_offset_bytes += reserve
+            self.immediate_offset_bytes += reserve
+        # Separate fresh-mamba-slot gate (None on the SWA composite).
+        self.rem_mamba_slots = None
+        if not self.is_swa:
+            self.rem_mamba_slots = (
+                allocator.mamba_allocator.schedulable_available_size()
+            )
+            if adder.tree_cache.supports_mamba():
+                self.rem_mamba_slots += adder.tree_cache.mamba_evictable_size()
+        # Mixed-decode tokens allocated this pass alongside the prefill: they
+        # consume real buffer bytes (BOTH sides on the SWA composite — every
+        # composite token allocates both; the token budget under-counted this).
+        n_mixed = getattr(adder, "num_mixed_decode_tokens", 0)
+        if n_mixed:
+            mixed_bytes = n_mixed * (self._e_f + self._e_s)
+            self.lifetime_offset_bytes += mixed_bytes
+            self.immediate_offset_bytes += mixed_bytes
+
+    # -- availability (ONE view) --
+
+    def _evictable_bytes(self) -> int:
+        tree = self.adder.tree_cache
+        ev = tree.full_evictable_size() * self._e_f
+        if self.is_swa:
+            # Evicting a joint node frees BOTH sides' bytes — physically
+            # exact under the shared buffer (the token budget could not
+            # credit the swa side).
+            ev += tree.swa_evictable_size() * self._e_s
+        return ev
+
+    def lifetime_remaining(self) -> int:
+        return (
+            self.allocator.schedulable_free_bytes()
+            + self._evictable_bytes()
+            - self.lifetime_offset_bytes
+        )
+
+    def immediate_remaining(self) -> int:
+        return (
+            self.allocator.schedulable_free_bytes()
+            + self._evictable_bytes()
+            - self.immediate_offset_bytes
+        )
+
+    # -- running-batch charges --
+
+    def _running_est_bytes(self, req) -> int:
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+
+        est_tokens = (
+            min(
+                req.sampling_params.max_new_tokens - len(req.output_ids),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            * self.adder.new_token_ratio
+        )
+        # A running request's future decode consumes both sides per token on
+        # the SWA composite, and one band slot per verify step on the mamba
+        # composite (spec on).
+        return int(est_tokens * (self._e_f + self._e_s)) + self._band_epp
+
+    def charge_running(self, reqs) -> None:
+        self.lifetime_offset_bytes += sum(
+            self._running_est_bytes(r) for r in reqs
+        )
+
+    # -- per-candidate cost / gates / charge --
+
+    def _fresh_mamba_slots(self, req) -> int:
+        if self.is_swa or self.rem_mamba_slots is None:
+            return 0
+        return self._mamba_slots_per_admit if req.mamba_pool_idx is None else 0
+
+    def prefill_cost(
+        self,
+        req,
+        cand_extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int = 0,
+    ) -> PrefillCostBytes:
+        adder = self.adder
+        extend_paged = adder.ceil_paged_tokens(cand_extend_input_len)
+        if self.is_swa:
+            return self.allocator.new_request_prefill_cost_bytes(
+                extend_tokens_paged=extend_paged,
+                max_new_tokens=max_new_tokens,
+                page_size=adder.page_size,
+                swa_budget_tokens=adder._swa_budget_for_req(
+                    cand_extend_input_len,
+                    swa_host_hit_length=swa_host_hit_length,
+                ),
+            )
+        return self.allocator.new_request_prefill_cost_bytes(
+            extend_tokens_paged=extend_paged,
+            max_new_tokens=max_new_tokens,
+            page_size=adder.page_size,
+            fresh_mamba_slots=self._fresh_mamba_slots(req),
+        )
+
+    def fits(self, cost: PrefillCostBytes) -> bool:
+        return cost.lifetime_bytes < self.lifetime_remaining()
+
+    def fits_immediate(self, cost: PrefillCostBytes) -> bool:
+        return cost.immediate_bytes <= min(
+            self.immediate_remaining(), self.lifetime_remaining()
+        )
+
+    def charge(
+        self, cost: PrefillCostBytes, extend_input_len: int, max_new_tokens: int
+    ) -> None:
+        """Charge the ADMITTED length (may be truncated vs the gate-time
+        candidate — chunked prefill), recomputing the length-dependent parts;
+        `cost` supplies the state decision (fresh mamba slots) made at gate
+        time."""
+        adder = self.adder
+        imm = (extend_input_len + adder.page_size) * self._e_f
+        imm += cost.fresh_mamba_slots * self._mamba_epp + self._band_epp
+        if self.is_swa:
+            imm += adder._swa_budget_for_req(extend_input_len) * self._e_s
+        self.immediate_offset_bytes += imm
+        self.lifetime_offset_bytes += imm + max_new_tokens * self._e_f
+        if cost.fresh_mamba_slots and self.rem_mamba_slots is not None:
+            self.rem_mamba_slots -= cost.fresh_mamba_slots
+
+    def exhausted(self) -> bool:
+        if self.lifetime_remaining() <= 0 or self.immediate_remaining() <= 0:
+            return True
+        if self.rem_mamba_slots is not None and self.rem_mamba_slots <= 0:
+            return True
+        return False
+
+    def immediate_token_equiv(self) -> int:
+        """Full-token-equivalents of the immediate budget — ONLY for the
+        ignore-eos solvency heuristic (a documented conservative floor)."""
+        return self.immediate_remaining() // self._e_f
+
+    # -- chunked-prefill length derivation (closed form over the ledger) --
+
+    def chunk_memory_cap(self, chunk_cap: int, req) -> int:
+        rem = self.lifetime_remaining()
+        page = self.adder.page_size
+        if not self.is_swa:
+            fixed = (
+                page * self._e_f
+                + self._fresh_mamba_slots(req) * self._mamba_epp
+                + self._band_epp
+            )
+            v = (rem - fixed) // self._e_f
+            return min(chunk_cap, v)
+        # SWA: the swa-side budget is window-floored
+        # (`_swa_budget_for_req(v) = max(v, W) + page`), giving two regimes.
+        # cost(v >= W) = (v + page)(e_f + e_s); cost(v < W) =
+        # (v + page)e_f + (W + page)e_s. Continuous at v == W, so:
+        W = self.adder.tree_cache.sliding_window_size
+        v_a = rem // (self._e_f + self._e_s) - page
+        if v_a >= W:
+            return min(chunk_cap, v_a)
+        v_b = (rem - (W + page) * self._e_s) // self._e_f - page
+        return min(chunk_cap, v_b)
+
+    # -- preemption (bytes on both sides of the demand/credit arithmetic) --
+
+    def preemption_demand(self, req, extend_len: int) -> int:
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+
+        cost = self.prefill_cost(
+            req,
+            extend_len,
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+        )
+        return cost.lifetime_bytes - self.lifetime_remaining()
+
+    def running_request_credit(self, req) -> int:
+        return self._running_est_bytes(req)
+
+    def uncharge_running(self, req) -> None:
+        self.lifetime_offset_bytes -= self._running_est_bytes(req)
 
 import atexit
 import signal
@@ -2288,52 +2619,161 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
 
-    def mamba_slot_full_token_cost(self) -> int:
-        """Full-token-equivalents of shared-gap bytes ONE mamba state consumes.
+    # (The full-token-equivalent converters — `mamba_slot_full_token_cost`,
+    # `spec_band_full_token_cost`, `spec_band_reserve_full_tokens` — are gone:
+    # admission runs on the byte surface below. The band-vs-mamba charging
+    # rationale they documented lives on in `new_request_prefill_cost_bytes`
+    # / `new_token_decode_cost_bytes`: the band slot is charged on EVERY
+    # admit and per running request — every verify-row occupies one, radix-hit
+    # or not — while fresh mamba slots are charged only to requests with no
+    # cached state.)
 
-        full and mamba share one byte buffer, so a mamba slot removes that many
-        full-KV tokens from the gap; the prefill planner reserves this so admission
-        stays inside the JOINT budget. = mamba bytes/slot ÷ full bytes/token, rounded
-        UP (conservative). Only on the shared composite (non-shared pools are separate,
-        so the planner sources this via `getattr(..., None)`).
-
-        Mamba-slot only; the spec-state band's per-request charge is separate
-        (`spec_band_full_token_cost`) because it is owed by EVERY running request,
-        not just those taking a fresh mamba slot.
+    def check_decode_capacity(
+        self, tree_cache, num_tokens: int, num_reqs: int
+    ) -> bool:
+        """Decode-capacity gate (allocator-owned; see the base hook), in
+        BYTES: the next step's full-KV tokens plus the spec-state band
+        reserve (one band slot per request + alignment margin; 0 when spec is
+        off) — reserved here, in the same check the retract loop converges
+        on, so a band shortfall retracts gracefully instead of tripping the
+        fail-loud RuntimeError at `place_spec_state_band_for_decode`.
         """
-        per_req_bytes = self.mamba_allocator.entry_bytes_per_page
-        return -(-per_req_bytes // self.full_attn_allocator.entry_bytes)
+        need_bytes = self.new_token_decode_cost_bytes(
+            num_reqs=num_reqs, new_tokens=num_tokens
+        )
+        self._evict_to_free_bytes(tree_cache, need_bytes)
+        if self.schedulable_free_bytes() < need_bytes:
+            return False
+        if self.spec_state_allocator is not None:
+            # Byte budget holds; validate the GEOMETRY with a zero-copy
+            # placement probe (band-page alignment can still cost up to the
+            # margin). The probe IS a legal placement — the band is movable
+            # between pin windows, and prepare_for_decode re-places it
+            # (identical placement is a no-op). Skip when pinned (verify in
+            # flight); the stale-pin recovery in
+            # place_spec_state_band_for_decode owns that path.
+            if not self.spec_state_allocator._band_pinned:
+                return self.place_spec_state_band(num_reqs)
+        return True
 
-    def spec_band_full_token_cost(self) -> int:
-        """Full-token-equivalents of shared-gap bytes ONE spec-state band slot
-        consumes, or 0 when spec is off.
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool:
+        """Allocator-owned eviction sizing (base hook): full-KV and mamba
+        state share ONE byte buffer, so eviction is sized against the joint
+        byte ledger rather than the per-side token views."""
+        self._evict_to_free_bytes(
+            tree_cache, self.alloc_tokens_to_bytes(num_tokens)
+        )
+        return True
 
-        Charged PER RUNNING REQUEST at admission: every verify-row occupies a band
-        slot whether its mamba state is fresh or radix-reused, so charging it only
-        for fresh-mamba requests (as folding it into `mamba_slot_full_token_cost`
-        did) under-reserves the band under radix cache and `place_band(bs)` fails
-        at the next decode step (an over-admission class: radix cache hits let the
-        band reservation be skipped).
-        """
-        if self.spec_state_allocator is None:
-            return 0
-        return -(
-            -self.spec_state_allocator.entry_bytes_per_page
-            // self.full_attn_allocator.entry_bytes
+    def _evict_to_free_bytes(self, tree_cache, need_bytes: int) -> None:
+        """Bounded progress-checked byte eviction loop: evicting a node frees
+        full-side bytes exactly, but tombstoned nodes can dilute the gain —
+        re-check bytes each pass instead of trusting a one-shot conversion."""
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        for _ in range(4):
+            free = self.schedulable_free_bytes()
+            if free >= need_bytes:
+                break
+            before = tree_cache.full_evictable_size()
+            tree_cache.evict(self.shortfall_to_evict_params(need_bytes - free))
+            if tree_cache.full_evictable_size() >= before:
+                break  # nothing evictable left; the caller's gate decides
+
+    # -- byte-denominated admission surface (the allocator's native currency) --
+
+    def schedulable_free_bytes(self) -> int:
+        """Free bytes of the shared buffer realizable for NEW allocations
+        after compaction (the schedulable view): the whole inter-end gap,
+        minus a placed spec-state band's live bytes, plus both ends' drainable
+        hole bytes, plus the band's live bytes back when it is UNPINNED (the
+        band is zero-copy reclaimable on the alloc-shortfall path). The
+        pinned/unpinned band semantics mirror `_peer_drainable_hole_bytes` —
+        this is what structurally prevents double-counting a placed band
+        against the decode-time band reserve."""
+        up = self.sub_allocators[0]
+        down = self.sub_allocators[-1]
+        gap = max(0, down._byte_low_frontier() - up._byte_high_frontier())
+        holes = (
+            len(up._free_phys_pages) * up.entry_bytes_per_page
+            + len(down._free_phys_pages) * down.entry_bytes_per_page
+        )
+        band = self.spec_state_allocator
+        if band is None:
+            return gap + holes
+        band_live = band._allocated_pages() * band.entry_bytes_per_page
+        free = gap - band_live + holes
+        if not band._band_pinned:
+            free += band_live
+        return free
+
+    def new_request_prefill_cost_bytes(
+        self,
+        *,
+        extend_tokens_paged: int,
+        max_new_tokens: int,
+        page_size: int,
+        fresh_mamba_slots: int,
+    ) -> PrefillCostBytes:
+        """Bytes one admitted request consumes: the extend allocation (+ the
+        paged allocator's one-page-per-request overhead) on the full side,
+        plus `fresh_mamba_slots` new mamba state slots, plus one spec-state
+        band slot when spec is on (charged on EVERY admit, radix-hit or not —
+        every verify-row occupies a band slot). Lifetime adds the estimated
+        decode output on the full side."""
+        e_f = self.full_attn_allocator.entry_bytes
+        state = fresh_mamba_slots * self.mamba_allocator.entry_bytes_per_page
+        band = (
+            self.spec_state_allocator.entry_bytes_per_page
+            if self.spec_state_allocator is not None
+            else 0
+        )
+        immediate = (extend_tokens_paged + page_size) * e_f + state + band
+        return PrefillCostBytes(
+            immediate_bytes=immediate,
+            lifetime_bytes=immediate + max_new_tokens * e_f,
+            fresh_mamba_slots=fresh_mamba_slots,
         )
 
-    def spec_band_reserve_full_tokens(self, num_reqs: int) -> int:
-        """Full-token-equivalents the NEXT verify step's band placement needs:
-        one band slot per running request plus the band-page alignment margin
-        (`place_band` ceils its low bound and floors its high bound, losing up
-        to 2 slots of the byte gap). 0 when spec is off. Consulted by the
-        decode-side budget (`ScheduleBatch.check_decode_mem`) so decode/retract
-        keep the band's bytes free — placement failure then flows into the
-        existing retract loop instead of the fail-loud RuntimeError."""
-        cost = self.spec_band_full_token_cost()
-        if cost == 0:
-            return 0
-        return (num_reqs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS) * cost
+    def new_token_decode_cost_bytes(self, *, num_reqs: int, new_tokens: int) -> int:
+        """Bytes the next decode step needs: `new_tokens` full-KV tokens
+        (page-aligned by the caller) plus the spec-state band reserve — one
+        band slot per running request + the band-page alignment margin (0 when
+        spec is off)."""
+        band = 0
+        if self.spec_state_allocator is not None:
+            band = (
+                num_reqs + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS
+            ) * self.spec_state_allocator.entry_bytes_per_page
+        return new_tokens * self.full_attn_allocator.entry_bytes + band
+
+    def alloc_tokens_to_bytes(self, num_tokens: int) -> int:
+        """Shared-buffer bytes `num_tokens` full-KV token allocations consume."""
+        return num_tokens * self.full_attn_allocator.entry_bytes
+
+    def shortfall_to_evict_params(self, shortfall_bytes: int):
+        """Token-denominated eviction request covering `shortfall_bytes` (the
+        radix tree evicts in tokens; the byte evict loop re-checks bytes)."""
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        t = -(-shortfall_bytes // self.full_attn_allocator.entry_bytes)
+        return EvictParams(num_tokens=t)
+
+    def verify_byte_accounting(self) -> List[str]:
+        """Idle-time byte-conservation self-check (base hook; see
+        `_verify_two_end_byte_accounting`)."""
+        return _verify_two_end_byte_accounting(
+            self.sub_allocators[0],
+            self.sub_allocators[-1],
+            self.spec_state_allocator,
+            self.unified_buffer.total_bytes,
+        )
+
+    def make_admission_budget(self, adder) -> "ByteAdmissionBudget":
+        """Admission-budget hook (base hook): byte-denominated admission —
+        gates and charges run in the allocator's native currency, replacing
+        the full-token-equivalent conversions."""
+        return ByteAdmissionBudget(self, adder)
 
     @property
     def size_full(self) -> int:
@@ -2591,12 +3031,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     replaces).
 
     Capacity views:
-    - `available_size()`: joint byte-budget, the only safe `alloc(N)` pre-check
-      (N slots cost N*(entry_full + entry_swa) shared-gap bytes).
+    - `schedulable_free_bytes()`: the ONE planner view — free bytes of the
+      shared buffer (gap + drainable holes; admission/decode/evict gate here,
+      via the byte admission budget: each token costs entry_full + entry_swa).
+    - `available_size()`: token facade over the byte view (stats/logs + the
+      token-identity check); the exact realizable-NOW 3-phase formula is the
+      private alloc-internal `_joint_realizable_now_tokens()`.
     - `schedulable_*` == `full/swa_available_size()`: byte-coordinated,
       realizable-with-compaction per-side views (NO static-cap clamp — the
       boot ratio split is not a runtime wall; admission soundness comes from
-      the `swa_full_token_cost` cross-charge in PrefillAdder).
+      the single joint byte ledger).
     - `size_full` / `size_swa`: DYNAMIC self-canceling leak totals
       (= schedulable + allocated), so the checker's invariant reduces to
       radix slot conservation at any borrow depth.
@@ -2706,7 +3150,24 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     # -- capacity reporting (three-way split) --
 
     def available_size(self) -> int:
-        """Tokens available for `alloc(N)` / `alloc_extend(N)` (TOKENS).
+        """Joint tokens available (TOKENS — base-interface facade, derived
+        from the ONE schedulable byte view: bytes // joint per-token cost).
+        Consumers: stats/logs and the token-identity leak check. The exact
+        realizable-NOW 3-phase formula is a private alloc-internal helper
+        (`_joint_realizable_now_tokens`) used only for the pre-flush decision
+        — gating planners on the schedulable view is sound because every
+        composite alloc path flushes both sides on shortfall."""
+        return (
+            self.schedulable_free_bytes()
+            // (
+                self.full_attn_allocator.entry_bytes_per_page
+                + self.swa_attn_allocator.entry_bytes_per_page
+            )
+            * self.page_size
+        )
+
+    def _joint_realizable_now_tokens(self) -> int:
+        """Realizable-NOW joint capacity (TOKENS) — alloc-internal.
 
         Joint byte-budget: each composite alloc(1) consumes one full-side AND one
         swa-side page (same virtual id). The 3-phase lazy formula consumes both
@@ -2755,38 +3216,160 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
         return K_total * self.page_size
 
-    # Per-side views read by scheduling / eviction consumers: the byte-
-    # coordinated realizable values, with NO static-cap clamp. The old
+    # Per-side views read by stats/observer consumers: the byte-coordinated
+    # realizable values, with NO static-cap clamp. The old
     # `min(boot_cap − allocated, schedulable)` conserve caps enforced the
     # boot-time swa_full_tokens_ratio split as a runtime wall (the full side
     # could never borrow the swa side's idle bytes past its boot count). The
     # caps were ALSO the admission-soundness mechanism — both per-side views
-    # alias the SAME shared gap, so without them the dual PrefillAdder gate
-    # would promise the gap twice. That job now belongs to the
-    # `swa_full_token_cost` cross-charge below (the mamba composite's
-    # `mamba_slot_full_token_cost` pattern): every admitted request's swa-side
-    # bytes are charged into the full-token budget, so the sum of promises
-    # across BOTH sides stays within the realizable bytes, single-counted.
+    # alias the SAME shared gap, so without them a dual per-side gate would
+    # promise the gap twice. That job now belongs to the byte admission
+    # budget: ONE joint ledger prices every admitted request's bytes on both
+    # sides, so the sum of promises stays within the realizable bytes,
+    # single-counted by construction.
     def full_available_size(self) -> int:
         return self.schedulable_full_available_size()
 
     def swa_available_size(self) -> int:
         return self.schedulable_swa_available_size()
 
-    def swa_full_token_cost(self, swa_budget_tokens: int) -> int:
-        """Full-token-equivalents of the shared-buffer bytes `swa_budget_tokens`
-        swa-side tokens consume: ceil(tokens · e_swa / e_full), rounded UP
-        (conservative). The PrefillAdder folds this into the full-token gate
-        and offsets for every admitted request (see `_swa_gap_budget_for_req`),
-        which is what keeps the dual per-side budgets byte-sound now that the
-        static conserve caps are gone. Only on the unified composite — the
-        planner sources it via `getattr(..., None)`, so baseline SWA
-        (physically disjoint pools, no shared gap to double-promise) charges 0
-        and keeps upstream behavior byte-identical."""
-        return -(
-            -(swa_budget_tokens * self.swa_attn_allocator.entry_bytes)
-            // self.full_attn_allocator.entry_bytes
+    # (The `swa_full_token_cost` converter is gone: what kept the dual
+    # per-side token budgets byte-sound after the static conserve caps were
+    # removed is now the byte admission budget itself — ONE joint ledger
+    # pricing e_full + e_swa per token, no cross-charge needed.)
+
+    # -- byte-denominated admission surface (the allocator's native currency) --
+
+    def schedulable_free_bytes(self) -> int:
+        """Free bytes of the shared buffer realizable for NEW allocations
+        after compaction (the schedulable view): the inter-end gap plus both
+        sides' drainable hole bytes (an urgent both-side flush converts holes
+        into gap; every composite alloc path flushes on shortfall, so gating
+        on this sum is sound). No spec-state band on this composite."""
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        if fa.grow_direction == "up":
+            gap = max(0, sa._byte_low_frontier() - fa._byte_high_frontier())
+        else:
+            gap = max(0, fa._byte_low_frontier() - sa._byte_high_frontier())
+        holes = (
+            len(fa._free_phys_pages) * fa.entry_bytes_per_page
+            + len(sa._free_phys_pages) * sa.entry_bytes_per_page
         )
+        return gap + holes
+
+    def new_request_prefill_cost_bytes(
+        self,
+        *,
+        extend_tokens_paged: int,
+        max_new_tokens: int,
+        page_size: int,
+        swa_budget_tokens: int,
+    ) -> PrefillCostBytes:
+        """Bytes one admitted request consumes: the extend allocation (+ the
+        paged allocator's one-page-per-request overhead) on the full side plus
+        the request's swa-side token budget (`_swa_budget_for_req`: window
+        floor + swa page overhead — the window-floor conservatism is retained
+        deliberately). Lifetime adds the estimated decode output on the full
+        side."""
+        e_f = self.full_attn_allocator.entry_bytes
+        e_s = self.swa_attn_allocator.entry_bytes
+        immediate = (extend_tokens_paged + page_size) * e_f + swa_budget_tokens * e_s
+        return PrefillCostBytes(
+            immediate_bytes=immediate,
+            lifetime_bytes=immediate + max_new_tokens * e_f,
+        )
+
+    def new_token_decode_cost_bytes(self, *, num_reqs: int, new_tokens: int) -> int:
+        """Bytes the next decode step needs: every decode token allocates
+        BOTH sides (one full-side and one swa-side page per virtual id)."""
+        return new_tokens * (
+            self.full_attn_allocator.entry_bytes + self.swa_attn_allocator.entry_bytes
+        )
+
+    def alloc_tokens_to_bytes(self, num_tokens: int) -> int:
+        """Shared-buffer bytes `num_tokens` composite token allocations
+        consume (both sides per token)."""
+        return num_tokens * (
+            self.full_attn_allocator.entry_bytes + self.swa_attn_allocator.entry_bytes
+        )
+
+    def shortfall_to_evict_params(self, shortfall_bytes: int):
+        """Token-denominated eviction request covering `shortfall_bytes` —
+        evicting a joint node frees both sides, so the token count divides by
+        the joint per-token cost; the byte evict loop re-checks bytes."""
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        t = -(
+            -shortfall_bytes
+            // (
+                self.full_attn_allocator.entry_bytes
+                + self.swa_attn_allocator.entry_bytes
+            )
+        )
+        return EvictParams(num_tokens=t, swa_num_tokens=t)
+
+    def verify_byte_accounting(self) -> List[str]:
+        """Idle-time byte-conservation self-check (base hook; see
+        `_verify_two_end_byte_accounting`). No band on this composite."""
+        fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+        up, down = (fa, sa) if fa.grow_direction == "up" else (sa, fa)
+        return _verify_two_end_byte_accounting(
+            up, down, None, self.unified_buffer.total_bytes
+        )
+
+    def make_admission_budget(self, adder) -> "ByteAdmissionBudget":
+        """Admission-budget hook (base hook): byte-denominated admission —
+        one joint ledger prices both sides per token, replacing the
+        `swa_full_token_cost` cross-charge and the dual per-side token gates."""
+        return ByteAdmissionBudget(self, adder)
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool:
+        """Allocator-owned eviction sizing (base hook): full and swa share ONE
+        byte buffer, so the per-side views alias the SAME gap bytes — "each
+        side individually sufficient" does NOT imply the JOINT alloc fits
+        (every allocated token costs e_full + e_swa gap bytes). Sizing
+        eviction from the per-side views evicts NOTHING in exactly that state
+        and the caller's alloc dies on the fail-loud shortfall (observed under
+        radix stress: both sides "sufficient", joint < need, nothing evicted).
+        Sized against the joint BYTE ledger with a RE-CHECK: evicting a
+        full-LRU node frees both sides, but tombstoned nodes return only
+        full-side bytes, diluting the joint gain — hence the bounded
+        progress-checked loop instead of a one-shot."""
+        self._evict_to_free_bytes(
+            tree_cache, self.alloc_tokens_to_bytes(num_tokens)
+        )
+        return True
+
+    def _evict_to_free_bytes(self, tree_cache, need_bytes: int) -> None:
+        if tree_cache is None or tree_cache.is_chunk_cache():
+            return
+        for _ in range(4):
+            free = self.schedulable_free_bytes()
+            if free >= need_bytes:
+                break
+            evictable_before = (
+                tree_cache.full_evictable_size() + tree_cache.swa_evictable_size()
+            )
+            tree_cache.evict(self.shortfall_to_evict_params(need_bytes - free))
+            evictable_after = (
+                tree_cache.full_evictable_size() + tree_cache.swa_evictable_size()
+            )
+            if evictable_after >= evictable_before:
+                break  # nothing evictable is left; let the caller's gate decide
+
+    def check_decode_capacity(
+        self, tree_cache, num_tokens: int, num_reqs: int
+    ) -> bool:
+        """Decode-capacity gate (allocator-owned; see the base hook), in
+        BYTES: every decode token allocates BOTH sides. Gated on the
+        schedulable byte view — sound because every composite alloc path
+        flushes both sides on shortfall, converting drainable holes into gap
+        (the post-flush capacity IS the byte sum)."""
+        need_bytes = self.new_token_decode_cost_bytes(
+            num_reqs=num_reqs, new_tokens=num_tokens
+        )
+        self._evict_to_free_bytes(tree_cache, need_bytes)
+        return self.schedulable_free_bytes() >= need_bytes
 
     # Byte-coordinated, realizable-with-compaction views (peer drainable holes
     # credited — see `MultiEndedAllocator.schedulable_available_size`).
@@ -2802,10 +3385,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         so flush BOTH (one urgent pass each).
         """
         if not self.lazy_compaction:
-            return need_tokens <= self.available_size()
+            return need_tokens <= self._joint_realizable_now_tokens()
         self.full_attn_allocator._flush(urgent=True)
         self.swa_attn_allocator._flush(urgent=True)
-        return need_tokens <= self.available_size()
+        return need_tokens <= self._joint_realizable_now_tokens()
 
     # Dynamic self-canceling totals for the leak invariant, mirroring the
     # mamba composite's `size` property: total_x = schedulable_x + allocated_x.
@@ -2924,7 +3507,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         with record_function("UnifiedSWAAlloc.alloc"):
             # Joint pre-check. Both sides are mutual peers (each side's compaction
             # opens gap for the other), so flush BOTH on shortfall.
-            if need_size > self.available_size():
+            if need_size > self._joint_realizable_now_tokens():
                 if not self._flush_both_for_alloc(need_size):
                     return None
             # Snapshot the virtual PAGES full will consume, to bind them on swa too.
@@ -2962,7 +3545,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 prefix_lens=prefix_lens_cpu,
             )
             need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
+            if need_tokens > self._joint_realizable_now_tokens():
                 if not self._flush_both_for_alloc(need_tokens):
                     return None
 
@@ -3001,7 +3584,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
             need_tokens = num_new_pages * self.page_size
-            if need_tokens > self.available_size():
+            if need_tokens > self._joint_realizable_now_tokens():
                 if not self._flush_both_for_alloc(need_tokens):
                     return None
 

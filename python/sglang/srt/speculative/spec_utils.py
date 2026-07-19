@@ -584,8 +584,8 @@ def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
     prepare_for_decode, before the worker launch — the verify forward's bs
     equals this bs. No-op for non-unified pools.
 
-    Failure should be unreachable by construction: admission charges every
-    request's band slot via spec_band_full_token_cost, and the buffer reserves
+    Failure should be unreachable by construction: the byte admission budget
+    charges every request's band slot bytes, and the buffer reserves
     SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of band-page alignment headroom, so the ends
     cannot legally out-grow the band's placeable region. The RuntimeError is a
     fail-loud backstop for accounting bugs, not a flow-control path.
@@ -604,8 +604,8 @@ def place_spec_state_band_for_decode(batch: ScheduleBatch) -> None:
             f"spec-state band placement failed: bs={bs} slots do not fit "
             "between the full/mamba frontiers even after an urgent flush — "
             "this indicates an admission-accounting bug "
-            "(spec_band_full_token_cost should reserve every request's band slot "
-            "+ SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of alignment headroom). "
+            "(the byte admission budget should reserve every request's band "
+            "slot bytes + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of alignment headroom). "
             "Workarounds: reduce --max-running-requests or increase "
             "--mem-fraction-static. "
             f"Allocator: {batch.token_to_kv_pool_allocator.debug_print()}"

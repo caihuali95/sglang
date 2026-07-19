@@ -438,6 +438,28 @@ class SchedulerInvariantChecker:
             msg,
         )
 
+    def check_unified_byte_accounting(self):
+        """Byte-level buffer-conservation check (idle only, after
+        `on_idle_proceed()`): the allocator verifies its own byte accounting
+        (frontier ordering/bounds, a live-page sanity bound, spec-band
+        placement) and returns problem strings — empty for every allocator
+        without a shared byte buffer (base hook). Complements the token
+        identity, whose dynamic totals cancel the free-space term out of the
+        check (making it blind to frontier/band corruption).
+
+        Strictness is gated on its OWN env (default WARN, not raise) — the
+        byte check is newer than the token identity, so it logs-and-counts
+        until a clean campaign proves it never false-positives, THEN flips to
+        strict. The token identity keeps raising by default regardless."""
+        problems = self.token_to_kv_pool_allocator.verify_byte_accounting()
+        if problems:
+            raise_error_or_warn(
+                self,
+                envs.SGLANG_ENABLE_STRICT_UNIFIED_BYTE_CHECK.get(),
+                "count_memory_leak_warnings",
+                "unified-bytes accounting problem: " + "; ".join(problems),
+            )
+
     def _check_all_pools(
         self, ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, List[str]]:

@@ -40,6 +40,13 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.swa_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
+        # A generic tree cache does NOT support mamba. Pin this to a real bool
+        # (not a truthy MagicMock) so `PrefillAdder.__init__` takes the
+        # non-SSM branch for `_chunked_prefill_align` and never dereferences
+        # `mamba_cache_chunk_size` — which would load the (nonexistent)
+        # "dummy" model config and fail offline. Mamba-specific cases set
+        # this True explicitly.
+        tree_cache.supports_mamba.return_value = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
         tree_cache.dec_lock_ref.return_value = DecLockRefResult()
         return tree_cache
@@ -487,8 +494,15 @@ class TestPrefillAdder(CustomTestCase):
         # scheduler hands out all of rem_swa_tokens, alloc_extend cannot get its
         # extra page and OOMs. With the fix, extend_input_len must cap at
         # rem_swa_tokens - page_size so the page is reserved.
+        #
+        # REM_SWA is a MULTIPLE of PAGE_SIZE so the reserved chunk
+        # (rem_swa - page) lands on a page boundary. A hybrid-SWA (non-SSM)
+        # cache aligns a truncated chunk to page_size, so a sub-page
+        # reservation would floor to 0 and PARK instead — that boundary is the
+        # sibling test `..._defers_when_swa_below_page`; this one isolates the
+        # reservation itself.
         PAGE_SIZE = 64
-        REM_SWA = 100
+        REM_SWA = 192  # 3 * PAGE_SIZE → reservation 128 is page-aligned
         adder, req = self._build_hybrid_swa_chunked_req(
             page_size=PAGE_SIZE, rem_swa=REM_SWA
         )

@@ -2452,33 +2452,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        # Spec-state band (unified Mamba pool + spec decoding): the next verify
-        # step also needs a CONTIGUOUS band of one slot per request (+ alignment
-        # margin) between the pool frontiers. Reserving it here — in the same
-        # check the retract loop converges on — makes a band shortfall retract
-        # gracefully instead of tripping the fail-loud RuntimeError at
-        # place_spec_state_band_for_decode. 0 / absent everywhere else.
-        band_reserve_fn = getattr(
-            self.token_to_kv_pool_allocator, "spec_band_reserve_full_tokens", None
-        )
-        band_tokens = 0
         bs = len(selected_indices) if selected_indices is not None else len(self.reqs)
-        if band_reserve_fn is not None:
-            band_tokens = band_reserve_fn(bs)
-        evict_from_tree_cache(self.tree_cache, num_tokens + band_tokens)
-        if self.token_to_kv_pool_allocator.available_size() < num_tokens + band_tokens:
-            return False
-        if band_tokens:
-            # Byte budget holds; validate the GEOMETRY with a zero-copy placement
-            # probe (band-page alignment can still cost up to the margin). The
-            # probe IS a legal placement — the band is movable between pin
-            # windows, and prepare_for_decode re-places it (identical placement
-            # is a no-op). Skip when pinned (verify in flight); the stale-pin
-            # recovery in place_spec_state_band_for_decode owns that path.
-            band = self.token_to_kv_pool_allocator.spec_state_allocator
-            if not band._band_pinned:
-                return self.token_to_kv_pool_allocator.place_spec_state_band(bs)
-        return True
+        # The allocator owns the capacity gate (incl. any per-step reservations
+        # of its own, e.g. the unified pool's spec-state band) — the retract
+        # loop converges on this same check, so allocator-side shortfalls
+        # retract gracefully instead of tripping fail-loud alloc errors.
+        return self.token_to_kv_pool_allocator.check_decode_capacity(
+            self.tree_cache, num_tokens=num_tokens, num_reqs=bs
+        )
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = retract_all(
