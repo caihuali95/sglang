@@ -26,9 +26,9 @@ def _draft_layer_count(model_config: "ModelConfig") -> Optional[int]:
 
     Returns None for an MTP/NextN draft whose head size cannot be determined:
     falling back to `num_hidden_layers` there would size the draft region at the
-    WHOLE target -- a 1-layer MTP head charged as 32 layers, a ~5x per-token cell
-    inflation that silently halves admission (see the `num_nextn_predict_layers`
-    note in `ModelConfig`, whose nested-config miss is exactly how that fallback
+    WHOLE target, e.g., a 1-layer MTP head charged as 32 layers, an inflation
+    that silently halves admission (see the `num_nextn_predict_layers` note
+    in `ModelConfig`, whose nested-config miss is exactly how that fallback
     used to get taken). Refusing to fuse is the safe failure. A dense draft
     checkpoint (DFLASH / EAGLE3) legitimately uses its own layer count, so only
     the MTP archs get the guard.

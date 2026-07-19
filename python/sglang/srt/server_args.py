@@ -6395,9 +6395,8 @@ class ServerArgs:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
         # views; FA3 / FlashInfer do not.
-        # The draft backend must be listed too. It is not a fallback of
-        # `attention_backend` -- the draft factory picks it FIRST when set -- so a
-        # non-Triton draft backend would otherwise slip past this guard, write its
+        # The draft backend must be listed. The draft factory picks it FIRST
+        # when set. So a non-Triton draft backend would otherwise write its
         # KV without the virtual->physical translate, and silently corrupt the
         # draft cache (no crash; it surfaces only as a degraded accept length).
         backends = {

@@ -325,11 +325,9 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # Unified pool byte-conservation idle check: RAISE on a problem (True,
-    # default) vs log-and-count only (False). Enforced by default now that the
-    # validation campaign proved it never false-positives on a healthy pool
-    # (strict across accuracy + stress lanes, zero fires); it is the sole idle
-    # leak check on the unified path, so it must gate. Set False to demote it
-    # to warn for debugging.
+    # default) vs log-and-count only (False). Enforced by default now. It is
+    # the sole idle leak check on the unified path, so it must gate. Set
+    # False to demote it to warn for debugging.
     SGLANG_ENABLE_STRICT_UNIFIED_BYTE_CHECK = EnvBool(True)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
