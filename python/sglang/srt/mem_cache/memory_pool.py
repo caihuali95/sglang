@@ -2424,13 +2424,12 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
-        # virtual->physical full-KV translate for the MODEL-SIDE MLA write/read
-        # entry points (`set_mla_kv_buffer`/`get_mla_kv_buffer`): unlike the
-        # backend paths (which carry the physical loc in `KVWriteLoc`), those
-        # are called from model code with `forward_batch.out_cache_loc`
-        # directly. Identity for a static pool (loc already physical); the
-        # allocator's `translate_kv_loc` under the unified pool.
-        self._full_translate = lambda ids: ids
+        # NOTE: there is deliberately NO full-KV translate hook here. The
+        # model-side MLA doors (`set_mla_kv_buffer`/`get_mla_kv_buffer`)
+        # receive PHYSICAL ids on every pool: writes carry the ForwardBatch's
+        # rebound `out_cache_loc` (apply_unified_kv_loc_rebind), and read
+        # indices are translated at their production sites
+        # (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices).
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
@@ -2651,8 +2650,10 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
-        # Model-side entry point — same translate rationale as set_mla_kv_buffer.
-        loc = self._full_translate(loc)
+        # Model-side entry point — same physical-only contract as
+        # set_mla_kv_buffer: `loc` is a read-index tensor already translated at
+        # its production site (fetch_mha_one_shot_kv_indices /
+        # prepare_chunked_kv_indices); the pool never translates.
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 

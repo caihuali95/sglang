@@ -1007,8 +1007,10 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
     mamba-radix machinery forces it.
 
     `set_kv_buffer` gets PHYSICAL slot ids; never translates. Model-side entry
-    points (`set_mla_kv_buffer`/`get_mla_kv_buffer`) receive PHYSICAL ids from
-    the composite's `_full_translate` hook."""
+    points (`set_mla_kv_buffer`/`get_mla_kv_buffer`) also receive PHYSICAL
+    ids: writes carry the ForwardBatch's rebound `out_cache_loc`
+    (apply_unified_kv_loc_rebind), reads are translated at their production
+    sites (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices)."""
 
     def __init__(
         self,
@@ -1165,7 +1167,8 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        # Composite translated `loc` to PHYSICAL via `_full_translate`.
+        # `loc` is PHYSICAL: the ForwardBatch's out_cache_loc was rebound at
+        # construction (apply_unified_kv_loc_rebind).
         layer_id = layer.layer_id - self.start_layer
         with record_function("UnifiedMLA.set_mla_kv_buffer"):
             if cache_k_nope.dtype != self.dtype:
@@ -1732,9 +1735,9 @@ def init_unified_mamba_pools(
         assert disable_overlap_schedule, (
             "unified MLA-hybrid path requires --disable-overlap-schedule"
         )
-        # Every MLA write path must route through the pool (KVWriteLoc /
-        # _full_translate); non-CUDA platforms have pool-bypassing MLA write
-        # kernels that no tripwire can catch.
+        # Every MLA write path must route through the pool with the physical
+        # loc (KVWriteLoc / the ForwardBatch rebind); non-CUDA platforms have
+        # pool-bypassing MLA write kernels that no tripwire can catch.
         assert device.startswith("cuda"), (
             f"unified MLA-hybrid path is CUDA-only; got device={device!r}"
         )
@@ -1891,13 +1894,11 @@ def init_unified_mamba_pools(
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
-    if use_mla_backend:
-        # Model-side MLA entry points (`set_mla_kv_buffer`/`get_mla_kv_buffer`
-        # on zero-prefix extends) pass `forward_batch.out_cache_loc` — VIRTUAL
-        # under this pool — so the composite must v2p-translate before
-        # forwarding (the backend paths carry the physical loc in KVWriteLoc
-        # instead).
-        token_to_kv_pool._full_translate = allocator.translate_kv_loc
+    # NOTE: no full-KV translate hook is wired. The model-side MLA entry
+    # points (`set_mla_kv_buffer`/`get_mla_kv_buffer`) receive PHYSICAL ids:
+    # writes carry the ForwardBatch's rebound `out_cache_loc`
+    # (apply_unified_kv_loc_rebind), reads are translated at their production
+    # sites (fetch_mha_one_shot_kv_indices / prepare_chunked_kv_indices).
 
     logger.info(
         "[unified-memory-pool] ============================================================"
