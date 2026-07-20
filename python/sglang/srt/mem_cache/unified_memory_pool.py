@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 
 import msgspec
 import torch
@@ -130,8 +130,11 @@ class MHARegionGeometry(msgspec.Struct, frozen=True, kw_only=True):
     `MHASubPoolSpec`'s MHA fields but
     carries the draft's OWN geometry — EAGLE3/DFLASH drafts are separate
     checkpoints whose head_num/head_dim differ from the target's.
-    `msgspec.Struct`, deliberately outside the grandfathered `SubPoolSpec`
-    `@dataclass` hierarchy (same convention as `SpecStateSubPoolSpec`).
+
+    Not a `SubPoolSpec`: this is a region NESTED inside another spec's slot
+    envelope, not a sub-pool of its own, so it has no `grow_direction` and
+    never reaches `UnifiedKVPool`'s frontier logic. Its `validate()` is driven
+    by the enclosing `MHASubPoolSpec.__post_init__`.
     """
 
     layer_num: int
@@ -161,17 +164,29 @@ class MHARegionGeometry(msgspec.Struct, frozen=True, kw_only=True):
 
 @dataclass(frozen=True, kw_only=True)
 class SubPoolSpec(ABC):
-    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`."""
+    """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`.
+
+    `@dataclass` rather than `msgspec.Struct` (`.claude/rules/no-dataclasses.md`)
+    because `msgspec.Struct` cannot share a metaclass with `ABC`, and the
+    abstract `entry_bytes`/`get_dtype` contract below is what lets
+    `UnifiedKVPool` treat every sub-pool spec uniformly. These specs are
+    in-process only — they never cross an IPC boundary — so msgspec's
+    decode-time validation and codec speed would go unused anyway.
+    """
+
+    # Grow directions this subclass accepts. End pools own the two frontiers;
+    # float (middle) pools narrow this to ("float",).
+    _allowed_grow_directions: ClassVar[Tuple[str, ...]] = ("up", "down")
 
     name: str
     layer_num: int
-    grow_direction: str  # "up" | "down"
+    grow_direction: str  # "up" | "down" | "float"
 
     def __post_init__(self):
-        assert self.grow_direction in (
-            "up",
-            "down",
-        ), f"grow_direction must be 'up' or 'down'; got {self.grow_direction!r}"
+        assert self.grow_direction in self._allowed_grow_directions, (
+            f"{type(self).__name__}.grow_direction must be one of "
+            f"{self._allowed_grow_directions}; got {self.grow_direction!r}"
+        )
         assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
 
     @abstractmethod
@@ -290,18 +305,18 @@ class MambaSubPoolSpec(SubPoolSpec):
         return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
 
 
-class SpecStateSubPoolSpec(msgspec.Struct, frozen=True, kw_only=True):
+@dataclass(frozen=True, kw_only=True)
+class SpecStateSubPoolSpec(SubPoolSpec):
     """Per-slot layout of the spec-decode intermediate-state "float" sub-pool.
 
     One slot = one verify-batch row's intermediate SSM states + conv windows
     across all mamba layers and draft steps (DENSE conv layout). A float pool
     lives between the two end pools' frontiers as one contiguous, freely
-    relocatable band. `msgspec.Struct`, deliberately outside the grandfathered
-    `SubPoolSpec` `@dataclass` hierarchy — the sweep type-dispatches.
+    relocatable band — hence the narrowed `grow_direction`.
     """
 
-    name: str
-    layer_num: int
+    _allowed_grow_directions: ClassVar[Tuple[str, ...]] = ("float",)
+
     num_draft_tokens: int
     conv_window_shapes: Tuple[Tuple[int, ...], ...]  # one shape per conv tensor
     conv_dtype: torch.dtype
@@ -309,12 +324,8 @@ class SpecStateSubPoolSpec(msgspec.Struct, frozen=True, kw_only=True):
     ssm_dtype: torch.dtype
     grow_direction: str = "float"
 
-    def validate(self) -> None:
-        assert self.grow_direction == "float", (
-            f"SpecStateSubPoolSpec must be a float middle pool; "
-            f"got {self.grow_direction!r}"
-        )
-        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
+    def __post_init__(self):
+        super().__post_init__()
         assert (
             self.num_draft_tokens > 0
         ), f"num_draft_tokens must be positive; got {self.num_draft_tokens}"
@@ -334,25 +345,24 @@ class SpecStateSubPoolSpec(msgspec.Struct, frozen=True, kw_only=True):
         return self.ssm_dtype  # dominant buffer's dtype (informational)
 
 
-class MLASubPoolSpec(msgspec.Struct, frozen=True, kw_only=True):
+@dataclass(frozen=True, kw_only=True)
+class MLASubPoolSpec(SubPoolSpec):
     """Layout spec for an MLA full-attention sub-pool: ONE latent region per
-    layer (`kv_cache_dim = kv_lora_rank + qk_rope_head_dim`), no K/V pair.
+    layer (`kv_cache_dim = kv_lora_rank + qk_rope_head_dim`), no K/V pair."""
 
-    msgspec (not the grandfathered `@dataclass` ABC) per repo rule — the
-    `SpecStateSubPoolSpec`/`MHARegionGeometry` precedent; `UnifiedKVPool`
-    dispatches by isinstance, so nothing needs the ABC."""
-
-    name: str
-    layer_num: int
     kv_lora_rank: int
     qk_rope_head_dim: int
     store_dtype: torch.dtype
     grow_direction: str = "down"  # end pool, mirrors the MHA full spec
 
-    def validate(self) -> None:
-        assert self.layer_num > 0
-        assert self.kv_lora_rank > 0 and self.qk_rope_head_dim > 0
-        assert self.grow_direction in ("up", "down")
+    def __post_init__(self):
+        super().__post_init__()
+        assert (
+            self.kv_lora_rank > 0
+        ), f"kv_lora_rank must be positive; got {self.kv_lora_rank}"
+        assert (
+            self.qk_rope_head_dim > 0
+        ), f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
 
     def kv_cache_dim(self) -> int:
         return self.kv_lora_rank + self.qk_rope_head_dim
@@ -368,11 +378,6 @@ class MLASubPoolSpec(msgspec.Struct, frozen=True, kw_only=True):
 
     def get_dtype(self) -> torch.dtype:
         return self.store_dtype
-
-
-# Duck-typed union accepted by UnifiedKVPool: the grandfathered @dataclass
-# hierarchy plus msgspec-based specs (`.claude/rules/no-dataclasses.md`).
-SubPoolSpecLike = Union[SubPoolSpec, SpecStateSubPoolSpec, MLASubPoolSpec]
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +396,7 @@ class UnifiedKVPool:
         self,
         *,
         total_bytes: int,
-        sub_pool_specs: List[SubPoolSpecLike],
+        sub_pool_specs: List[SubPoolSpec],
         device: str,
         enable_memory_saver: bool,
         page_size: int = 1,
@@ -404,9 +409,7 @@ class UnifiedKVPool:
         assert len(set(names)) == len(
             names
         ), f"sub-pool names must be unique; got {names}"
-        for s in sub_pool_specs:
-            if isinstance(s, (SpecStateSubPoolSpec, MLASubPoolSpec)):
-                s.validate()
+        # Per-spec field validation already ran in each spec's __post_init__.
         up_specs = [s for s in sub_pool_specs if s.grow_direction == "up"]
         down_specs = [s for s in sub_pool_specs if s.grow_direction == "down"]
         float_specs = [s for s in sub_pool_specs if s.grow_direction == "float"]
@@ -428,13 +431,13 @@ class UnifiedKVPool:
         # pool, floating middles (input order preserved), the grow-down end
         # pool. Input list order is otherwise irrelevant (all access is
         # by-name); the chain order is what peer wiring follows.
-        self.sub_pool_specs: List[SubPoolSpecLike] = [
+        self.sub_pool_specs: List[SubPoolSpec] = [
             up_specs[0],
             *float_specs,
             down_specs[0],
         ]
         self._page_size = page_size
-        self._specs_by_name: Dict[str, SubPoolSpecLike] = {
+        self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
         }
 
@@ -548,7 +551,7 @@ class UnifiedKVPool:
 
     # -- introspection --
 
-    def spec(self, name: str) -> SubPoolSpecLike:
+    def spec(self, name: str) -> SubPoolSpec:
         return self._specs_by_name[name]
 
     def mha_spec(self, name: str) -> MHASubPoolSpec:
@@ -1712,7 +1715,7 @@ def init_unified_mamba_pools(
     # With draft_kv_geometry (fused draft KV), each full slot carries
     # the draft model's KV region; the draft worker binds a UnifiedDraftKVPool
     # over the same slots.
-    full_spec: SubPoolSpecLike
+    full_spec: SubPoolSpec
     if use_mla_backend:
         # MLA-hybrid (e.g. KDA + MLA): the full sub-pool stores one latent
         # region per layer. Constraints of this path, asserted here rather
@@ -1773,7 +1776,7 @@ def init_unified_mamba_pools(
         temporal_dtype=cp.dtype.temporal,
         grow_direction="up",
     )
-    sub_pool_specs: List[SubPoolSpecLike] = [full_spec, mamba_spec]
+    sub_pool_specs: List[SubPoolSpec] = [full_spec, mamba_spec]
     # `total_bytes` is the WHOLE profiled buffer budget B, passed in directly
     # (the same `unified_total_bytes` the SWA path carries). The
     # full-KV / mamba-state / spec-state frontiers all float within it, so we do
