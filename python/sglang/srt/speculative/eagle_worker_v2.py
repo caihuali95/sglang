@@ -313,7 +313,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        target_model = self.target_worker.model_runner.model
+        if not hasattr(target_model, "get_embed_and_head"):
+            raise ValueError(
+                f"EAGLE speculative decoding requires the target model to "
+                f"expose draft-model hooks (get_embed_and_head), but "
+                f"{type(target_model).__name__} does not implement them. "
+                "Targets without a self-draft (MTP/NEXTN) head or a trained "
+                "EAGLE draft cannot run EAGLE; use a draft-free algorithm "
+                "such as NGRAM instead."
+            )
+        embed, head = target_model.get_embed_and_head()
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares

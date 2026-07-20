@@ -284,6 +284,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        # Trivially satisfied for GDN (its dispatcher has target_verify), but
+        # keeps the capability contract structural: every dispatcher-based
+        # linear family self-checks at boot rather than corrupting at verify.
+        self._check_spec_target_verify_support(model_runner)
         # Per-verify-row intermediate indices now come from the metadata's
         # static buffer (identity rows for the dense pool; translated physical
         # band slots under the unified pool).

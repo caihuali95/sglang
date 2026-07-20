@@ -104,7 +104,10 @@ _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
 
 
 def conv_window_dedup_enabled(
-    is_npu: bool, is_cpu: bool, speculative_eagle_topk: Optional[int]
+    is_npu: bool,
+    is_cpu: bool,
+    speculative_eagle_topk: Optional[int],
+    is_kda: bool = False,
 ) -> bool:
     """Whether the deduplicated sliding-window conv-intermediate layout is safe.
 
@@ -115,10 +118,22 @@ def conv_window_dedup_enabled(
     columns can need different values from different parent chains -> fall back to
     the dense layout. NPU/CPU also keep the dense layout (their kernels assume
     contiguous per-step windows). See ``MambaPool.__init__``.
+
+    KDA always takes the dense layout: the dedup allocation below unpacks
+    ``conv_dim, win = conv_shape``, but KDA conv shapes are stored SWAPPED as
+    ``(win, dim)`` (``KimiLinearStateShape.create`` transposes them so the
+    persistent conv state is feature-contiguous; see ``mamba_utils.py``) — the
+    dedup buffer would come out mis-shaped. The dense branch and the unified
+    builder derive the window layout from ``conv_shape`` verbatim, so they are
+    axis-consistent with the persistent conv pool for both orientations. A
+    KDA-native dedup layout is possible (the shared axis is the token axis
+    either way) but is deliberately a separate follow-up; window buffers are
+    small next to ``intermediate_ssm``.
     """
     return (
         not is_npu
         and not is_cpu
+        and not is_kda
         and (speculative_eagle_topk is None or speculative_eagle_topk <= 1)
     )
 
@@ -524,13 +539,14 @@ class MambaPool:
                 # consume the view through its strides.
                 #
                 # Dedup the sliding-window conv-intermediate only when it is safe:
-                # CUDA + a linear draft chain (topk <= 1). NPU/CPU and EAGLE tree
-                # verify (topk > 1) keep the dense layout -- see
+                # CUDA + a linear draft chain (topk <= 1) + non-KDA orientation.
+                # NPU/CPU, EAGLE tree verify (topk > 1), and KDA (swapped
+                # (win, dim) conv shapes) keep the dense layout -- see
                 # `conv_window_dedup_enabled` for the full rationale. The
                 # `fused_conv_window_scatter_with_mask` scatter is layout-agnostic,
                 # so the dense fallback reads correctly through the same code path.
                 dedup_conv_window = conv_window_dedup_enabled(
-                    _is_npu, _is_cpu, speculative_eagle_topk
+                    _is_npu, _is_cpu, speculative_eagle_topk, cache_params.is_kda
                 )
                 self._intermediate_conv_window_phys = []
                 if dedup_conv_window:

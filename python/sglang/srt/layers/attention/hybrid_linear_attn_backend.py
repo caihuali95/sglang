@@ -74,6 +74,39 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def _check_spec_target_verify_support(self, model_runner: ModelRunner) -> None:
+        """Boot-time capability gate for speculative decoding on
+        kernel-dispatcher linear backends (GDN, KDA).
+
+        Target-verify on a linear-attention family needs a dedicated verify
+        path: multi-token state recurrence with per-step intermediate capture
+        and NO in-place advance of the persistent state. A family whose kernel
+        dispatcher lacks ``target_verify`` would instead route TARGET_VERIFY
+        batches into its chunk-prefill kernels, which commit state assuming
+        every draft token is accepted — and the family-blind post-verify
+        commit then scatters never-written intermediate buffers over the
+        states. That is SILENT corruption, not a crash, so refuse at boot.
+
+        The probe is the dispatcher METHOD (duck-typed, like the commit
+        dispatch itself), not a capability attribute: the family's dispatcher
+        advertising ``target_verify`` is exactly the contract the verify
+        forward relies on. Subclasses using a different verify architecture
+        (Mamba2Metadata) do not call this.
+        """
+        if model_runner.server_args.speculative_algorithm is None:
+            return
+        if self.is_draft_worker:
+            return
+        dispatcher = getattr(self, "kernel_dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "target_verify"):
+            raise ValueError(
+                "Speculative decoding requires a target-verify kernel for the "
+                f"linear-attention family, but {type(dispatcher).__name__} "
+                "does not implement one. Without it, verify batches would "
+                "silently corrupt the recurrent state. Disable speculative "
+                "decoding for this model family."
+            )
+
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
         if (

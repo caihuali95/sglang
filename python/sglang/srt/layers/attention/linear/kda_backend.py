@@ -14,6 +14,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
@@ -88,9 +89,18 @@ class KDAKernelDispatcher:
             self.decode_kernel, "supports_packed_decode", False
         )
 
+        # Target-verify always runs the Triton kernel: it is the only KDA
+        # kernel implementing the verify machinery (intermediate-state capture
+        # + tree-ancestor reload + disable_state_update); the CuTe DSL KDA
+        # kernel has no verify path. The boot-time spec capability gate probes
+        # for this method's existence (see MambaAttnBackendBase), so its
+        # presence here is what admits KDA models to speculative decoding.
+        self.verify_kernel = triton_kernel
+
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__} "
+            f"verify={self.verify_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
 
@@ -181,6 +191,35 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
 
 class KDAAttnBackend(MambaAttnBackendBase):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
@@ -190,6 +229,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        self._check_spec_target_verify_support(model_runner)
 
     def forward_decode(
         self,
@@ -287,6 +327,121 @@ class KDAAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         )
 
+    def _forward_target_verify(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ):
+        """Multi-token target-verify over the KDA state (mirrors the GDN
+        verify branch in ``gdn_backend.forward_extend``).
+
+        Contract (identical to GDN's):
+        - the persistent ``ssm_states`` are NEVER advanced here
+          (``disable_state_update`` in the fused kernel); each draft step's
+          post-state is written to the ``SpeculativeState`` intermediate
+          buffers, and ``update_mamba_state_after_mtp_verify`` scatters the
+          last-accepted step back after sampling;
+        - the persistent conv state IS rolled in-place by
+          ``causal_conv1d_update`` under the full-acceptance assumption and is
+          likewise corrected by the post-verify conv-window scatter;
+        - only ``forward_metadata`` statics and the capture-constant
+          ``draft_token_num`` are consumed, keeping the branch CUDA-graph
+          replay-safe.
+
+        KDA deltas vs GDN: the conv state and the intermediate conv window are
+        stored feature-contiguous ``(win, dim)`` (GDN stores ``(dim, win)``),
+        so both are handed to the stride-aware ``causal_conv1d_update`` as
+        transposed VIEWS — decode's existing per-call pattern; and the
+        recurrence runs the shared fused kernel with ``is_kda=True`` (per-K
+        decay), receiving the RAW flat gate ``a`` and raw ``b`` exactly as
+        decode does (the model skips pre-activation for verify; activation
+        happens in-kernel — see ``KimiDeltaAttention.forward``).
+        """
+        assert isinstance(mixed_qkv, torch.Tensor)
+        forward_metadata = self.forward_metadata
+        query_start_loc = forward_metadata.query_start_loc
+        cache_indices = forward_metadata.mamba_cache_indices
+        retrieve_next_token = forward_metadata.retrieve_next_token
+        retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+        retrieve_parent_token = forward_metadata.retrieve_parent_token
+
+        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        assert isinstance(mamba_cache_params, MambaPool.SpeculativeState), (
+            "KDA target-verify requires the speculative state pool "
+            "(intermediate ssm + conv-window buffers)"
+        )
+        conv_states = mamba_cache_params.conv[0]
+        ssm_states = mamba_cache_params.temporal
+        intermediate_state_cache = mamba_cache_params.intermediate_ssm
+        # KDA window buffers are dense (dedup is disabled for KDA — see
+        # conv_window_dedup_enabled) and shaped [.., win, dim]; expose the
+        # (dim, win) view the conv kernel expects.
+        intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[
+            0
+        ].transpose(-1, -2)
+        intermediate_state_indices = forward_metadata.intermediate_state_indices
+
+        # The chunk-prefill 'lower_bound' safe gate is not implemented in the
+        # fused recurrent kernel (decode already ignores it); verify must stay
+        # numerically consistent with decode, so refuse loudly if a future
+        # checkpoint ever sets it.
+        assert getattr(layer, "lower_bound", None) is None, (
+            "KDA target-verify uses the fused softplus-gate recurrent kernel; "
+            "the chunk-prefill 'lower_bound' safe gate is not implemented "
+            "there (decode already ignores it)."
+        )
+
+        seq_len = mixed_qkv.shape[0]
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        batch_size = seq_len // draft_token_num
+
+        # Single packed depthwise conv over the whole mixed qkv — decode's
+        # exact call shape plus the verify window/tree kwargs. Equivalent to
+        # the extend path's 3-way split conv (depthwise = per-channel; the
+        # split only partitions channels).
+        mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(
+            1, 2
+        )
+        mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_reshaped,
+            conv_states.transpose(-1, -2),
+            layer.conv_weights,
+            layer.bias,
+            activation="silu",
+            conv_state_indices=cache_indices[:batch_size],
+            intermediate_conv_window=intermediate_conv_window_cache,
+            intermediate_state_indices=intermediate_state_indices[:batch_size],
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+        mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+
+        q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
+
+        return self.kernel_dispatcher.target_verify(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate_state_cache,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=draft_token_num,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -296,6 +451,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        # Multi-token verify never runs the chunk-prefill path below: chunk_kda
+        # commits the recurrent state in-place assuming every draft token is
+        # accepted, which is exactly the silent-corruption mode target-verify
+        # must avoid. Route it to the dedicated verify branch instead.
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
