@@ -402,6 +402,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            # Unified physical-loc contract: the buffer holds whatever id space
+            # prepare() copied in (PHYSICAL when the live batch was rebound).
+            out_cache_loc_is_physical=getattr(
+                self, "_out_cache_loc_is_physical", False
+            ),
             spec_info=spec_info,
         )
         self.eagle_worker.draft_extend_attn_backend_list[
@@ -615,6 +620,14 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        # Unified physical-loc contract: the buffer inherits the id space of
+        # the tensor copied in — PHYSICAL once the live batch was rebound at
+        # construction (ForwardBatch.init_new -> apply_unified_kv_loc_rebind).
+        # Record it here (replay() has no forward_batch in scope) so the
+        # replay fb_view can carry the flag to the backend's tripwire.
+        self._out_cache_loc_is_physical = getattr(
+            forward_batch, "out_cache_loc_is_physical", False
+        )
         buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 

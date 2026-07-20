@@ -338,6 +338,12 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             ),
             encoder_lens=None,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            # Unified physical-loc contract: carry the source batch's rebound
+            # state so the backend's tripwire sees it (an fb_view that drops
+            # the flag reads as un-rebound and fails loud).
+            out_cache_loc_is_physical=getattr(
+                forward_batch, "out_cache_loc_is_physical", False
+            ),
             spec_info=None,
         )
         with self._frozen_kv_target_view(forward_batch):

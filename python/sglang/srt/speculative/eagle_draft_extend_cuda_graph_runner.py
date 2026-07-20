@@ -557,6 +557,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens_cpu=buffers.seq_lens_cpu,
             encoder_lens=None,
             out_cache_loc=forward_batch.out_cache_loc,
+            # Unified physical-loc contract: `out_cache_loc` above is the live
+            # batch's tensor, already rebound to PHYSICAL at its construction
+            # (ForwardBatch.init_new -> apply_unified_kv_loc_rebind). Carry the
+            # flag so the backend's tripwire sees the rebound state; dropping
+            # it made the backend read this view as un-rebound. (No swa rail:
+            # the draft pool is an MHA view over the draft byte region, never
+            # a SWA pool, so the backend never reads that rail here.)
+            out_cache_loc_is_physical=getattr(
+                forward_batch, "out_cache_loc_is_physical", False
+            ),
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
