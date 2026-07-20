@@ -56,5 +56,55 @@ class TestKimiLinearUnifiedMemory(TestKimiLinear):
     extra_args = ["--enable-unified-memory"]
 
 
+class TestKimiLinearNgramChain(TestKimiLinear):
+    """NGRAM speculative decoding, CHAIN drafts (bfs breadth 1): the minimal
+    KDA target-verify configuration — multi-token verify over the KDA
+    recurrent state with per-step intermediate capture, no tree walk. NGRAM is
+    target-only (no draft model / draft KV), so this exercises exactly the KDA
+    verify branch + the family-generic commit scatter. Same GSM8K bar as
+    spec-off: verify must be output-lossless."""
+
+    extra_args = [
+        "--speculative-algorithm",
+        "NGRAM",
+        "--speculative-ngram-max-bfs-breadth",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    ]
+
+
+class TestKimiLinearNgramTree(TestKimiLinear):
+    """NGRAM speculative decoding with the default TREE drafts (bfs breadth
+    10, 12 draft tokens): adds the conv ancestor walk + per-branch SSM parent
+    reload on top of the chain path."""
+
+    extra_args = ["--speculative-algorithm", "NGRAM"]
+
+
+class TestKimiLinearNgramChainUnifiedMemory(TestKimiLinear):
+    """NGRAM chain under --enable-unified-memory: the KDA intermediate verify
+    states live in the relocatable spec-state band and the verify indices go
+    through the virtual->physical translate; the MLA verify read rail runs
+    the unified ragged translate at page_size=1."""
+
+    extra_args = [
+        "--enable-unified-memory",
+        "--speculative-algorithm",
+        "NGRAM",
+        "--speculative-ngram-max-bfs-breadth",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    ]
+
+
+class TestKimiLinearNgramTreeUnifiedMemory(TestKimiLinear):
+    """NGRAM tree under --enable-unified-memory (tree at page_size=1 is the
+    supported tree configuration under the unified pool)."""
+
+    extra_args = ["--enable-unified-memory", "--speculative-algorithm", "NGRAM"]
+
+
 if __name__ == "__main__":
     unittest.main()
