@@ -1680,6 +1680,7 @@ def init_unified_mamba_pools(
     extra_max_context_len: int,
     max_total_num_tokens: int,
     max_mamba_cache_size: int,
+    total_bytes: int,
     max_num_reqs: int,
     enable_memory_saver: bool,
     enable_mamba_extra_buffer: bool,
@@ -1770,17 +1771,24 @@ def init_unified_mamba_pools(
         grow_direction="up",
     )
     sub_pool_specs: List[SubPoolSpecLike] = [full_spec, mamba_spec]
-    total_bytes = (
-        max_total_num_tokens * full_spec.entry_bytes()
-        + max_mamba_cache_size * mamba_spec.entry_bytes()
+    # `total_bytes` is the WHOLE profiled buffer budget B, passed in directly
+    # (the same `unified_total_bytes` the SWA path carries). The
+    # full-KV / mamba-state / spec-state frontiers all float within it, so we do
+    # NOT reconstruct it from `max_total_num_tokens * e_f + slots * mamba_epp`:
+    # that reconstruction re-imposes the N-shared partition floor, whereas
+    # `max_total_num_tokens` is now only the single-request feasibility LABEL
+    # (the per-request clamp / usage denominator). The mamba slots and the spec
+    # band are carved from within B by their sub-pool specs below.
+    assert total_bytes > 0, (
+        f"unified mamba buffer needs a positive byte budget; got {total_bytes}"
     )
     # Spec decoding: insert the intermediate-state float band as a MIDDLE
-    # sub-pool and grow the budget by its worst-case band (spec_state_size + 1
-    # slots — one per verify-batch row plus the reserved slot 0 — plus
-    # SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of alignment headroom so a full-`bs`
-    # placement never fails on band-page rounding). At runtime the band occupies
-    # exactly the current verify bs; the rest of these bytes sit in the gaps,
-    # available to full/mamba growth.
+    # sub-pool (spec_state_size + 1 slots — one per verify-batch row plus the
+    # reserved slot 0 — plus SPEC_BAND_ALIGNMENT_MARGIN_SLOTS of alignment
+    # headroom so a full-`bs` placement never fails on band-page rounding). Its
+    # bytes live WITHIN B (already reserved by the admission solve); at runtime
+    # the band occupies exactly the current verify bs and the rest sits in the
+    # gaps, available to full/mamba growth.
     spec_state_sub_pool: Optional[str] = None
     if speculative_num_draft_tokens is not None:
         if spec_state_size is None:
@@ -1798,9 +1806,6 @@ def init_unified_mamba_pools(
             ssm_dtype=cp.dtype.temporal,
         )
         sub_pool_specs.append(spec_state_spec)
-        total_bytes += (
-            spec_state_size + 1 + SPEC_BAND_ALIGNMENT_MARGIN_SLOTS
-        ) * spec_state_spec.entry_bytes()
     else:
         spec_state_size = max_num_reqs
     shared_pool = UnifiedKVPool(
@@ -2207,15 +2212,15 @@ def init_unified_swa_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     draft_kv_geometry: Optional[MHARegionGeometry] = None,
-    total_bytes: Optional[int] = None,
+    total_bytes: int,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack.
 
-    `total_bytes`, when given, is the buffer's byte budget DIRECTLY (the
-    ratio-free path: the token counts are feasibility/label values,
-    not a partition — re-summing them would silently re-derive a split that
-    no longer means anything). When None, fall back to re-summing the counts
-    (legacy callers and unit tests)."""
+    `total_bytes` is the buffer's byte budget DIRECTLY (required — the same
+    `unified_total_bytes` contract as the mamba factory): the token counts are
+    feasibility/label values, not a partition, and re-summing them would
+    silently re-derive a split that no longer means anything. Every unified
+    SWA configurator path sets it (`_solve_unified_pool_sizes`)."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
         UnifiedSWATokenToKVPoolAllocator,
     )
@@ -2254,11 +2259,14 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
-    if total_bytes is None:
-        total_bytes = (
-            full_max_total_num_tokens * full_spec.entry_bytes()
-            + swa_max_total_num_tokens * swa_spec.entry_bytes()
-        )
+    # Fail loud rather than fall back to re-summing the token counts: a None/0
+    # here means a configurator path skipped the unified feasibility solve
+    # (e.g. an override that predates the unified branch) — exactly the
+    # static-split regression this contract exists to prevent.
+    assert total_bytes and total_bytes > 0, (
+        "unified SWA buffer needs the byte budget (unified_total_bytes) from "
+        f"the configurator's feasibility solve; got {total_bytes!r}"
+    )
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],

@@ -84,13 +84,13 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 # the existing retract machinery.
 UNIFIED_MIN_TOKENS_PER_REQ = 2048
 
-# Unified-pool admission ceiling used when the SPECULATIVE hook defaulted
+# Spec-ON: unified-pool admission ceiling used when the SPECULATIVE hook defaulted
 # --max-running-requests to 48 (a static-partition tuning, not a user
 # decision; under the unified pool the joint byte solve is the real bound).
 # Matches the default decode CUDA-graph max_bs; batches beyond the captured
 # sizes fall back to eager, and runtime pressure lands on the admission
 # charges + check_decode_mem probe->retract machinery.
-UNIFIED_MAX_RUNNING_REQUESTS_CEILING = 256
+UNIFIED_SPEC_ON_REQ_CEILING = 256
 
 # Spec-OFF analogue: without spec, --max-running-requests has no default at
 # all (None), so the solve needs a finite `requested` seed. Matches
@@ -110,8 +110,11 @@ class UnifiedSpecAdmission(msgspec.Struct):
     headroom_slots: int
     mamba_slots: int  # hard + radix headroom (possibly explicit-capped)
     band_bytes: int  # spec-state band at max_num_reqs
-    deducted_bytes: int  # profile deduction: band + mamba bytes
-    token_budget_bytes: int  # rest - deducted (converted by the fused cell)
+    # ONE request's irreducible floor = its `hard_slots` mamba slots + the fixed
+    # spec band (subtract 1x, not Nx). `rest - single_req_floor_bytes` is the
+    # SINGLE-request feasibility budget the handler advertises as
+    # max_total_num_tokens (a lone request's ceiling in the floating buffer).
+    single_req_floor_bytes: int
 
 
 def solve_unified_spec_admission(
@@ -155,8 +158,7 @@ def solve_unified_spec_admission(
             headroom_slots=0,
             mamba_slots=0,
             band_bytes=0,
-            deducted_bytes=0,
-            token_budget_bytes=0,
+            single_req_floor_bytes=0,
         )
 
     band_bytes = (n + 1 + margin_slots) * num_draft_tokens * mamba_bytes_per_req
@@ -181,15 +183,15 @@ def solve_unified_spec_admission(
     if explicit_mamba_slots is not None:
         mamba_slots = min(mamba_slots, explicit_mamba_slots)
 
-    deducted_bytes = band_bytes + mamba_slots * mamba_bytes_per_req
+    # One request's irreducible floor: its hard mamba slots + the fixed band.
+    single_req_floor_bytes = hard_slots * mamba_bytes_per_req + band_bytes
     return UnifiedSpecAdmission(
         max_num_reqs=int(n),
         hard_mamba_slots=int(hard_mamba_slots),
         headroom_slots=int(headroom_slots),
         mamba_slots=mamba_slots,
         band_bytes=band_bytes,
-        deducted_bytes=deducted_bytes,
-        token_budget_bytes=rest_bytes - deducted_bytes,
+        single_req_floor_bytes=single_req_floor_bytes,
     )
 
 
@@ -448,49 +450,98 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def _handle_max_mamba_cache_unified(self: ModelRunner, total_rest_memory):
-        """Unified-pool (target) sizing, spec ON or OFF: solve admission and
-        the reservations JOINTLY against the shared buffer's byte budget.
+        """Unified-pool (target) admission sizing, spec ON or OFF: solve the
+        admission cap and the mamba/band reservations JOINTLY against the one
+        shared byte buffer.
 
-        The static-partition model (upstream path above) charges every request
-        its worst case FOREVER — `ratio` mamba slots + D intermediate rows —
-        then splits bytes by `mamba_full_memory_ratio`. At Falcon-7B/mfs0.45/
-        D=4 that admits 11 requests against a 313k-token pool the workload
-        cannot fill (3% peak usage with 189 requests queued). Under the
-        unified pool all partitions share one byte buffer with floating
-        frontiers, so boot-time admission only needs each request's
-        IRREDUCIBLE floor:
+        WHY THIS EXISTS — a wall vs no wall.
+        The upstream path (`handle_max_mamba_cache` above) statically
+        PARTITIONS memory: it splits bytes by `mamba_full_memory_ratio` into a
+        mamba partition and a full-KV partition, then derives the admission cap
+        as `max_mamba_cache_size // ratio`. That split is a WALL fixed at boot,
+        and it forces CONSERVATIVE sizing — it charges every request its WORST
+        case forever (`ratio` mamba slots + D intermediate rows + a full
+        token-budget share) — because once the wall is set an over-admit is
+        UNRECOVERABLE: the mamba side cannot borrow bytes from the full-KV
+        side, so it would hard-OOM.
 
-            floor mamba slots (active + extra_buffer track + radix
-            checkpoint allowance = the full mamba_ratio)           x per_req
-          + D spec-band rows (worst case: all N verify together)   x per_req
-          + UNIFIED_MIN_TOKENS_PER_REQ tokens                      x cell_size
+        The unified pool has NO wall: mamba / full-KV / spec-state band all
+        share one byte buffer with floating frontiers, and a request's growth
+        is funded dynamically from that shared buffer at runtime. That lets
+        this method size AGGRESSIVELY — reserve only each request's IRREDUCIBLE
+        FLOOR instead of its worst case — which yields a much higher cap N:
 
-        The radix-checkpoint allowance is INSIDE the floor: it is
-        consumed by every running chunked request as a LOCKED tree checkpoint,
-        so leftover-funded "headroom" starves under an uncapped byte solve and
-        trips the fail-loud `_alloc_mamba_slot` assert). Runtime pressure
-        lands on the existing machinery: per-request band/mamba charges in
-        admission (schedule_policy), check_decode_mem's probe->place->retract,
-        and radix eviction.
+            (hard_slots + D) mamba slots         x mamba_bytes_per_req
+          + UNIFIED_MIN_TOKENS_PER_REQ tokens    x cell_size
+            (+ a one-time band-alignment margin, spec only)
+
+        The aggression is SAFE, not reckless, precisely BECAUSE there is no
+        wall: if N admits more work than fits, the RUNTIME machinery claws it
+        back — per-request byte charges in admission (schedule_policy /
+        ByteAdmissionBudget), check_decode_mem's probe->place->retract, and
+        radix eviction. Boot only sets an initial ceiling; runtime is the
+        authoritative constraint. (Upstream cannot lean on this: its wall makes
+        the boot split final, so it has no choice but worst-case reservation.)
+
+        THE MAMBA FLOOR (`hard_slots` = the full `mamba_ratio`) has three parts:
+          - active: the 1 slot holding the request's live recurrent state,
+            read and updated every decode step.
+          - radix-checkpoint allowance: the slots a running chunked request
+            LOCKS when it checkpoints its recurrent state into the tree for
+            prefix reuse. These are INSIDE the floor, NOT evictable headroom —
+            funding them from "leftover" bytes starves under an aggressive byte
+            solve and trips the fail-loud `_alloc_mamba_slot` assert.
+          - extra_buffer track: the ping-pong double-buffer slots the overlap
+            scheduler needs (0 for the `no_buffer` strategy, e.g. Kimi).
+
+        UNIFIED_MIN_TOKENS_PER_REQ — a heuristic minimum full-KV token budget
+        charged per admitted request. Its imprecision splits cleanly:
+          - HARMLESS for CORRECTNESS: it reserves nothing (there is no wall) —
+            it only divides `rest_bytes` into a boot-time COUNT. A wrong value
+            can never OOM, corrupt, or wedge the pool; the runtime byte budget
+            + retract are authoritative and self-correct.
+          - a PERFORMANCE dial for the rest: it sets the concurrency ceiling N
+            (when --max-running-requests is unset). Too small -> higher N ->
+            more retract churn; too large -> N caps concurrency below what the
+            hardware could sustain. It DOMINATES the floor for small-state
+            models (GDN-class: small mamba state, large `cell_size`, so
+            N ~ rest_bytes / (UNIFIED_MIN_TOKENS_PER_REQ * cell_size)) and is
+            negligible for large-state models (Kimi KDA: the mamba slots
+            dominate). So it is a fine fixed default; tune it only as a
+            throughput/latency choice, never for safety.
 
         DRAFT KV: fused into the full-KV slot entry (`cell_size` is the fused
         entry from the draft's own geometry), so the draft worker allocates no
         pool of its own and nothing beyond the cell needs reserving.
 
-        ADMISSION CEILING: when --max-running-requests was NOT set by the
-        user, the speculative hook's default of 48 (a static-partition tuning)
-        is lifted to UNIFIED_MAX_RUNNING_REQUESTS_CEILING and the byte
-        solve becomes the binding constraint; the solved value is written back
-        to server_args so the draft worker and downstream consumers see it.
-        Spec-OFF there is no hook default at all (None) — the solve seeds
-        `requested` with UNIFIED_SPEC_OFF_REQ_CEILING and nothing is written
-        back (_resolve_max_num_reqs re-clamps as usual).
+        ADMISSION CEILING seed: when --max-running-requests was NOT set, the
+        speculative hook's default of 48 (a static-partition tuning) is lifted
+        to UNIFIED_SPEC_ON_REQ_CEILING and the byte solve becomes the
+        binding constraint; the solved value is written back to server_args so
+        the draft worker and downstream consumers see it. Spec-OFF has no hook
+        default at all (None) — the solve seeds `requested` with
+        UNIFIED_SPEC_OFF_REQ_CEILING and nothing is written back
+        (_resolve_max_num_reqs re-clamps as usual).
 
-        Sets `self._unified_mamba_max_num_reqs` (consumed by _resolve_max_num_reqs,
-        which then skips the static ratio clamp), `self.mamba_spec_state_size`
-        (band rows = N), and `server_args.max_mamba_cache_size` (hard slots +
-        headroom grant); returns the token-pool budget in GiB, mirroring the
-        upstream path's contract.
+        MAX_TOTAL_NUM_TOKENS is a LABEL, not a partition. This method returns
+        the SINGLE-REQUEST feasibility numerator (`B - one request's floor`), so
+        the configurator's `available_bytes // cell_size` yields the largest
+        full-KV token count one request can occupy alongside its own mamba floor
+        and the fixed band — exactly the SWA path's `(B - floor*e_s)//e_f`. It is
+        NOT the N-shared partition floor `(B - N*floors - headroom)//e_f`, which
+        collapses toward `N*UNIFIED_MIN_TOKENS_PER_REQ` for large-state models
+        and would clamp a lone request's `max_new_tokens` far below what the
+        floating buffer can schedule. Admission/concurrency does NOT key off this
+        value (runtime is byte-gated via schedulable_free_bytes; max_running_reqs
+        stays at N) — only the per-request clamp and the usage denominators do.
+
+        Sets `self._unified_mamba_max_num_reqs` (consumed by
+        _resolve_max_num_reqs, which then skips the static ratio clamp),
+        `self.mamba_spec_state_size` (band rows = N),
+        `server_args.max_mamba_cache_size` (hard slots + headroom grant), and
+        `self.unified_total_bytes` (the whole buffer budget B, read directly by
+        the pool factory — the same `unified_total_bytes` the SWA path carries);
+        returns the single-request feasibility budget in GiB.
         """
         config = self.mambaish_config
         server_args = self.server_args
@@ -530,29 +581,25 @@ class ModelRunnerKVCacheMixin:
                 requested = UNIFIED_SPEC_OFF_REQ_CEILING // dp
                 requested_note = " = spec-off ceiling, byte solve binds"
             else:
-                requested = UNIFIED_MAX_RUNNING_REQUESTS_CEILING // dp
-                requested_note = " = unified ceiling (cap unset)"
+                requested = UNIFIED_SPEC_ON_REQ_CEILING // dp
+                requested_note = " = spec-on ceiling (cap unset)"
             requested_defaulted = False
         elif requested_defaulted:
-            requested = UNIFIED_MAX_RUNNING_REQUESTS_CEILING // dp
-            requested_note = " = unified ceiling, hook default lifted"
+            requested = UNIFIED_SPEC_ON_REQ_CEILING // dp
+            requested_note = " = spec-on ceiling, hook default lifted"
         else:
             requested = server_args.max_running_requests // dp
             requested_note = ""
         per_req = config.mamba2_cache_params.mamba_cache_per_req
         ratio = self._calculate_mamba_ratio()
-        # The per-request slot FLOOR is the full ratio: 1 active + the
-        # extra_buffer ping-pong track slots + the base ratio's radix
-        # allowance. The radix slots are NOT optional headroom: a running
-        # chunked request checkpoints its mamba state into the tree
-        # (`cache_unfinished_req -> _alloc_mamba_slot`, a fail-loud assert)
-        # and that checkpoint stays LOCKED while the request runs — charging
-        # only active+track lets an uncapped byte solve admit huge N with a
-        # handful of leftover-funded radix slots and die on that assert
-        # under load. `mamba_ratio` is 1 under disable_radix_cache, so the
-        # floor degenerates correctly. The solve's headroom term then caps at
-        # zero (floor == ratio) — the guarantee is exactly upstream's
-        # `max_mamba_cache_size // ratio` allowance, byte-solved.
+        # Per-request mamba slot floor = the full ratio (active + track +
+        # radix-checkpoint; see the docstring for why the checkpoint slots are
+        # part of the floor, not evictable headroom). The lock happens at
+        # `cache_unfinished_req -> _alloc_mamba_slot` (a fail-loud assert).
+        # `mamba_ratio` degenerates to 1 under disable_radix_cache, and the
+        # solve's headroom term then caps at zero (floor == ratio) — so the
+        # guarantee is exactly upstream's `max_mamba_cache_size // ratio`
+        # allowance, byte-solved.
         hard_slots = ratio
 
         # Per-token full-KV bytes from the SAME configurator class that sizes
@@ -563,7 +610,17 @@ class ModelRunnerKVCacheMixin:
         configurator = create_memory_pool_configurator(self)
         cell_size = configurator._cell_size
 
-        rest_bytes = int(total_rest_memory * (1 << 30))
+        # Align the buffer budget to a coarse boundary every store-dtype
+        # itemsize divides (mirrors the SWA path's UNIFIED_BYTE_ALIGN): this
+        # value becomes the raw buffer's total_bytes directly, and the sub-pools
+        # view it as the store dtype — an arbitrary odd profiled count can crash
+        # at boot ("size must be divisible by 2 to view Byte as BFloat16"). Do
+        # it once here so the solve, the feasibility label, and the buffer all
+        # agree; the lost remainder (<4096 B) is negligible.
+        UNIFIED_BYTE_ALIGN = 4096
+        rest_bytes = (
+            int(total_rest_memory * (1 << 30)) // UNIFIED_BYTE_ALIGN
+        ) * UNIFIED_BYTE_ALIGN
         explicit_mamba_slots = (
             server_args.max_mamba_cache_size // dp
             if server_args.max_mamba_cache_size is not None
@@ -603,6 +660,14 @@ class ModelRunnerKVCacheMixin:
         # no-band path (mirrors the upstream spec-off contract).
         self.mamba_spec_state_size = int(n) if D > 0 else None
         self._unified_mamba_max_num_reqs = int(n)
+        # The WHOLE profiled budget IS the buffer: full-KV + mamba state + spec
+        # band all float within it (no wall). Stash it verbatim so the factory
+        # sizes total_bytes from it directly (the same `unified_total_bytes` the
+        # SWA path carries), instead of reconstructing it from the
+        # feasibility token count below — which would re-impose the N-shared
+        # partition. `is_hybrid_swa` is false here, so _apply_memory_pool_config
+        # never overwrites this stash.
+        self.unified_total_bytes = rest_bytes
         if requested_defaulted:
             # Write the solved cap back so every downstream consumer — the
             # draft worker (via memory_pool_config), _resolve_max_num_reqs,
@@ -615,11 +680,25 @@ class ModelRunnerKVCacheMixin:
             if self.draft_kv_geometry is not None
             else f"no draft KV ({cell_size} B/token)"
         )
+        # Advertise max_total_num_tokens as a SINGLE-REQUEST feasibility ceiling,
+        # mirroring the SWA path's `(B - floor*e_s)//e_f`: subtract ONE request's
+        # irreducible floor (its `hard_slots` mamba slots + the fixed spec band,
+        # = admission.single_req_floor_bytes), NOT the N-shared deduction (N
+        # floors + radix headroom = band_bytes + mamba_slots*per_req). The buffer
+        # still physically reserves the N mamba slots; this value is only the
+        # per-request clamp / usage denominator, and at runtime a lone request
+        # can grow into the whole floating buffer. Subtracting 1x (not Nx) is why
+        # the label no longer collapses toward N*token_floor for large-state
+        # models (Kimi-class), whose mamba slots dominate the budget.
+        feasibility_tokens = (
+            rest_bytes - admission.single_req_floor_bytes
+        ) // cell_size
         logger.info(
             "[unified-memory-pool] joint admission solve: max_num_reqs=%d "
             "(requested %d%s), floor slots/req=%d (active+track+radix ckpt), "
             "D=%d, mamba slots=%d (floor %d + headroom %d), band %.2f GiB, "
-            "%s, token floor %d tok/req, token-pool budget %.2f GiB.",
+            "%s, token floor %d tok/req, buffer budget %.2f GiB, single-request "
+            "feasibility label %d tok.",
             n,
             requested,
             requested_note,
@@ -631,9 +710,10 @@ class ModelRunnerKVCacheMixin:
             admission.band_bytes / (1 << 30),
             draft_note,
             UNIFIED_MIN_TOKENS_PER_REQ,
-            admission.token_budget_bytes / (1 << 30),
+            rest_bytes / (1 << 30),
+            feasibility_tokens,
         )
-        return total_rest_memory - admission.deducted_bytes / (1 << 30)
+        return total_rest_memory - admission.single_req_floor_bytes / (1 << 30)
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
@@ -818,6 +898,12 @@ class ModelRunnerKVCacheMixin:
             extra_max_context_len=extra_max_context_len,
             max_total_num_tokens=self.max_total_num_tokens,
             max_mamba_cache_size=self.server_args.max_mamba_cache_size,
+            # The whole profiled buffer budget B, stashed by
+            # _handle_max_mamba_cache_unified (which always runs on the target
+            # before pool init). max_total_num_tokens above is only the
+            # single-request feasibility label; the buffer is sized from B so
+            # the frontiers float freely (no N-shared partition).
+            total_bytes=self.unified_total_bytes,
             max_num_reqs=max_num_reqs,
             enable_memory_saver=self.server_args.enable_memory_saver,
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
@@ -939,7 +1025,7 @@ class ModelRunnerKVCacheMixin:
             # Ratio-free byte budget: allocate the buffer from the
             # profiled bytes directly; the token counts are labels. None falls
             # back to count-summing (SWAChunkCapPoolConfigurator path).
-            total_bytes=getattr(self, "unified_swa_total_bytes", None),
+            total_bytes=self.unified_total_bytes,
         )
         self.token_to_kv_pool = bundle.token_to_kv_pool
         self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
@@ -1837,10 +1923,11 @@ class ModelRunnerKVCacheMixin:
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
             # Unified path: the buffer's DIRECT byte budget (the token counts
             # above are feasibility/label values, not a partition). None on
-            # non-unified and on configurators that still size by counts.
-            self.unified_swa_total_bytes = getattr(
-                config, "unified_total_bytes", None
-            )
+            # non-unified and on configurators that still size by counts. The
+            # mamba path populates the SAME attribute earlier, in
+            # _handle_max_mamba_cache_unified (is_hybrid_swa is false there, so
+            # this branch never clobbers it).
+            self.unified_total_bytes = config.unified_total_bytes
 
         # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on

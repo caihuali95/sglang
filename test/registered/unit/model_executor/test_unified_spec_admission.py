@@ -74,6 +74,14 @@ def _reference_solve(
     return n, mamba_slots, deducted
 
 
+def _deducted_bytes(a, mamba_bytes_per_req):
+    """The N-shared reservation (band + all admitted mamba slots), derived from
+    the surviving struct fields. The dedicated `deducted_bytes` /
+    `token_budget_bytes` fields were removed once nothing in production read
+    them; the solve's arithmetic is still pinned here, just recomputed."""
+    return a.band_bytes + a.mamba_slots * mamba_bytes_per_req
+
+
 # Production-shaped cells: Qwen3.5-9B-class GDN. The fused cell = host entry
 # 32768 B/token + the draft region: EAGLE +4096 (1 MTP layer), DFLASH +24576
 # (6 layers). NGRAM carries no draft KV, so its cell is the host entry alone.
@@ -175,16 +183,33 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
                             self.assertEqual(a.max_num_reqs, n)
                             if n > 0:
                                 self.assertEqual(a.mamba_slots, mamba_slots)
-                                self.assertEqual(a.deducted_bytes, deducted)
+                                # N-shared reservation, byte-exact vs reference.
                                 self.assertEqual(
-                                    a.token_budget_bytes,
-                                    rest_gib * GIB - deducted,
+                                    _deducted_bytes(
+                                        a, params["mamba_bytes_per_req"]
+                                    ),
+                                    deducted,
+                                )
+                                # One request's floor = 1x hard slots + the
+                                # fixed band; never larger than the N-shared
+                                # deduction (which carries N floors + headroom).
+                                self.assertEqual(
+                                    a.single_req_floor_bytes,
+                                    params["hard_slots"]
+                                    * params["mamba_bytes_per_req"]
+                                    + a.band_bytes,
+                                )
+                                self.assertLessEqual(
+                                    a.single_req_floor_bytes,
+                                    _deducted_bytes(
+                                        a, params["mamba_bytes_per_req"]
+                                    ),
                                 )
 
     def test_spec_off_degenerates_band_to_zero(self):
-        """D=0 (spec OFF): every band term is EXACTLY zero, the deduction is
-        the mamba grant alone, and the token budget is rest minus that grant.
-        This is the arithmetic contract the spec-OFF gate flip relies on."""
+        """D=0 (spec OFF): every band term is EXACTLY zero, so the deduction is
+        the mamba grant alone. This is the arithmetic contract the spec-OFF gate
+        flip relies on."""
         for params in (QWEN_SPEC_OFF, QWEN_SPEC_OFF_EXTRA_BUF, KIMI_SPEC_OFF):
             for rest_gib, requested in ((2, 48), (35, 256), (55, 4096)):
                 a = solve_unified_spec_admission(
@@ -197,13 +222,15 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
                 ):
                     self.assertGreater(a.max_num_reqs, 0)
                     self.assertEqual(a.band_bytes, 0)
+                    # No band -> the deduction is exactly the mamba grant, and
+                    # the single-request floor is exactly one request's slots.
                     self.assertEqual(
-                        a.deducted_bytes,
+                        _deducted_bytes(a, params["mamba_bytes_per_req"]),
                         a.mamba_slots * params["mamba_bytes_per_req"],
                     )
                     self.assertEqual(
-                        a.token_budget_bytes,
-                        rest_gib * GIB - a.deducted_bytes,
+                        a.single_req_floor_bytes,
+                        params["hard_slots"] * params["mamba_bytes_per_req"],
                     )
                     # The hard grant backs every admitted request's slots.
                     self.assertEqual(
@@ -241,7 +268,10 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
             )
             with self.subTest(rest_gib=rest_gib, cell=params["cell_size"]):
                 self.assertGreater(a.max_num_reqs, 0)
-                tokens = a.token_budget_bytes // params["cell_size"]
+                token_budget = rest_gib * GIB - _deducted_bytes(
+                    a, params["mamba_bytes_per_req"]
+                )
+                tokens = token_budget // params["cell_size"]
                 self.assertGreaterEqual(
                     tokens, a.max_num_reqs * UNIFIED_MIN_TOKENS_PER_REQ
                 )
@@ -292,8 +322,9 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
             rest_bytes=1 * GIB, requested=48, **QWEN_DFLASH
         )
         self.assertLessEqual(a.max_num_reqs, 0)
-        self.assertEqual(a.deducted_bytes, 0)
+        self.assertEqual(a.mamba_slots, 0)
         self.assertEqual(a.band_bytes, 0)
+        self.assertEqual(a.single_req_floor_bytes, 0)
 
     def test_headroom_capped_by_base_ratio(self):
         """With an ample budget the radix-headroom grant stops at the base
@@ -306,6 +337,118 @@ class TestUnifiedSpecAdmissionSolve(CustomTestCase):
         self.assertEqual(
             a.mamba_slots, 4 * QWEN_EAGLE["mamba_ratio"]
         )  # leftover >> cap
+
+
+class TestSingleRequestFeasibilityLabel(CustomTestCase):
+    """The handler advertises max_total_num_tokens as `(rest -
+    single_req_floor_bytes) // cell` — a SINGLE-request feasibility ceiling
+    (subtract ONE request's floor), decoupled from the N-shared token budget.
+    These pin the arithmetic the handler relies on (see
+    _handle_max_mamba_cache_unified); the ModelRunner wiring is exercised by the
+    e2e GPU lanes."""
+
+    def _feasibility_tokens(self, a, params, rest_bytes):
+        return (rest_bytes - a.single_req_floor_bytes) // params["cell_size"]
+
+    def _nshared_tokens(self, a, params, rest_bytes):
+        token_budget = rest_bytes - _deducted_bytes(
+            a, params["mamba_bytes_per_req"]
+        )
+        return token_budget // params["cell_size"]
+
+    def test_label_never_below_nshared(self):
+        """The feasibility label is >= the old N-shared value everywhere:
+        subtracting 1x a floor can only leave MORE room than subtracting Nx.
+        This is the whole point of the change — the label never regresses."""
+        for params in (
+            QWEN_EAGLE,
+            QWEN_DFLASH,
+            QWEN_NGRAM,
+            QWEN_SPEC_OFF,
+            KIMI_SPEC_OFF,
+        ):
+            for rest_gib in (10, 35, 55):
+                for requested in (48, 256, 4096):
+                    rest = rest_gib * GIB
+                    a = solve_unified_spec_admission(
+                        rest_bytes=rest, requested=requested, **params
+                    )
+                    if a.max_num_reqs <= 0:
+                        continue
+                    with self.subTest(
+                        cell=params["cell_size"],
+                        rest_gib=rest_gib,
+                        requested=requested,
+                    ):
+                        self.assertGreaterEqual(
+                            self._feasibility_tokens(a, params, rest),
+                            self._nshared_tokens(a, params, rest),
+                        )
+
+    def test_large_state_label_strictly_larger(self):
+        """Kimi-class (large mamba state, light MLA cell): when N is byte-bound
+        the N mamba floors dominate the budget, so the N-shared label collapses
+        toward N*token_floor while the single-request label stays near the full
+        buffer. Concretely the ratio is ~1 + hard*per_req/token_floor (≈5x for
+        KDA: 3*21MiB / (2048*8064B)). This is the bug the change fixes."""
+        rest = 35 * GIB
+        # requested large so admission is BYTE-bound (N maximal); at a small
+        # requested cap N is artificially low and mamba does not yet dominate.
+        a = solve_unified_spec_admission(
+            rest_bytes=rest, requested=4096, **KIMI_SPEC_OFF
+        )
+        self.assertGreater(a.max_num_reqs, 1)
+        feasibility = self._feasibility_tokens(a, KIMI_SPEC_OFF, rest)
+        nshared = self._nshared_tokens(a, KIMI_SPEC_OFF, rest)
+        # The freed bytes = (mamba_slots - hard_slots) * per_req; for KDA that is
+        # several multiples of the N-shared count.
+        self.assertGreater(feasibility, 3 * nshared)
+
+    def test_small_state_label_parity(self):
+        """Tiny mamba state (per_req << token_floor bytes): the 1x-vs-Nx
+        distinction is a rounding error, so the feasibility label matches the
+        N-shared value within one request's floor. GDN-class behavior is
+        unchanged."""
+        tiny = dict(
+            mamba_bytes_per_req=64 * (1 << 10),  # 64 KiB — negligible state
+            num_draft_tokens=0,
+            hard_slots=3,
+            mamba_ratio=3,
+            cell_size=32768,
+            margin_slots=3,
+        )
+        rest = 35 * GIB
+        a = solve_unified_spec_admission(rest_bytes=rest, requested=256, **tiny)
+        feasibility = self._feasibility_tokens(a, tiny, rest)
+        nshared = self._nshared_tokens(a, tiny, rest)
+        # Within the N-shared deduction expressed in tokens (a few tokens).
+        self.assertLessEqual(
+            feasibility - nshared,
+            _deducted_bytes(a, tiny["mamba_bytes_per_req"]) // tiny["cell_size"]
+            + 1,
+        )
+
+    def test_one_request_fits_its_floor_plus_token_floor(self):
+        """The feasibility budget must hold at least one request's full-KV token
+        floor after its own mamba floor + band — else the per-request clamp
+        would admit a request that cannot be scheduled alone."""
+        for params, rest_gib, requested in (
+            (QWEN_EAGLE, 35, 256),
+            (QWEN_DFLASH, 55, 256),
+            (KIMI_SPEC_OFF, 12, 256),
+            (KIMI_SPEC_OFF, 4, 48),
+            (QWEN_SPEC_OFF, 6, 4096),
+        ):
+            rest = rest_gib * GIB
+            a = solve_unified_spec_admission(
+                rest_bytes=rest, requested=requested, **params
+            )
+            with self.subTest(rest_gib=rest_gib, cell=params["cell_size"]):
+                self.assertGreater(a.max_num_reqs, 0)
+                self.assertGreaterEqual(
+                    self._feasibility_tokens(a, params, rest),
+                    UNIFIED_MIN_TOKENS_PER_REQ,
+                )
 
 
 if __name__ == "__main__":

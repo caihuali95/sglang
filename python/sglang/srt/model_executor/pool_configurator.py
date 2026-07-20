@@ -63,11 +63,14 @@ class MemoryPoolConfig:
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
 
-    # Unified memory pool (hybrid SWA): the byte budget the shared buffer is
-    # allocated with DIRECTLY. When set, the factory must NOT re-sum the token
-    # counts above into bytes — the counts are feasibility/label values (the
-    # per-request clamp and the usage denominators), not a partition, and the
-    # runtime split across the buffer is fully dynamic.
+    # Unified memory pool (hybrid SWA AND hybrid Mamba): the byte budget the
+    # shared buffer is allocated with DIRECTLY. When set, the factory must NOT
+    # re-sum the token counts above into bytes — the counts are feasibility/label
+    # values (the per-request clamp and the usage denominators), not a partition,
+    # and the runtime split across the buffer is fully dynamic. The SWA
+    # configurator sets it here; the mamba path stashes the same quantity on the
+    # ModelRunner during profiling (_handle_max_mamba_cache_unified), since B is
+    # only known there after the admission solve.
     unified_total_bytes: Optional[int] = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
@@ -178,7 +181,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             # KV is charged NOTHING here -- the target sizes its token budget as if
             # spec were off, and the draft pool built afterwards has to come out of
             # bytes nobody budgeted for. The complementary failure is the draft pool
-            # itself falling back to `num_hidden_layers` and being built 32x too
+            # itself falling back to `num_hidden_layers` and being built too
             # large. Both are silent; the pair OOMs at high mem-fraction.
             eagle_draft_num_layers = getattr(mr, "eagle_draft_num_layers", None)
             if (
@@ -380,15 +383,17 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * self._swa_layers_num
             )
 
-        # Fused draft KV: the draft region rides inside every FULL
-        # slot, so only the full-side per-token term grows — exact, via the
-        # same helper the physical layout uses. This also closes a latent gap:
-        # this configurator had no draft scaling at all, which could OOM on
-        # SWA-hybrid x spec. The non-fused fallback stays upstream-verbatim by
-        # design. `draft_kv_geometry is not None` <=> fusion enabled.
-        # `_full_entry_bytes` is the SINGLE full-side per-token price (fused
-        # when applicable) used by every byte computation below and in the
-        # ChunkCap subclass — the ratio cell is priced from it too.
+        # Fused draft KV: the draft region rides inside every FULL slot, so
+        # only the full-side per-token price grows — exact, via the same helper
+        # the physical layout uses. This closes a latent gap: this configurator
+        # had no draft scaling at all, which could OOM on SWA-hybrid x spec.
+        # `draft_kv_geometry is not None` <=> fusion enabled, and fusion only
+        # happens under the unified pool (gated in maybe_init_draft_kv_geometry).
+        # The unified sizing solve reads `_full_entry_bytes` DIRECTLY (not
+        # `_cell_size`), so only that price needs the fused bump; `_cell_size`
+        # is the non-unified ratio cell, never reached when fused.
+        # `_full_entry_bytes` is the single full-side per-token price used by
+        # every unified byte computation below and in the ChunkCap subclass.
         self._full_entry_bytes = self._full_per_token * self._full_layers_num
         self._swa_entry_bytes = self._swa_per_token * self._swa_layers_num
         draft_kv_geometry = _resolve_fused_draft_geometry(mr)
@@ -402,12 +407,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             self._full_entry_bytes = fused_entry_bytes(
                 self._full_per_token * self._full_layers_num, draft_kv_geometry
             )
-            self._cell_size = (
-                self._full_entry_bytes
-                + self._swa_full_tokens_ratio
-                * self._swa_per_token
-                * self._swa_layers_num
-            )
 
         # Unified memory pool: the boot split is NOT a runtime partition (the
         # buffer's frontiers float), so the ratio guess is replaced by a
@@ -419,8 +418,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # a perf bug). Precompute the page-independent floor terms here;
         # `calculate_pool_sizes` adds the page margins.
         self._unified = (
-            getattr(mr.server_args, "enable_unified_memory", False)
-            and self._full_layers_num > 0
+            mr.server_args.enable_unified_memory and self._full_layers_num > 0
         )
         if self._unified:
             sa = mr.server_args
@@ -673,6 +671,17 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     def is_applicable(mr: ModelRunner) -> bool:
         """True when SWAChunkCache can be sized from explicit max requests."""
         sa = mr.server_args
+        if sa.enable_unified_memory:
+            # Unified pool: sizing must stay with the parent's feasibility
+            # solve (_solve_unified_pool_sizes) — ONE byte budget, no static
+            # split. This subclass's whole premise is moot there: the swa side
+            # has no fixed pool to size tightly, and there is no partition to
+            # redirect the freed bytes across (the frontiers float at runtime).
+            # Its calculate_pool_sizes overrides also predate the unified
+            # branch and would silently bypass it (leaving unified_total_bytes
+            # unset -> the pool factory falls back to re-summing token counts,
+            # a static-split itemization the unified design retired).
+            return False
         if sa.max_running_requests is None:
             return False
         if not sa.disable_radix_cache:

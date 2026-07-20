@@ -707,6 +707,38 @@ class TestUnifiedSWASizing(unittest.TestCase):
         )
         self.assertIsNone(cfg.unified_total_bytes)
 
+    def test_chunk_cap_configurator_excluded_under_unified(self):
+        """REGRESSION: with --disable-radix-cache + explicit
+        --max-running-requests + chunked prefill (chunk-cache serving), the
+        factory used to select SWAChunkCapPoolConfigurator even under unified.
+        Its calculate_pool_sizes overrides predate the unified branch: they
+        split statically from the per-request cap and leave unified_total_bytes
+        unset, silently bypassing the feasibility solve. Under unified the
+        factory must stay on the parent configurator; non-unified keeps the
+        ChunkCap behavior verbatim."""
+        from sglang.srt.model_executor.pool_configurator import (
+            SWAChunkCapPoolConfigurator,
+            create_memory_pool_configurator,
+        )
+
+        chunk_cap_kw = dict(
+            max_running_requests=64,
+            disable_radix_cache=True,
+            chunked_prefill_size=self.CHUNK,
+        )
+        with mock_cpu_env():
+            # Unified: parent configurator + the byte-budget contract.
+            mr = self._mr(**chunk_cap_kw)
+            configurator = create_memory_pool_configurator(mr)
+            self.assertNotIsInstance(configurator, SWAChunkCapPoolConfigurator)
+            cfg = configurator.calculate_pool_sizes(self.B, self.PAGE)
+            self.assertEqual(cfg.unified_total_bytes, self.B)
+            # Non-unified control: ChunkCap still applies.
+            mr2 = self._mr(enable_unified_memory=False, **chunk_cap_kw)
+            self.assertIsInstance(
+                create_memory_pool_configurator(mr2), SWAChunkCapPoolConfigurator
+            )
+
 
 class TestMLACellSingleSourcing(unittest.TestCase):
     """The MLA per-token cost is single-sourced: the configurator's byte
