@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -74,6 +74,38 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         if self.free_group:
             self.free(torch.cat(self.free_group))
+
+    def on_forward_launched(
+        self,
+        forward_stream: torch.Stream,
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        """Lifecycle hook: a forward was just launched asynchronously.
+
+        Called by the scheduler once per launched forward, on the scheduling
+        thread, immediately after ALL of the forward's kernels have been
+        enqueued on ``forward_stream`` (for a speculative step that includes
+        every draft/verify kernel) and BEFORE anything else — frees of the
+        previous batch, new allocations — can run. ``out_cache_loc`` is the
+        forward's write-location tensor as the scheduler allocated it.
+
+        Default: no-op. An allocator that relocates or reuses pages while a
+        forward may still be reading or writing them (the unified memory
+        pool's lazy compaction) overrides this to record a completion event
+        and register the forward's write-set. The call-time guarantee above
+        is what makes that registration race-free: the allocator learns about
+        the in-flight forward before any flush can consider its pages.
+        """
+
+    def on_idle_proceed(self) -> None:
+        """Lifecycle hook: the scheduler has no work and is about to idle.
+
+        Called by the scheduler from ``on_idle`` (only when fully idle, so no
+        forward is in flight). Default: no-op. An allocator that defers work
+        while requests are running overrides this to catch up now — the
+        unified memory pool compacts its lazy holes here, when doing so is
+        free of any concurrent forward.
+        """
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:

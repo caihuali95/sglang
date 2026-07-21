@@ -44,10 +44,6 @@ from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 logger = logging.getLogger(__name__)
 
 
-# OFF (default): cat unsorted, `_flush` sorts once. ON: sort after each cat.
-_SORT_FREE_LIST_AFTER_MERGE = envs.SGLANG_SORT_FREE_LIST_AFTER_MERGE.get()
-
-
 import atexit
 import signal
 import time as _time_mod  # local alias so tests can patch
@@ -458,16 +454,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                     return None
 
             if n_drain > 0:
-                if _SORT_FREE_LIST_AFTER_MERGE:
-                    if self.grow_direction == "up":
-                        drained_t = self._free_phys_pages[:n_drain]
-                        self._free_phys_pages = self._free_phys_pages[n_drain:]
-                    else:
-                        drained_t = self._free_phys_pages[-n_drain:].flip(0)
-                        self._free_phys_pages = self._free_phys_pages[:-n_drain]
-                else:
-                    drained_t = self._free_phys_pages[:n_drain]
-                    self._free_phys_pages = self._free_phys_pages[n_drain:]
+                drained_t = self._free_phys_pages[:n_drain]
+                self._free_phys_pages = self._free_phys_pages[n_drain:]
             else:
                 drained_t = None
 
@@ -976,8 +964,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
             self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
-            if _SORT_FREE_LIST_AFTER_MERGE:
-                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
             self.live_page_count -= int(freed_p_pages.shape[0])
 
     def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
@@ -993,8 +979,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._stats_n_release_batch += 1
         with record_function("MultiEndedAlloc._release_phys_pages_batch"):
             self._free_phys_pages = torch.cat([self._free_phys_pages, pages])
-            if _SORT_FREE_LIST_AFTER_MERGE:
-                self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
     def _compact_pending(self, freed_physical_pages: torch.Tensor) -> None:
         """Eager compaction over the freed PHYSICAL pages: move survivors from the
@@ -1166,7 +1150,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self._stats_peak_pending_pages = max(
             self._stats_peak_pending_pages, cur_pending
         )
-        sort_tag = "ON" if _SORT_FREE_LIST_AFTER_MERGE else "OFF"
         logger.info(
             f"[lazy-stats sub={self.sub_pool_name!r}] "
             f"free_lazy={self._stats_n_free_lazy} "
@@ -1175,7 +1158,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             f"moves={self._stats_n_flush_moves} "
             f"abs={self._stats_n_pages_absorbed}) "
             f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
-            f"sort={sort_tag} "
             f"peak_holes={self._stats_peak_free_list_len} "
             f"peak_pending={self._stats_peak_pending_pages} "
             f"cur_holes={cur_holes} cur_pending={cur_pending} "
@@ -1199,7 +1181,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._stats_peak_pending_pages = max(
                 self._stats_peak_pending_pages, cur_pending
             )
-            sort_tag = "ON" if _SORT_FREE_LIST_AFTER_MERGE else "OFF"
             self._stats_final_emitted = True
             logger.info(
                 f"[lazy-stats FINAL sub={self.sub_pool_name!r} reason={reason}] "
@@ -1209,7 +1190,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"moves={self._stats_n_flush_moves} "
                 f"abs={self._stats_n_pages_absorbed}) "
                 f"drain={self._stats_n_drain_did_work}/{self._stats_n_drain_calls} "
-                f"sort={sort_tag} "
                 f"peak_holes={self._stats_peak_free_list_len} "
                 f"peak_pending={self._stats_peak_pending_pages} "
                 f"cur_holes={cur_holes} cur_pending={cur_pending} "
@@ -1257,8 +1237,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 self._stats_n_drained_pages_total += sum(
                     t.numel() for t in ready_tensors
                 )
-                if _SORT_FREE_LIST_AFTER_MERGE:
-                    self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
     def maybe_drain_pending_reuse(self) -> None:
         """Public scheduler hook (once per step): flow fired compaction-src pages
@@ -1393,8 +1371,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         with record_function("MultiEndedAlloc._flush"):
             self._drain_pending_reuse(urgent=urgent)
 
-            # Sort ASCENDING (skip if the env knob keeps the list always-sorted).
-            if not _SORT_FREE_LIST_AFTER_MERGE and self._free_phys_pages.numel() > 1:
+            # Sort ASCENDING.
+            if self._free_phys_pages.numel() > 1:
                 self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
             all_cpu = self._free_phys_pages.tolist()  # the ONE D2H sync per flush
@@ -1428,8 +1406,8 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # deferred to AFTER the trailing dst-slice, keeping `_free_phys_pages`
             # byte-identical to `holes_cpu` for the whole walk. That invariant is
             # what makes the directional dst-slice correct in both directions
-            # (catting srcs mid-flush would chop the wrong end / scramble under
-            # sort=ON, leaving ghost p2v=-1 pages + double-bound dsts). Event-
+            # (catting srcs mid-flush would chop the wrong end, leaving ghost
+            # p2v=-1 pages + double-bound dsts). Event-
             # PENDING srcs still route to `_pending_reuse` (read-race gating).
             released_fired: List[torch.Tensor] = []
 
@@ -1910,6 +1888,33 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     # -- Lazy compaction hooks --
 
+    def on_forward_launched(
+        self,
+        forward_stream: torch.Stream,
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        """Arm lazy compaction's write-race defense for the just-launched forward.
+
+        Records `forward_done` at the current tail of ``forward_stream`` — the
+        scheduler calls this hook after `forward_batch_generation` has enqueued
+        the WHOLE step, so for a speculative step the event covers the
+        multi-step draft, draft-extend, and DFLASH KV materialization too. The
+        event gates when a compaction-moved page's SOURCE may be reused
+        (readers must have drained); the write-set keeps the forward's own
+        write pages out of `_flush`'s move candidates entirely.
+
+        Fused draft KV is covered by construction: the write-set is SLOT/page-
+        granular and the draft writes its byte region at the SAME
+        `out_cache_loc` ids the target writes. Draft writes at COMMITTED
+        positions (draft-extend / DFLASH re-materialization) target
+        still-allocated pages, which are never flush candidates — the same
+        safety argument as the target's own accept-move destinations.
+        """
+        forward_done = torch.get_device_module(self.device).Event()
+        forward_done.record(forward_stream)
+        self.set_latest_forward_done_event(forward_done)
+        self.set_inflight_forward(forward_done, out_cache_loc)
+
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
         with record_function("UnifiedMambaAlloc.set_latest_forward_done_event"):
@@ -1930,6 +1935,10 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 forward_done, out_cache_loc_virtual
             )
             self.mamba_allocator.set_inflight_forward(forward_done, None)
+
+    def on_idle_proceed(self) -> None:
+        """Idle housekeeping: compact lazy holes while nothing is running."""
+        self.flush_opportunistic()
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free. Composite empty-set
@@ -2434,6 +2443,21 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     # -- Lazy compaction hooks --
 
+    def on_forward_launched(
+        self,
+        forward_stream: torch.Stream,
+        out_cache_loc: Optional[torch.Tensor],
+    ) -> None:
+        """Arm lazy compaction's write-race defense for the just-launched
+        forward. Same contract as the Mamba composite's hook (see it for the
+        event/write-set semantics and the fused-draft-KV coverage argument);
+        here both sub-pools derive their write-sets from `out_cache_loc`, each
+        via its own v2p."""
+        forward_done = torch.get_device_module(self.device).Event()
+        forward_done.record(forward_stream)
+        self.set_latest_forward_done_event(forward_done)
+        self.set_inflight_forward(forward_done, out_cache_loc)
+
     def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
         """Forward the per-batch `forward_done` event to BOTH sub-allocators."""
         with record_function("UnifiedSWAAlloc.set_latest_forward_done_event"):
@@ -2456,6 +2480,10 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator.set_inflight_forward(
                 forward_done, out_cache_loc_virtual
             )
+
+    def on_idle_proceed(self) -> None:
+        """Idle housekeeping: compact lazy holes while nothing is running."""
+        self.flush_opportunistic()
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of BOTH sub-allocators; sync-free. Composite empty-set

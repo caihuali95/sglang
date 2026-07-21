@@ -44,13 +44,13 @@ def _resolve_fused_draft_geometry(mr: "ModelRunner"):
     """The ModelRunner's fused-draft-KV region geometry, or None.
 
     `mr.draft_kv_geometry is not None` <=> fusion enabled (gated once in
-    `maybe_init_draft_kv_geometry`). Type-checked rather than a bare getattr
-    so mock ModelRunners in tests (whose auto-attributes are truthy) don't
-    trip the fused sizing branch.
+    `maybe_init_draft_kv_geometry`). Type-checked so mock ModelRunners in
+    tests (whose auto-attributes are truthy) don't trip the fused sizing
+    branch.
     """
     from sglang.srt.mem_cache.unified_memory_pool import MHARegionGeometry
 
-    geometry = getattr(mr, "draft_kv_geometry", None)
+    geometry = mr.draft_kv_geometry
     return geometry if isinstance(geometry, MHARegionGeometry) else None
 
 
