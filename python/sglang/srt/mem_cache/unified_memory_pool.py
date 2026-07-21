@@ -26,8 +26,9 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
+import msgspec
 import torch
 import triton
 from torch.profiler import record_function
@@ -36,16 +37,24 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.layout.page_major import (
     build_page_major_mamba_views,
     build_page_major_mha_views,
+    build_page_major_mla_views,
+    mla_entry_bytes,
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
+    KVWriteLoc,
     MambaPool,
     MHATokenToKVPool,
+    MLATokenToKVPool,
     move_kv_cache_native,
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.triton_ops.cache_move import store_cache_4d_kernel
+from sglang.srt.mem_cache.triton_ops.mla_buffer import (
+    get_mla_kv_buffer_page_major,
+    set_mla_kv_buffer_page_major,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -169,6 +178,46 @@ class MambaSubPoolSpec(SubPoolSpec):
         return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
 
 
+class MLASubPoolSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Layout spec for an MLA full-attention sub-pool: ONE latent region per
+    layer (`kv_cache_dim = kv_lora_rank + qk_rope_head_dim`), no K/V pair.
+
+    msgspec (not the grandfathered `@dataclass` hierarchy); `UnifiedKVPool`
+    dispatches by isinstance, so nothing needs the shared base class."""
+
+    name: str
+    layer_num: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    store_dtype: torch.dtype
+    grow_direction: str = "down"  # end pool, mirrors the MHA full spec
+
+    def validate(self) -> None:
+        assert self.layer_num > 0
+        assert self.kv_lora_rank > 0 and self.qk_rope_head_dim > 0
+        assert self.grow_direction in ("up", "down")
+
+    def kv_cache_dim(self) -> int:
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    def entry_bytes(self) -> int:
+        # Single source of truth shared with the configurator's MLA pricing.
+        return mla_entry_bytes(
+            layer_num=self.layer_num,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            itemsize=self.store_dtype.itemsize,
+        )
+
+    def get_dtype(self) -> torch.dtype:
+        return self.store_dtype
+
+
+# Duck-typed union accepted by UnifiedKVPool: the grandfathered @dataclass
+# hierarchy plus the msgspec-based MLA spec.
+SubPoolSpecLike = Union[SubPoolSpec, MLASubPoolSpec]
+
+
 # ---------------------------------------------------------------------------
 # UnifiedKVPool — the byte buffer + the strided per-sub-pool views
 # ---------------------------------------------------------------------------
@@ -189,9 +238,22 @@ class UnifiedKVPool:
         page_size: int = 1,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
-        assert len(sub_pool_specs) == 2, (
-            f"UnifiedKVPool currently supports exactly 2 sub-pools; got "
-            f"{len(sub_pool_specs)} (N>2 is not yet implemented)"
+        assert (
+            len(sub_pool_specs) >= 2
+        ), f"UnifiedKVPool needs >= 2 sub-pools; got {len(sub_pool_specs)}"
+        names = [s.name for s in sub_pool_specs]
+        assert len(set(names)) == len(
+            names
+        ), f"sub-pool names must be unique; got {names}"
+        for s in sub_pool_specs:
+            if isinstance(s, MLASubPoolSpec):
+                s.validate()
+        up_specs = [s for s in sub_pool_specs if s.grow_direction == "up"]
+        down_specs = [s for s in sub_pool_specs if s.grow_direction == "down"]
+        assert len(up_specs) == 1 and len(down_specs) == 1, (
+            f"UnifiedKVPool needs exactly one grow-up and one grow-down end "
+            f"sub-pool; got directions "
+            f"{[s.grow_direction for s in sub_pool_specs]}"
         )
         names = [s.name for s in sub_pool_specs]
         assert len(set(names)) == 2, f"sub-pool names must be unique; got {names}"
@@ -222,6 +284,8 @@ class UnifiedKVPool:
         # MHA: (k_buffer, v_buffer); Mamba: (conv_state_list, temporal_state)
         self._mha_views: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
+        # MLA sub-pools: one latent view list per layer (no K/V pair).
+        self._mla_views: Dict[str, List[torch.Tensor]] = {}
 
         # Slot-0 dummy writes for both pools land in [0, entry_max); each pool's
         # first allocatable slot is chosen so real data starts at >= entry_max.
@@ -251,6 +315,13 @@ class UnifiedKVPool:
             elif isinstance(spec, MambaSubPoolSpec):
                 self._mamba_views[spec.name] = self._build_mamba_views(
                     spec, anchor, max_slots
+                )
+            elif isinstance(spec, MLASubPoolSpec):
+                self._mla_views[spec.name] = self._build_mla_views(
+                    spec,
+                    anchor,
+                    max_slots,
+                    page_size=page_size,
                 )
             else:  # pragma: no cover
                 raise TypeError(f"unsupported SubPoolSpec type: {type(spec)}")
@@ -295,6 +366,16 @@ class UnifiedKVPool:
         ), f"sub-pool {name!r} is {type(s).__name__}, expected MambaSubPoolSpec"
         return s
 
+    def mla_spec(self, name: str) -> MLASubPoolSpec:
+        s = self._specs_by_name[name]
+        assert isinstance(
+            s, MLASubPoolSpec
+        ), f"sub-pool {name!r} is {type(s).__name__}, expected MLASubPoolSpec"
+        return s
+
+    def mla_views_for(self, name: str) -> List[torch.Tensor]:
+        return self._mla_views[name]
+
     def max_slots(self, name: str) -> int:
         return self._max_slots[name]
 
@@ -329,6 +410,26 @@ class UnifiedKVPool:
             page_size=page_size,
             num_pages=max_slots // page_size,
             anchor_bytes=anchor_bytes,
+            page_stride_bytes=page_size * spec.entry_bytes(),
+        )
+
+    def _build_mla_views(
+        self,
+        spec: MLASubPoolSpec,
+        anchor_bytes: int,
+        max_slots: int,
+        page_size: int,
+    ) -> List[torch.Tensor]:
+        return build_page_major_mla_views(
+            self._raw,
+            layer_num=spec.layer_num,
+            kv_lora_rank=spec.kv_lora_rank,
+            qk_rope_head_dim=spec.qk_rope_head_dim,
+            store_dtype=spec.store_dtype,
+            page_size=page_size,
+            num_pages=max_slots // page_size,
+            anchor_bytes=anchor_bytes,
+            page_stride_bytes=page_size * spec.entry_bytes(),
         )
 
     def _build_mamba_views(
@@ -494,6 +595,229 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
                 BLOCK=BLOCK,
                 num_warps=4,
             )
+
+
+class UnifiedMLATokenToKVPool(MLATokenToKVPool):
+    """MLA latent-KV pool whose `kv_buffer` is a list of 4-D PAGE-MAJOR strided
+    views into a `UnifiedKVPool` — the single-region analog of
+    `UnifiedMHATokenToKVPool`.
+
+    The views are `(num_pages, page_size, 1, kv_cache_dim)` and token
+    addressing is two-level (`page = loc // ps`, `slot = loc % ps`) — NON-affine
+    in the token id at page_size > 1, so every parent method that indexes
+    `kv_buffer[loc]` token-affinely is overridden with a page-aware
+    implementation. The layout is page-size-general by design (future ps > 1);
+    today's only MLA-hybrid (Kimi Linear) runs at ps == 1 because the
+    mamba-radix machinery forces it.
+
+    `set_kv_buffer` gets PHYSICAL slot ids; never translates. Model-side entry
+    points (`set_mla_kv_buffer`/`get_mla_kv_buffer`) also receive PHYSICAL ids:
+    `forward_batch.out_cache_loc` is rebound to physical once at ForwardBatch
+    construction (see `apply_unified_kv_loc_rebind`), so every downstream
+    consumer — backend and model code alike — sees only physical ids."""
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        sub_pool_name: str,
+        page_size: int = 1,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        spec = unified_buffer.mla_spec(sub_pool_name)
+        assert spec.store_dtype in (torch.bfloat16, torch.float16), (
+            "unified MLA sub-pool supports bf16/fp16 KV only (fp8/fp4 store "
+            "juggling in the MLA base class is untested on strided views)"
+        )
+        self._unified_buffer = unified_buffer
+        self._sub_pool_name = sub_pool_name
+        self._kv_views = unified_buffer.mla_views_for(sub_pool_name)
+        self._page_size = page_size
+        max_slots = unified_buffer.max_slots(sub_pool_name)
+
+        super().__init__(
+            size=max_slots - 1,  # -1 for reserved slot 0 (dummy-write sink)
+            page_size=page_size,
+            dtype=spec.store_dtype,
+            kv_lora_rank=spec.kv_lora_rank,
+            qk_rope_head_dim=spec.qk_rope_head_dim,
+            layer_num=spec.layer_num,
+            device=unified_buffer.device,
+            enable_memory_saver=False,  # buffer owned by UnifiedKVPool
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+    def _create_buffers(self):
+        self.kv_buffer = self._kv_views
+        # For external inspectors only; nothing on the MLA path consumes them.
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        pass  # lifetime owned by UnifiedKVPool
+
+    def get_kv_size_bytes(self):
+        # SCALAR (the MLA contract — HybridLinearKVPool.__init__ divides it);
+        # the UnifiedKVPool logs the real total centrally.
+        return 0
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "UnifiedMLATokenToKVPool: PD disaggregation / host transfer needs "
+            "contiguous per-layer buffers; the unified pool's views are "
+            "strided. PD is rejected under --enable-unified-memory."
+        )
+
+    def get_cpu_copy(self, indices):
+        raise NotImplementedError(
+            "UnifiedMLATokenToKVPool: host offload (HiCache) is disabled under "
+            "--enable-unified-memory; the parent's token-affine copy is "
+            "invalid on page-major views."
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        raise NotImplementedError(
+            "UnifiedMLATokenToKVPool: host offload (HiCache) is disabled under "
+            "--enable-unified-memory."
+        )
+
+    def _physical_loc(self, loc_info, ctx: str) -> torch.Tensor:
+        """Unwrap a bare PHYSICAL loc or a KVWriteLoc WITH full_loc; RAISE on a
+        KVWriteLoc without one (an untranslated backend) — the same load-bearing
+        tripwire as `UnifiedMHATokenToKVPool.set_kv_buffer`."""
+        was_write_loc = isinstance(loc_info, KVWriteLoc)
+        loc, _, full_loc = unwrap_write_loc(loc_info)
+        if full_loc is not None:
+            return full_loc
+        if was_write_loc:
+            raise RuntimeError(
+                f"unified MLA pool ({ctx}) received a KVWriteLoc with no "
+                "physical loc (full_loc=None): the attention backend did not "
+                "translate the virtual slot ids. The unified memory pool "
+                "requires the Triton attention backend on every path."
+            )
+        return loc
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        loc = self._physical_loc(loc_info, "set_kv_buffer")
+        with record_function("UnifiedMLA.set_kv_buffer"):
+            if cache_k.dtype != self.dtype:
+                cache_k = cache_k.to(self.dtype)
+            layer_id = layer.layer_id - self.start_layer
+            assert 0 <= layer_id < len(self.kv_buffer), (
+                f"UnifiedMLATokenToKVPool: layer_id {layer_id} out of range "
+                f"for {len(self.kv_buffer)} layer view(s)"
+            )
+            kv_view = self.kv_buffer[layer_id]
+            N = loc.numel()
+            if N == 0:
+                return
+            # Reuse the proven page-aware store: `store_cache_4d_kernel`'s K/V
+            # split is grid-controlled (axis 2), so a single-region launch
+            # (grid z=1) writes only the "K" region — which here IS the whole
+            # latent row. Same raw-pointer caller contract as the MHA pool:
+            # compact source rows + contiguous loc, upheld here.
+            cache_k = cache_k.reshape(N, -1)
+            if not cache_k.is_contiguous():
+                cache_k = cache_k.contiguous()
+            if not loc.is_contiguous():
+                loc = loc.contiguous()
+            assert kv_view.stride(-1) == 1 and (
+                kv_view.stride(1) == kv_view.shape[-1]
+            ), (
+                f"UnifiedMLATokenToKVPool: kv_view trailing dims not compact; "
+                f"stride={kv_view.stride()}, shape={tuple(kv_view.shape)}"
+            )
+            ROW_DIM = kv_view.shape[2] * kv_view.shape[3]  # 1 * kv_cache_dim
+            assert cache_k.shape[1] == ROW_DIM, (
+                f"UnifiedMLATokenToKVPool: latent row dim {cache_k.shape[1]} "
+                f"!= view row dim {ROW_DIM}"
+            )
+            BLOCK = 128
+            store_cache_4d_kernel[(N, triton.cdiv(ROW_DIM, BLOCK), 1)](
+                kv_view,
+                kv_view,  # V pointer unused: grid z=1 never runs the V branch
+                cache_k,
+                cache_k,
+                loc,
+                kv_view.stride(0),
+                kv_view.stride(1),
+                kv_view.stride(0),
+                kv_view.stride(1),
+                cache_k.stride(0),
+                cache_k.stride(0),
+                K_ROW_DIM=ROW_DIM,
+                V_ROW_DIM=ROW_DIM,
+                PAGE_SIZE=self._page_size,
+                BLOCK=BLOCK,
+                num_warps=4,
+            )
+
+    def set_mla_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        # `loc` is PHYSICAL (the ForwardBatch-level rebind).
+        layer_id = layer.layer_id - self.start_layer
+        with record_function("UnifiedMLA.set_mla_kv_buffer"):
+            if cache_k_nope.dtype != self.dtype:
+                cache_k_nope = cache_k_nope.to(self.dtype)
+                cache_k_rope = cache_k_rope.to(self.dtype)
+            set_mla_kv_buffer_page_major(
+                self.kv_buffer[layer_id],
+                loc.contiguous(),
+                cache_k_nope.reshape(loc.numel(), -1).contiguous(),
+                cache_k_rope.reshape(loc.numel(), -1).contiguous(),
+                page_size=self._page_size,
+            )
+
+    def get_mla_kv_buffer(
+        self,
+        layer,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        layer_id = layer.layer_id - self.start_layer
+        n = loc.numel()
+        dst_dtype = dst_dtype or self.dtype
+        cache_k_nope = torch.empty(
+            (n, 1, self.kv_lora_rank), dtype=dst_dtype, device=self.device
+        )
+        cache_k_rope = torch.empty(
+            (n, 1, self.qk_rope_head_dim), dtype=dst_dtype, device=self.device
+        )
+        get_mla_kv_buffer_page_major(
+            self.kv_buffer[layer_id],
+            loc.contiguous(),
+            cache_k_nope.view(n, -1),
+            cache_k_rope.view(n, -1),
+            page_size=self._page_size,
+        )
+        return cache_k_nope, cache_k_rope
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Page-aware single-region move for compaction / inverse-history /
+        accept-move. `tgt_loc`/`src_loc` are PHYSICAL token ids; two-level
+        advanced indexing is stride-correct on the 4-D views."""
+        ps = self._page_size
+        tgt_pg, tgt_in = tgt_loc // ps, tgt_loc % ps
+        src_pg, src_in = src_loc // ps, src_loc % ps
+        for kv in self.kv_buffer:
+            kv[tgt_pg, tgt_in] = kv[src_pg, src_in]
 
 
 class UnifiedMambaPool(MambaPool):
@@ -843,6 +1167,8 @@ def init_unified_mamba_pools(
     mamba_full_memory_ratio: Optional[float] = None,  # informational only
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
+    kv_lora_rank: Optional[int] = None,
+    qk_rope_head_dim: Optional[int] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -850,22 +1176,56 @@ def init_unified_mamba_pools(
         UnifiedMambaTokenToKVPoolAllocator,
     )
 
-    assert (
-        not use_mla_backend
-    ), "unified memory pool does not support MLA-hybrid-Mamba yet"
     # Full sub-pool is page-aware; mamba stays page=1 (state is per-request).
     assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), mamba at the low-byte end (grow-up).
-    full_spec = MHASubPoolSpec(
-        name="full",
-        layer_num=len(full_attention_layer_ids),
-        head_num=head_num,
-        head_dim=head_dim,
-        store_dtype=store_dtype,
-        grow_direction="down",
-    )
+    full_spec: SubPoolSpecLike
+    if use_mla_backend:
+        # MLA-hybrid (e.g. KDA + MLA): the full sub-pool stores one latent
+        # region per layer. Constraints of this path, asserted here rather
+        # than inherited from the CLI hooks (which can be bypassed):
+        assert kv_lora_rank is not None and qk_rope_head_dim is not None, (
+            "unified MLA-hybrid path needs the model's kv_lora_rank / "
+            "qk_rope_head_dim"
+        )
+        # The mamba-radix machinery of the current MLA-hybrid models runs
+        # non-overlap at page_size 1; the pool-side layout is page-size-general
+        # but the runtime combination beyond this is unvalidated.
+        assert page_size == 1, (
+            f"unified MLA-hybrid path requires page_size == 1; got {page_size}"
+        )
+        assert disable_overlap_schedule, (
+            "unified MLA-hybrid path requires --disable-overlap-schedule"
+        )
+        # Every MLA write path must route through the pool doors, which the
+        # ForwardBatch-level rebind feeds PHYSICAL ids; non-CUDA platforms have
+        # pool-bypassing MLA write kernels that no tripwire can catch.
+        assert device.startswith("cuda"), (
+            f"unified MLA-hybrid path is CUDA-only; got device={device!r}"
+        )
+        assert store_dtype in (torch.bfloat16, torch.float16), (
+            f"unified MLA-hybrid path supports bf16/fp16 KV only; got "
+            f"{store_dtype}"
+        )
+        full_spec = MLASubPoolSpec(
+            name="full",
+            layer_num=len(full_attention_layer_ids),
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            store_dtype=store_dtype,
+            grow_direction="down",
+        )
+    else:
+        full_spec = MHASubPoolSpec(
+            name="full",
+            layer_num=len(full_attention_layer_ids),
+            head_num=head_num,
+            head_dim=head_dim,
+            store_dtype=store_dtype,
+            grow_direction="down",
+        )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
         name="mamba",
@@ -902,13 +1262,23 @@ def init_unified_mamba_pools(
         enable_overlap_schedule=not disable_overlap_schedule,
         start_layer=start_layer,
     )
-    unified_full_kv_pool = UnifiedMHATokenToKVPool(
-        unified_buffer=shared_pool,
-        sub_pool_name="full",
-        page_size=page_size,
-        start_layer=start_layer,
-        end_layer=end_layer,
-    )
+    unified_full_kv_pool: KVCache
+    if use_mla_backend:
+        unified_full_kv_pool = UnifiedMLATokenToKVPool(
+            unified_buffer=shared_pool,
+            sub_pool_name="full",
+            page_size=page_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+    else:
+        unified_full_kv_pool = UnifiedMHATokenToKVPool(
+            unified_buffer=shared_pool,
+            sub_pool_name="full",
+            page_size=page_size,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
     full_attn_layer_ids_for_pool = (
         [0] if is_draft_worker else list(full_attention_layer_ids)
     )
@@ -945,6 +1315,10 @@ def init_unified_mamba_pools(
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
+    # NOTE: model-side MLA entry points (`set_mla_kv_buffer`/`get_mla_kv_buffer`
+    # on zero-prefix extends) consume `forward_batch.out_cache_loc`, which the
+    # ForwardBatch-level rebind (`apply_unified_kv_loc_rebind`) has already
+    # translated to PHYSICAL — the pool doors never translate.
 
     logger.info(
         "[unified-memory-pool] ============================================================"

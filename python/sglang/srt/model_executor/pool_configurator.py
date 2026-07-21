@@ -176,10 +176,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
+            # Base MLA latent cost via the SAME helper the unified physical
+            # layout uses (`MLASubPoolSpec.entry_bytes`) — budget and layout
+            # single-sourced so they cannot drift. FP4/DSA add-ons below are
+            # pricing-only overheads with no unified-layout counterpart (both
+            # families are excluded from the unified pool).
+            from sglang.srt.mem_cache.layout.page_major import mla_entry_bytes
+
+            cell_size = mla_entry_bytes(
+                layer_num=num_layers,
+                kv_lora_rank=model_config.kv_lora_rank,
+                qk_rope_head_dim=model_config.qk_rope_head_dim,
+                itemsize=kv_size,
             )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer

@@ -11,10 +11,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=178, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=360, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestKimiLinear(CustomTestCase):
+    extra_args = []
+
     @classmethod
     def setUpClass(cls):
         cls.model = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
@@ -23,7 +25,7 @@ class TestKimiLinear(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--tp-size", "2", "--trust-remote"],
+            other_args=["--tp-size", "2", "--trust-remote", *cls.extra_args],
         )
 
     @classmethod
@@ -43,6 +45,15 @@ class TestKimiLinear(CustomTestCase):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], 0.88)
+
+
+class TestKimiLinearUnifiedMemory(TestKimiLinear):
+    """Same GSM8K bar under --enable-unified-memory: the KDA state and the MLA
+    latent KV share one unified byte buffer (the attention backend defaults to
+    triton under the flag; the mamba-radix hook pins page_size=1 and
+    non-overlap scheduling)."""
+
+    extra_args = ["--enable-unified-memory"]
 
 
 if __name__ == "__main__":

@@ -581,7 +581,9 @@ class TritonAttnBackend(AttentionBackend):
             out_cache_loc_full_physical = self._translate_cuda_graph_shared_pool_locs(
                 forward_batch, bs
             )
-            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
+            swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(
+                forward_batch, in_capture=True
+            )
             self.forward_metadata = self._build_cuda_graph_forward_metadata(
                 bs,
                 forward_mode,
@@ -597,16 +599,29 @@ class TritonAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
             )
+            # Physical-loc contract tripwire (replay only — capture batches
+            # are runner-built with zero-filled static buffers and carry no
+            # flag): a live ForwardBatch that skipped the rebind would feed
+            # virtual ids into the captured store as if physical.
+            if (
+                self._translate_kv_loc is not None
+                and forward_batch.out_cache_loc is not None
+            ):
+                assert getattr(forward_batch, "out_cache_loc_is_physical", False), (
+                    "unified pool: forward_batch.out_cache_loc is not physical "
+                    "— the ForwardBatch was built without "
+                    "apply_unified_kv_loc_rebind"
+                )
             # Metadata view is reused from capture; just refill the buffers.
             self._translate_cuda_graph_shared_pool_locs(forward_batch, bs)
             self._fill_cuda_graph_swa_out_cache_loc(forward_batch)
 
     def _fill_cuda_graph_swa_out_cache_loc(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, in_capture: bool = False
     ) -> Optional[torch.Tensor]:
-        """Refill the SWA write-target buffer from live out_cache_loc, returning the
-        [:n] view (None for non-SWA / multi-step draft) so the captured store reads
-        fresh slots on replay."""
+        """Refill the SWA write-target buffer, returning the [:n] view (None for
+        non-SWA / multi-step draft) so the captured store reads fresh slots on
+        replay."""
         if not self.use_sliding_window_kv_pool:
             return None
         out_cache_loc = forward_batch.out_cache_loc
@@ -617,9 +632,30 @@ class TritonAttnBackend(AttentionBackend):
             return None
         n = out_cache_loc.shape[0]
         self.cuda_graph_swa_out_cache_loc[n:].zero_()
-        self.cuda_graph_swa_out_cache_loc[:n].copy_(
-            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
-        )
+        if self._translate_kv_loc is not None:
+            # Unified pool: the swa-physical rail is prepared at ForwardBatch
+            # construction (apply_unified_kv_loc_rebind) — out_cache_loc here
+            # is already FULL-physical, so running the virtual->swa map on it
+            # would produce garbage. Capture-time batches are runner-built
+            # from zero-filled static buffers and carry no rail; zero-fill is
+            # exactly what the old translate-of-zeros produced (slot 0 is the
+            # reserved sink in both id spaces).
+            if in_capture:
+                self.cuda_graph_swa_out_cache_loc[:n].zero_()
+            else:
+                swa_loc = getattr(forward_batch, "swa_out_cache_loc", None)
+                assert swa_loc is not None, (
+                    "unified hybrid-SWA replay: forward_batch.swa_out_cache_loc "
+                    "missing — the ForwardBatch was built without "
+                    "apply_unified_kv_loc_rebind"
+                )
+                self.cuda_graph_swa_out_cache_loc[:n].copy_(swa_loc)
+        else:
+            # Non-unified SWA pool: out_cache_loc is physical-full already;
+            # the static full->swa mapping applies (upstream-verbatim).
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
+            )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
     def _translate_cuda_graph_shared_pool_locs(
@@ -651,16 +687,18 @@ class TritonAttnBackend(AttentionBackend):
                         self.cuda_graph_window_kv_indices[:n_win]
                     )
                 )
-        # Full-attention write path: translate out_cache_loc -> physical into the
-        # capture-stable buffer and RETURN the [:n] view.
+        # Full-attention write path: out_cache_loc is ALREADY PHYSICAL (rebound
+        # at ForwardBatch construction by apply_unified_kv_loc_rebind; at
+        # capture the runner-built batch holds zeros, and copy-of-zeros ==
+        # translate-of-zeros because slot 0 is the reserved sink in both id
+        # spaces). Copy it into the capture-stable buffer and RETURN the [:n]
+        # view.
         out_cache_loc = forward_batch.out_cache_loc
         n = out_cache_loc.shape[0]
         # Zero the padded tail first: a smaller replay batch leaves [n:] holding
         # stale ids that the captured store would write; send them to slot 0 (sink).
         self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
-        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
-            self._translate_kv_loc(out_cache_loc)
-        )
+        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(out_cache_loc)
         return self.cuda_graph_out_cache_loc_full_physical[:n]
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -869,20 +907,39 @@ class TritonAttnBackend(AttentionBackend):
 
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                forward_batch.out_cache_loc
-            )
+            if self._translate_kv_loc is not None:
+                # Unified pool: the swa-physical rail was computed from the
+                # still-VIRTUAL loc at ForwardBatch construction
+                # (apply_unified_kv_loc_rebind) — out_cache_loc here is already
+                # FULL-physical, so the virtual->swa map must not run on it.
+                swa_out_cache_loc = getattr(forward_batch, "swa_out_cache_loc", None)
+                assert swa_out_cache_loc is not None, (
+                    "unified hybrid-SWA: forward_batch.swa_out_cache_loc "
+                    "missing — the ForwardBatch was built without "
+                    "apply_unified_kv_loc_rebind"
+                )
+            else:
+                # Non-unified SWA pool: out_cache_loc is physical-full; the
+                # static full->swa mapping applies (upstream-verbatim).
+                swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
 
-        # Unified pool full-attention WRITE loc (virtual out_cache_loc -> physical),
-        # carried in the metadata (-> KVWriteLoc.full_loc). None for non-unified pools.
+        # Unified pool full-attention WRITE loc: ALREADY PHYSICAL (rebound at
+        # ForwardBatch construction by apply_unified_kv_loc_rebind), carried in
+        # the metadata (-> KVWriteLoc.full_loc). None for non-unified pools.
         out_cache_loc_full_physical = None
         if (
             self._translate_kv_loc is not None
             and forward_batch.out_cache_loc is not None
         ):
-            out_cache_loc_full_physical = self._translate_kv_loc(
-                forward_batch.out_cache_loc
+            # Physical-loc contract tripwire: a hand-built ForwardBatch that
+            # skipped the rebind would write virtual ids as if physical.
+            assert getattr(forward_batch, "out_cache_loc_is_physical", False), (
+                "unified pool: forward_batch.out_cache_loc is not physical — "
+                "the ForwardBatch was built without apply_unified_kv_loc_rebind"
             )
+            out_cache_loc_full_physical = forward_batch.out_cache_loc
 
         self.forward_metadata = ForwardMetadata(
             attn_logits,
@@ -1206,6 +1263,20 @@ class TritonAttnBackend(AttentionBackend):
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
                 cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
+            elif self._translate_kv_loc is not None:
+                # Unified pool: `get_kv_buffer` returns a page-major (4-D)
+                # view — a bare `k_buffer[cache_loc]` here would index the
+                # PAGE axis with a flat token id (physical or not), a
+                # silent-corruption read. No unified-pool model shares KV
+                # across layers (k/v are always recomputed, so this branch is
+                # dead for them); fail loud rather than corrupt. A future
+                # KV-sharing unified model must add a page-aware gather here.
+                raise RuntimeError(
+                    "unified memory pool: cross-layer KV-sharing read "
+                    "(k is None) is unsupported — get_kv_buffer returns a "
+                    "virtual-indexed page-major view. No current unified model "
+                    "reaches this path."
+                )
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
@@ -1650,9 +1721,16 @@ class TritonAttnBackend(AttentionBackend):
                     # MLATokenToKVPool doesn't accept scale parameters; k is unused
                     # after this point in decode, so scale in place.
                     k.div_(layer.k_scale)
+                # Carry the pre-translated physical loc like the non-MLA branch
+                # below (and the MLA extend path): under the unified memory
+                # pool `out_cache_loc` is VIRTUAL, and a bare loc would make
+                # the pool write to wrong slots silently.
                 self.token_to_kv_pool.set_kv_buffer(
                     layer,
-                    forward_batch.out_cache_loc,
+                    KVWriteLoc(
+                        forward_batch.out_cache_loc,
+                        full_loc=self.forward_metadata.out_cache_loc_full_physical,
+                    ),
                     k,
                     v,
                 )

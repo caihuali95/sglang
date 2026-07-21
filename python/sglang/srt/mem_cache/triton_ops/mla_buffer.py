@@ -388,3 +388,164 @@ def get_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
     )
+
+
+# ---------------------------------------------------------------------------
+# Page-major variants (unified memory pool).
+#
+# The unified pool's MLA views are 4-D page-major:
+# (num_pages, page_size, 1, kv_cache_dim), where a token id addresses
+# page = loc // page_size, slot = loc % page_size — TWO-LEVEL, non-affine in
+# the token id at page_size > 1, so the dense kernels above (which compute
+# `loc * buffer_stride`) cannot address them. These clones replace the flat
+# addressing with the two-level form; everything else (the nope/rope split,
+# the row-spanning BLOCK) is identical to the dense kernels.
+#
+# DCP is rejected under --enable-unified-memory at argument parsing, so the
+# page-major variants deliberately omit the DCP rank filtering.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def set_mla_kv_buffer_page_major_kernel(
+    kv_view_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    stride_page,
+    stride_tok,
+    nope_stride,
+    rope_stride,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    base = pid_blk * BLOCK
+    offs = base + tl.arange(0, BLOCK)
+    total_dim = nope_dim + rope_dim
+    mask = offs < total_dim
+
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    page_id = loc // PAGE_SIZE
+    tok_in_page = loc % PAGE_SIZE
+    dst_ptr = kv_view_ptr + page_id * stride_page + tok_in_page * stride_tok + offs
+
+    if base + BLOCK <= nope_dim:
+        src = tl.load(cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask)
+    elif base >= nope_dim:
+        offs_rope = offs - nope_dim
+        src = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + offs_rope, mask=mask
+        )
+    else:
+        is_nope = offs < nope_dim
+        is_rope = (offs >= nope_dim) & (offs < total_dim)
+        src_nope = tl.load(
+            cache_k_nope_ptr + pid_loc * nope_stride + offs,
+            mask=mask & is_nope,
+            other=0,
+        )
+        src_rope = tl.load(
+            cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
+            mask=mask & is_rope,
+            other=0,
+        )
+        src = tl.where(is_nope, src_nope, src_rope)
+
+    tl.store(dst_ptr, src, mask=mask)
+
+
+def set_mla_kv_buffer_page_major(
+    kv_view: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    page_size: int,
+):
+    """Scatter (nope|rope) rows into a 4-D page-major MLA view at PHYSICAL
+    token ids. `loc` must be contiguous (raw-pointer read); the view's trailing
+    dim must be contiguous."""
+    assert kv_view.dim() == 4 and kv_view.stride(3) == 1
+    assert loc.is_contiguous()
+    from sglang.srt.layers.utils.dcp_utils import dcp_enabled
+
+    assert not dcp_enabled(), "page-major MLA write: DCP unsupported under unified"
+    nope_dim = cache_k_nope.shape[-1]
+    rope_dim = cache_k_rope.shape[-1]
+    BLOCK = triton.next_power_of_2(nope_dim + rope_dim)
+    grid = (loc.numel(), 1)
+    set_mla_kv_buffer_page_major_kernel[grid](
+        kv_view,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_view.stride(0),
+        kv_view.stride(1),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        nope_dim,
+        rope_dim,
+        PAGE_SIZE=page_size,
+        BLOCK=BLOCK,
+    )
+
+
+@triton.jit
+def get_mla_kv_buffer_page_major_kernel(
+    kv_view_ptr,
+    cache_k_nope_ptr,
+    cache_k_rope_ptr,
+    loc_ptr,
+    stride_page,
+    stride_tok,
+    nope_stride,
+    rope_stride,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    pid_loc = tl.program_id(0)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
+    page_id = loc // PAGE_SIZE
+    tok_in_page = loc % PAGE_SIZE
+    loc_src_ptr = kv_view_ptr + page_id * stride_page + tok_in_page * stride_tok
+
+    nope_offs = tl.arange(0, nope_dim)
+    nope_src = tl.load(loc_src_ptr + nope_offs)
+    tl.store(cache_k_nope_ptr + pid_loc * nope_stride + nope_offs, nope_src)
+
+    rope_offs = tl.arange(0, rope_dim)
+    rope_src = tl.load(loc_src_ptr + nope_dim + rope_offs)
+    tl.store(cache_k_rope_ptr + pid_loc * rope_stride + rope_offs, rope_src)
+
+
+def get_mla_kv_buffer_page_major(
+    kv_view: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    page_size: int,
+):
+    """Gather (nope|rope) rows from a 4-D page-major MLA view at PHYSICAL
+    token ids — the read twin of `set_mla_kv_buffer_page_major`."""
+    assert kv_view.dim() == 4 and kv_view.stride(3) == 1
+    assert loc.is_contiguous()
+    get_mla_kv_buffer_page_major_kernel[(loc.numel(),)](
+        kv_view,
+        cache_k_nope,
+        cache_k_rope,
+        loc,
+        kv_view.stride(0),
+        kv_view.stride(1),
+        cache_k_nope.stride(0),
+        cache_k_rope.stride(0),
+        cache_k_nope.shape[-1],
+        cache_k_rope.shape[-1],
+        PAGE_SIZE=page_size,
+    )

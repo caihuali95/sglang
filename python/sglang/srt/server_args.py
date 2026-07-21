@@ -6357,6 +6357,17 @@ class ServerArgs:
         # single page-major path + stride-aware Triton asserts (set before the guard).
         if self.enable_unified_memory:
             self.enable_page_major_kv_layout = True
+            # Triton is the only legal attention backend under the unified
+            # pool (asserted below), but an UNSET backend would otherwise
+            # resolve per-platform later (e.g. fa3 for MLA on Hopper) and fail
+            # far from the cause — default it here instead of erroring.
+            if self.attention_backend is None:
+                logger.info(
+                    "--enable-unified-memory: defaulting --attention-backend "
+                    "to 'triton' (the only supported backend for the "
+                    "strided page-major KV layout)."
+                )
+                self.attention_backend = "triton"
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V

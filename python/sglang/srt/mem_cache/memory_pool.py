@@ -1144,20 +1144,23 @@ class KVWriteLoc:
 
     All location info lives here (in the attention metadata), NOT in the pool:
     - ``loc``: the generic per-token write location (the allocated
-      ``out_cache_loc``). VIRTUAL under the unified memory pool (it indexes the
-      virtual slot space); already physical for a non-unified memory pool.
-    - ``swa_loc``: the pre-translated SWA-sub-pool PHYSICAL location for hybrid
-      SWA pools (``None`` otherwise).
-    - ``full_loc``: the pre-translated full-attention-sub-pool PHYSICAL location
-      for the unified memory pool (``None`` otherwise), computed once per forward in
-      attention metadata (``ForwardMetadata.out_cache_loc_full_physical``). The
-      shared full pool writes it directly; the pool never translates (replacing
-      the former per-layer v2p gather / ``set_full_loc`` pin).
+      ``out_cache_loc``). PHYSICAL in every configuration: static pools are
+      physically indexed by construction, and under the unified memory pool
+      ``forward_batch.out_cache_loc`` is rebound to physical once at
+      ForwardBatch construction (``apply_unified_kv_loc_rebind``).
+    - ``swa_loc``: the SWA-sub-pool PHYSICAL location for hybrid SWA pools
+      (``None`` otherwise) — mapped from the full-side loc (non-unified) or
+      carried from the ForwardBatch swa rail (unified).
+    - ``full_loc``: the full-attention-sub-pool PHYSICAL location for the
+      unified memory pool (``None`` otherwise), carried once per forward in
+      attention metadata (``ForwardMetadata.out_cache_loc_full_physical``);
+      same id space as ``loc`` under the rebind contract. The shared full pool
+      writes it directly; the pool never translates.
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
     PHYSICAL loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
-    ``loc`` is the generic, possibly-virtual fallback. Bundling them lets a
-    backend issue one ``set_kv_buffer`` call regardless of pool type.
+    ``loc`` is the generic fallback. Bundling them lets a backend issue one
+    ``set_kv_buffer`` call regardless of pool type.
     """
 
     loc: torch.Tensor
@@ -2385,6 +2388,12 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
+        # NOTE: the model-side MLA entry points (`set_mla_kv_buffer` /
+        # `get_mla_kv_buffer`) receive PHYSICAL slot ids in every
+        # configuration: static pools are physically indexed by construction,
+        # and under the unified pool `forward_batch.out_cache_loc` is rebound
+        # to physical once at ForwardBatch construction
+        # (`apply_unified_kv_loc_rebind`) — the doors never translate.
         self.use_mla = use_mla
         if full_kv_pool is not None:
             # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
@@ -2542,10 +2551,16 @@ class HybridLinearKVPool(KVCache):
                 dcp_kv_mask=dcp_kv_mask,
             )
         else:
+            # Same physical-loc selection as the MHA branch above: `full_loc`
+            # is the unified pool's pre-translated PHYSICAL loc (None for a
+            # static pool, where `loc` is already physical). Dropping it here
+            # would hand VIRTUAL slot ids to the pool as if physical — silent
+            # wrong-slot KV the moment an MLA-hybrid runs unified.
+            write_loc = full_loc if full_loc is not None else loc
             with self._transfer_id_context(layer):
                 self.full_kv_pool.set_kv_buffer(
                     layer,
-                    loc,
+                    write_loc,
                     cache_k,
                     cache_v,
                 )
@@ -2582,6 +2597,8 @@ class HybridLinearKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
+        # Model-side entry point (zero-prefix MHA-mode extends): `loc` is
+        # PHYSICAL in every configuration (see the class-level NOTE).
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
@@ -2592,6 +2609,7 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
+        # Model-side entry point — same physical-id contract as set_mla_kv_buffer.
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
 
