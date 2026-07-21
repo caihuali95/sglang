@@ -166,9 +166,9 @@ class MHARegionGeometry(msgspec.Struct, frozen=True, kw_only=True):
 class SubPoolSpec(ABC):
     """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`.
 
-    `@dataclass` rather than `msgspec.Struct` (`.claude/rules/no-dataclasses.md`)
-    because `msgspec.Struct` cannot share a metaclass with `ABC`, and the
-    abstract `entry_bytes`/`get_dtype` contract below is what lets
+    `@dataclass` rather than `msgspec.Struct` because `msgspec.Struct`
+    cannot share a metaclass with `ABC`, and the abstract 
+    `entry_bytes`/`get_dtype` contract below is what lets
     `UnifiedKVPool` treat every sub-pool spec uniformly. These specs are
     in-process only — they never cross an IPC boundary — so msgspec's
     decode-time validation and codec speed would go unused anyway.

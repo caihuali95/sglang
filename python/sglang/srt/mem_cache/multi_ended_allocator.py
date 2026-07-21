@@ -45,14 +45,14 @@ from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 logger = logging.getLogger(__name__)
 
 
-# Extra spec-state band slots reserved beyond the per-verify-row need (`bs`). The
-# band's per-slot stride (num_draft_tokens x mamba state, ~0.5 GB) forces band-
-# page-aligned placement: `SpecStateBandAllocator._region_bounds_pages` ceils the
-# low frontier and floors the high frontier, losing up to 2 band slots of the byte
-# gap. The reserve is enforced where it actually bounds the RUNTIME gap — the
-# admission/decode budgets (schedule_policy / check_decode_capacity) — since a
-# capacity-side margin provably cannot widen the runtime gap (a capacity
-# shift leaves the runtime gap byte-identical).
+# Extra spec-state band slots reserved beyond the per-verify-row need. The
+# band's per-slot stride (num_draft_tokens x mamba state) forces band-page-
+# aligned placement: `SpecStateBandAllocator._region_bounds_pages` ceils the
+# low frontier and floors the high frontier, losing up to 2 band slots of the
+# byte gap. The reserve is enforced where it actually bounds the RUNTIME gap
+# — the admission/decode budgets (schedule_policy / check_decode_capacity) —
+# since a capacity-side margin provably cannot widen the runtime gap (a
+# capacity shift leaves the runtime gap byte-identical).
 SPEC_BAND_ALIGNMENT_MARGIN_SLOTS = 3
 
 
@@ -67,9 +67,8 @@ def _verify_two_end_byte_accounting(
     AFTER `on_idle_proceed()`.
 
     These invariants add the buffer-level STRUCTURE the token-identity leak
-    check is blind to (its dynamic self-canceling totals eliminate the
-    free-space term). They are chosen to be ROBUSTLY idle-true — they never
-    false-positive on a healthy pool — because the checker raises under
+    check is blind to. They are chosen to be ROBUSTLY idle-true, never
+    false-positive on a healthy pool. The checker raises under
     `SGLANG_ENABLE_STRICT_UNIFIED_BYTE_CHECK`:
 
     - (A) is a BOUND `0 <= live <= span`, NOT the exact page equation

@@ -788,8 +788,7 @@ class ServerArgs:
         "Replace the statically-partitioned hybrid-model pools (full-attn KV + "
         "SWA/Mamba state) with one byte buffer split dynamically between "
         "sub-pools. Requires the Triton attention / linear-attn / Mamba "
-        "backends; not yet compatible with PD disaggregation or speculative "
-        "decoding.",
+        "backends; not yet compatible with PD disaggregation.",
     ] = False
     disable_chunked_prefix_cache: A[
         bool,

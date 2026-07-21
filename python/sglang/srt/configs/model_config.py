@@ -942,11 +942,10 @@ class ModelConfig:
             # That silent None is dangerous rather than merely lossy: every
             # consumer of this field falls back to `num_hidden_layers`, i.e. it
             # sizes a 1-layer MTP draft's KV at the FULL target's depth. The KV
-            # bytes charged per token then jump by (1 + target_layers) / 2 --
-            # for a 32-layer target that is a ~5x per-token cell inflation,
-            # which halves the admitted batch under the unified pool's fused
-            # draft KV and oversizes a baseline draft pool by 32x. Fall back to
-            # `hf_config` so the value surfaces for nested configs too.
+            # bytes charged per token then jump, which halves the admitted batch
+            # under the unified pool's fused draft KV and oversizes a baseline
+            # draft pool. Fall back to `hf_config` so the value surfaces for
+            # nested configs too.
             self.num_nextn_predict_layers = getattr(
                 self.hf_config, "num_nextn_predict_layers", None
             )

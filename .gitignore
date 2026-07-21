@@ -283,6 +283,3 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
-
-# Packaging artifact (was accidentally committed; purged from history)
-scripts.zip
