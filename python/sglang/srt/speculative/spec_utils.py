@@ -553,9 +553,18 @@ def move_accept_tokens_to_target_kvcache(
         accept_out_cache_loc,
         next_power_of_2(size),
     )
-    token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
-        tgt_cache_loc, accept_out_cache_loc
-    )
+    # Unified pools: tgt/src are VIRTUAL token ids and the pure-store pool's
+    # move_kv_cache is physical-only, so route through the composite's
+    # move_accept_kv (translates per sub-pool: full, and the SWA window with
+    # the tombstone->sink clamp). getattr probe: only unified composites
+    # define it; every other allocator keeps the direct physical move.
+    move_accept_kv = getattr(token_to_kv_pool_allocator, "move_accept_kv", None)
+    if move_accept_kv is not None:
+        move_accept_kv(tgt_cache_loc, accept_out_cache_loc)
+    else:
+        token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+            tgt_cache_loc, accept_out_cache_loc
+        )
 
 
 def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:

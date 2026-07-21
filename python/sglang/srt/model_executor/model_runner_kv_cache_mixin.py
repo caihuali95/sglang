@@ -70,6 +70,15 @@ def _should_enable_lazy_compaction() -> bool:
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
+def _should_enable_fused_draft_kv() -> bool:
+    """Fused draft KV default — ON
+    unless `SGLANG_DISABLE_FUSED_DRAFT_KV=1` (escape hatch for A/B /
+    rollback to the private-pool + reserve path). The ONLY env read site —
+    everything downstream keys on `draft_kv_geometry is not None`.
+    """
+    return not envs.SGLANG_DISABLE_FUSED_DRAFT_KV.get()
+
+
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
@@ -479,6 +488,11 @@ class ModelRunnerKVCacheMixin:
             qk_rope_head_dim=(
                 self.model_config.qk_rope_head_dim if self.use_mla_backend else None
             ),
+            # Fused draft KV: attach the draft region to the full sub-pool so
+            # draft KV rides inside the fused slot entries.
+            draft_kv_geometry=(
+                self.draft_kv_geometry if _should_enable_fused_draft_kv() else None
+            ),
         )
         self.req_to_token_pool = bundle.req_to_token_pool
         self.token_to_kv_pool = bundle.token_to_kv_pool
@@ -563,15 +577,138 @@ class ModelRunnerKVCacheMixin:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            # Fused draft KV: the dense draft fuses into the FULL
+            # sub-pool (a DSV4-style draft would attach to "swa" instead;
+            # non-None <=> fusion enabled, gated in maybe_init_draft_kv_geometry).
+            draft_kv_geometry=self.draft_kv_geometry,
         )
         self.token_to_kv_pool = bundle.token_to_kv_pool
         self.token_to_kv_pool_allocator = bundle.token_to_kv_pool_allocator
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = bundle.unified_memory_pool
 
+    def _init_unified_draft_pool(self: ModelRunner) -> bool:
+        """DRAFT worker under a fused-draft-KV target: bind
+        `token_to_kv_pool` to the DRAFT-region views of the target's unified
+        full sub-pool instead of allocating a private, virtual-index-sized
+        pool. Returns True when the fused binding was made; the caller must
+        then skip all pool construction (the shared allocator/req_to_token
+        came in through the spec-worker handoff).
+        """
+        if not self.is_draft_worker:
+            return False
+        unified_buffer = getattr(
+            self.token_to_kv_pool_allocator, "unified_buffer", None
+        )
+        if unified_buffer is None or not unified_buffer.has_draft_region("full"):
+            return False
+
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
+
+        # The target built the region from resolve_draft_kv_geometry; validate
+        # this runner's actual geometry against it (a mismatch would silently
+        # corrupt neighboring slots).
+        region = unified_buffer.mha_spec("full").draft_region
+        head_num = self.model_config.get_num_kv_heads(get_attention_tp_size())
+        head_dim = self.model_config.head_dim
+        v_head_dim = self.model_config.v_head_dim or head_dim
+        for name, got, expected in (
+            ("head_num", head_num, region.head_num),
+            ("head_dim", head_dim, region.head_dim),
+            ("v_head_dim", v_head_dim, region.v_head_dim),
+        ):
+            assert got == expected, (
+                f"fused draft region {name} mismatch: draft runner has {got}, "
+                f"target reserved {expected} (resolve_draft_kv_geometry drift?)"
+            )
+        from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
+
+        assert _store_dtype_for(self.kv_cache_dtype) == region.store_dtype, (
+            f"fused draft region store_dtype mismatch: draft runner stores "
+            f"{_store_dtype_for(self.kv_cache_dtype)}, target reserved "
+            f"{region.store_dtype} (4.1 requires draft dtype == target dtype)"
+        )
+        layer_offset = (self.draft_model_idx or 0) * self.num_effective_layers
+        assert layer_offset + self.num_effective_layers <= region.layer_num, (
+            f"draft layers [{layer_offset}, "
+            f"{layer_offset + self.num_effective_layers}) exceed the fused "
+            f"region's {region.layer_num} layers"
+        )
+
+        draft_pool = UnifiedDraftKVPool(
+            unified_buffer=unified_buffer,
+            sub_pool_name="full",
+            page_size=self.page_size,
+            layer_offset=layer_offset,
+            layer_num=self.num_effective_layers,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+        )
+        if self.mambaish_config is not None:
+            # MTP self-draft on hybrid Mamba: keep the HybridLinearKVPool
+            # shell (mamba states stay in the shared mamba pool, translated).
+            self.token_to_kv_pool = HybridLinearKVPool(
+                page_size=self.page_size,
+                size=self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=head_num,
+                head_dim=head_dim,
+                full_attention_layer_ids=[0],
+                device=self.device,
+                mamba_pool=self.req_to_token_pool.mamba_pool,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                use_mla=self.use_mla_backend,
+                start_layer=self.start_layer,
+                full_kv_pool=draft_pool,
+            )
+        else:
+            self.token_to_kv_pool = draft_pool
+        logger.info(
+            "[unified-memory-pool] draft worker: fused draft KV bound to the "
+            "target's 'full' sub-pool (layers [%d, %d) of the %d-layer draft "
+            "region); no private draft pool allocated.",
+            layer_offset,
+            layer_offset + self.num_effective_layers,
+            region.layer_num,
+        )
+        return True
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+
+        # Fused draft KV : when the target's unified full sub-pool
+        # carries a draft region, the draft worker binds views instead of
+        # allocating a private pool — the vcap bump and every construction
+        # path below are then irrelevant.
+        if self._init_unified_draft_pool():
+            return
+
+        # DRAFT worker under a unified-pool TARGET: the shared allocator mints
+        # VIRTUAL token ids in [0, max_slots) — larger than
+        # max_total_num_tokens because the byte budget also covers the
+        # mamba/spec bands. The draft's PRIVATE KV pool is virtual-indexed
+        # (its attention backends skip the v2p translate; see
+        # TritonAttnBackend), so it must span the whole virtual-id space.
+        if self.is_draft_worker and self.token_to_kv_pool_allocator is not None:
+            full_mea = getattr(
+                self.token_to_kv_pool_allocator, "full_attn_allocator", None
+            )
+            if full_mea is not None:
+                virtual_capacity = full_mea.num_pages * full_mea.page_size
+                if virtual_capacity > self.max_total_num_tokens:
+                    logger.info(
+                        "[unified-memory-pool] draft worker: sizing the private "
+                        "KV pool to the shared virtual-id capacity %d "
+                        "(was max_total_num_tokens=%d; overshoot %.1f%% on the "
+                        "draft's few layers).",
+                        virtual_capacity,
+                        self.max_total_num_tokens,
+                        100.0
+                        * (virtual_capacity - self.max_total_num_tokens)
+                        / max(1, self.max_total_num_tokens),
+                    )
+                    self.max_total_num_tokens = virtual_capacity
 
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
@@ -587,18 +724,38 @@ class ModelRunnerKVCacheMixin:
             if self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 self._init_unified_swa_pools(max_num_reqs)
                 return
-            # Fail loud, not silently fall through to the normal pools (which would
-            # leave the flag a no-op). The feature replaces the HYBRID pools only.
-            raise ValueError(
-                "--enable-unified-memory requires a hybrid model "
-                "(full-attention + Mamba-family state — MHA- or MLA-full — "
-                "or full + sliding-window KV); the current model "
-                f"({self.model_config.hf_config.architectures}) is not one "
-                "(dense, non-hybrid MLA, and DeepSeek-V4 models are "
-                "unsupported, and --disable-hybrid-swa-memory disables the "
-                "SWA pairing). Drop --enable-unified-memory for this model — "
-                "plain --enable-page-major-kv-layout still works."
+            if (
+                self.use_mla_backend
+                or is_deepseek_v4(self.model_config.hf_config)
+            ):
+                # NON-HYBRID MLA / DSV4: their pool stacks (dense latent
+                # KV, compress-state rings) have no unified layout — fail
+                # loud, not silently fall through. (MLA-HYBRID models — MLA
+                # full side + Mamba-family state, e.g. Kimi Linear — are
+                # handled by the mambaish branch above.)
+                raise ValueError(
+                    "--enable-unified-memory does not support non-hybrid "
+                    "MLA-family or DeepSeek-V4 models; the current model "
+                    f"({self.model_config.hf_config.architectures}) is one. "
+                    "Drop --enable-unified-memory for this model."
+                )
+            # NON-HYBRID dense model: a single KV pool has nothing to share, so
+            # the unified machinery (virtual-id translation) would be pure
+            # overhead. Gracefully fall back to the standard pools/allocators —
+            # keeping the page-major envelope KV layout, which works for a
+            # single pool with identity addressing
+            # (enable_page_major_kv_layout stays True; the standard path picks
+            # PageMajorMHATokenToKVPool). Flip the flag so the scheduler's
+            # unified-only allocator hooks (flush_opportunistic /
+            # set_inflight_forward) see the real mode.
+            logger.warning(
+                "[unified-memory-pool] %s is not a hybrid model; falling back "
+                "to standard pools/allocators with the page-major envelope KV "
+                "layout (no virtual-id translation). Speculative decoding uses "
+                "the standard path.",
+                self.model_config.hf_config.architectures,
             )
+            self.server_args.enable_unified_memory = False
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -1264,6 +1421,16 @@ class ModelRunnerKVCacheMixin:
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
                 "and --kv-cache-dtype != fp4_e2m1."
             )
+
+        # Invariant D8 (NON-fused draft only; the fused path returned above):
+        # a draft worker reaching here built a PRIVATE pool indexed by VIRTUAL
+        # token ids — declare the capability so attention backends skip the
+        # v2p translate (see TritonAttnBackend). Capability lives on the POOL,
+        # not the worker role; harmless no-op for non-unified allocators
+        # (their probe finds no translate_kv_loc either way). Retires together
+        # with the reserve path once fused draft KV is the only mode.
+        if self.is_draft_worker:
+            self.token_to_kv_pool.kv_ids_are_virtual = True
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.

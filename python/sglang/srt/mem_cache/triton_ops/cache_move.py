@@ -128,6 +128,14 @@ def store_cache_4d_kernel(
         k_view[page_id, tok_in_p, :, :] = cache_k[i, :, :]
         v_view[page_id, tok_in_p, :, :] = cache_v[i, :, :]
 
+    CALLER CONTRACT: `loc` and the trailing dims of the K/V rows must be
+    CONTIGUOUS. This kernel reads them with raw pointer arithmetic (`loc_ptr + i`;
+    the head dims flattened into one linear ROW_DIM), so it walks flat memory and
+    a non-compact layout is read with the wrong element spacing -- it silently
+    writes the wrong bytes to the wrong slots instead of failing. See
+    `store_cache_4d` for the full warning; a strided `loc` has caused exactly this
+    in production.
+
     Cuda-graph safe: no Python branching on tensor values, no `.item()`,
     all shapes/strides known at launch time.
     """
@@ -182,15 +190,42 @@ def store_cache_4d(
     ``k_view[loc[i]//ps, loc[i]%ps, :, :]`` (and analogously for V) for
     ``i in [0, N)``.
 
+    !!! STRIDES ARE NOT HONOURED -- READ THIS BEFORE CALLING !!!
+
+    The kernel addresses ``loc`` and each KV row with RAW POINTER ARITHMETIC
+    (``tl.load(loc_ptr + i)``; ``(head_num, head_dim)`` flattened into one linear
+    ROW_DIM). It walks FLAT memory. The only stride it is ever told about is
+    ``stride(0)`` of each tensor -- every other stride is assumed to be the
+    compact one.
+
+    Hand it a non-contiguous tensor and it does NOT fail: it reads the wrong
+    elements and writes plausible-looking KV to the wrong slots. Nothing crashes,
+    no index goes out of range, and every torch-side check passes -- because torch
+    honours the very stride the kernel ignores. The only visible symptom is
+    degraded model quality (a speculative draft reading another request's KV shows
+    up purely as a lower accept length).
+
+    A strided ``loc`` HAS reached this kernel in production: a per-step draft slot
+    table built with ``permute(...).reshape(...)`` returns a VIEW whose rows have
+    element stride ``num_steps``, which made the kernel consume a step-interleaved
+    window and scatter draft KV across the wrong requests. Normalize at the source
+    (``per_step_draft_out_cache_loc``) AND here -- this wrapper copies a
+    non-contiguous ``loc`` defensively, and callers that bypass the wrapper (the
+    unified pool calls the kernel directly, since the wrapper cannot merge its
+    4-D layer-major view at ``page_size > 1``) must do the same.
+
+    If you add a new caller: any tensor you pass whose layout is not compact must
+    be materialized first, or the kernel must be taught to take its strides.
+
     Contract:
         - ``k_view``, ``v_view``: 4-D ``(num_pages, page_size, head_num,
           head_dim*)``, contiguous in the trailing ``(head_num, head_dim)``
           dims (i.e., ``stride[-1] == 1`` and ``stride[-2] == head_dim``).
         - ``cache_k``, ``cache_v``: 3-D ``(N, head_num, head_dim*)``,
           contiguous in the trailing ``(head_num, head_dim)`` dims.
-        - ``loc``: 1-D int64 or int32, N elements, values in
+        - ``loc``: 1-D int64 or int32, N elements, CONTIGUOUS, values in
           ``[0, num_pages * page_size)``. The caller is responsible for
-          clamping any negative entries to ≥ 0.
+          clamping any negative entries to >= 0.
         - At ``page_size == 1`` the kernel produces byte-identical output
           to the legacy advanced-indexing path.
 
@@ -237,6 +272,14 @@ def store_cache_4d(
         f"store_cache_4d: cache_v trailing dims must be contiguous; "
         f"got stride={cache_v.stride()}, shape={tuple(cache_v.shape)}"
     )
+    # `loc` is read with raw pointer arithmetic (`tl.load(loc_ptr + i)`), so its
+    # stride is IGNORED by the kernel: a strided loc (e.g. a row of a
+    # permuted-then-reshaped per-step buffer, stride == num_steps) makes the
+    # kernel consume an interleaving of other rows' locs -- silent wrong-slot
+    # writes that every torch-side (stride-aware) check waves through. Normalize
+    # rather than assert: a contiguous copy of a loc row is cheap and always safe.
+    if not loc.is_contiguous():
+        loc = loc.contiguous()
 
     head_num = k_view.shape[2]
     head_dim = k_view.shape[3]

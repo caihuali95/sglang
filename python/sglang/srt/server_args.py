@@ -6320,10 +6320,46 @@ class ServerArgs:
         assert self.disaggregation_mode == "null", (
             "--enable-unified-memory is not yet compatible with PD " "disaggregation."
         )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        # Speculative decoding: positive allow-list. EAGLE / EAGLE3 (incl.
+        # GDN/Qwen3-Next MTP, which runs under EAGLE), NGRAM (target-only),
+        # and DFLASH share the validated prepare/commit choke points for the
+        # spec-decode intermediate states; EAGLE/EAGLE3 and DFLASH drafts fuse
+        # their KV into the full sub-pool's slot entries by default
+        # (SGLANG_DISABLE_FUSED_DRAFT_KV=1 falls back to the private
+        # virtual-index-sized draft pool); NGRAM has no draft KV to fuse.
+        # Everything else stays a loud error:
+        # - FROZEN_KV_MTP hides inside is_eagle() — excluded by identity: its
+        #   draft aliases the TARGET pool, which the fused draft-KV layout
+        #   has not been validated against.
+        # - STANDALONE runs a full-model draft; its pool sizing/translation
+        #   story is unvalidated (and its many-layer draft would inflate the
+        #   fused entry prohibitively).
+        if self.speculative_algorithm is not None:
+            _allowed_spec_algos = ("EAGLE", "EAGLE3", "NGRAM", "DFLASH")
+            if self.speculative_algorithm.upper() not in _allowed_spec_algos:
+                raise ValueError(
+                    "--enable-unified-memory supports speculative decoding "
+                    f"only for {_allowed_spec_algos}; got "
+                    f"{self.speculative_algorithm!r}. Drop one of the two flags."
+                )
+        # Tree drafting (topk > 1) at page_size > 1 runs the two-pass page-tree
+        # cascade, whose draft-decode expand pass duplicates each branch's
+        # prefix-tail page into its first-page holes via a draft-side
+        # move_kv_cache (duplicate_prefix_tail_to_draft_branches). Under the
+        # fused draft-KV layout the draft pool is a strided view whose slots
+        # are relocated only by the host pool's whole-envelope move, so
+        # UnifiedDraftKVPool.move_kv_cache is intentionally unimplemented — the
+        # cascade would fault mid-run. Reject at config time until the
+        # draft-region move lands. Chain drafting (topk == 1) and tree drafting
+        # at page_size == 1 (no partial-tail page to duplicate) are unaffected.
+        if (self.speculative_eagle_topk or 0) > 1 and self.page_size > 1:
+            raise ValueError(
+                "--enable-unified-memory does not yet support tree speculative "
+                "decoding (--speculative-eagle-topk > 1) with --page-size > 1; "
+                f"got speculative_eagle_topk={self.speculative_eagle_topk}, "
+                f"page_size={self.page_size}. Use --speculative-eagle-topk 1 "
+                "(chain drafting) or --page-size 1."
+            )
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
@@ -6372,10 +6408,16 @@ class ServerArgs:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
         # views; FA3 / FlashInfer do not.
+        # The draft backend must be listed too. It is not a fallback of
+        # `attention_backend` -- the draft factory picks it FIRST when set -- so a
+        # non-Triton draft backend would otherwise slip past this guard, write its
+        # KV without the virtual->physical translate, and silently corrupt the
+        # draft cache (no crash; it surfaces only as a degraded accept length).
         backends = {
             self.attention_backend,
             self.prefill_attention_backend,
             self.decode_attention_backend,
+            self.speculative_draft_attention_backend,
         }
         backends.discard(None)
         assert backends <= {"triton"}, (

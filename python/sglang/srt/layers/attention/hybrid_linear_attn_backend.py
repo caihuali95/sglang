@@ -53,6 +53,39 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
+    def _check_spec_target_verify_support(self, model_runner: ModelRunner) -> None:
+        """Boot-time capability gate for speculative decoding on
+        kernel-dispatcher linear backends (GDN, KDA).
+
+        Target-verify on a linear-attention family needs a dedicated verify
+        path: multi-token state recurrence with per-step intermediate capture
+        and NO in-place advance of the persistent state. A family whose kernel
+        dispatcher lacks ``target_verify`` would instead route TARGET_VERIFY
+        batches into its chunk-prefill kernels, which commit state assuming
+        every draft token is accepted — and the family-blind post-verify
+        commit then scatters never-written intermediate buffers over the
+        states. That is SILENT corruption, not a crash, so refuse at boot.
+
+        The probe is the dispatcher METHOD (duck-typed, like the commit
+        dispatch itself), not a capability attribute: the family's dispatcher
+        advertising ``target_verify`` is exactly the contract the verify
+        forward relies on. Subclasses using a different verify architecture
+        (Mamba2Metadata) do not call this.
+        """
+        if model_runner.server_args.speculative_algorithm is None:
+            return
+        if self.is_draft_worker:
+            return
+        dispatcher = getattr(self, "kernel_dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "target_verify"):
+            raise ValueError(
+                "Speculative decoding requires a target-verify kernel for the "
+                f"linear-attention family, but {type(dispatcher).__name__} "
+                "does not implement one. Without it, verify batches would "
+                "silently corrupt the recurrent state. Disable speculative "
+                "decoding for this model family."
+            )
+
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
         if (
@@ -118,9 +151,28 @@ class MambaAttnBackendBase(AttentionBackend):
         # gather reads only real ids; padded rows are then poisoned to -1 (skipped).
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         if forward_batch.mamba_track_indices is not None:
+            # This one is written BACK onto the ForwardBatch, because the track
+            # helpers below read it from there rather than taking it as an
+            # argument. That makes it the only translate here that is not
+            # idempotent: translating twice gives v2p[v2p[v]], which is a valid
+            # index into a wrong slot -- no crash, just wrong state.
+            #
+            # Nothing builds metadata twice for one ForwardBatch today, so this is
+            # a latent hazard, not a live bug. Fail loudly if that ever changes
+            # (a retry, a second backend in the decode group, a piecewise
+            # re-build) instead of silently corrupting the mamba state.
+            if getattr(forward_batch, "_mamba_track_indices_translated", False):
+                raise RuntimeError(
+                    "mamba_track_indices was already translated for this "
+                    "ForwardBatch; a second translate would map v2p[v2p[v]] and "
+                    "silently write the mamba state to the wrong slots. Hold the "
+                    "physical ids in a backend-owned buffer instead of writing "
+                    "them back onto the ForwardBatch."
+                )
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
             )
+            forward_batch._mamba_track_indices_translated = True
         _real_bs = forward_batch._original_batch_size
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
@@ -204,7 +256,19 @@ class MambaAttnBackendBase(AttentionBackend):
                     )
                     # None during dummy run
                     if retrieve_next_token is not None:
-                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                        # -1, NOT empty: the tree builder leaves a token's parent
+                        # entry UNSET when it finds no parent for it (it warns
+                        # "invalid eagle tree ... the token will be ignored" and
+                        # skips). Uninitialized garbage there is not merely a wrong
+                        # state read -- the GDN verify kernels multiply this value
+                        # by the intermediate-state step stride (~1e7 elements) to
+                        # form a pointer, so a junk entry is an illegal access. -1
+                        # is the sentinel those kernels skip on. (The cuda-graph
+                        # path allocates these zeroed, which is why only the eager
+                        # path ever faulted.)
+                        retrieve_parent_token = torch.full_like(
+                            retrieve_next_token, -1
+                        )
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device

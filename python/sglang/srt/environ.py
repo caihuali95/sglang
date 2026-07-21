@@ -300,6 +300,14 @@ class Envs:
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
     # Sort the multi-ended allocator's free list after a merge (perf A/B knob).
     SGLANG_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
+    # Escape hatch: disable fused draft KV (the draft model's KV rides
+    # inside the unified full-KV slot entry [target KV | draft KV]) and
+    # fall back to the virtual-index-sized private draft pool.
+    # Default False (fusion on for
+    # the supported matrix: unified memory x EAGLE/EAGLE3/DFLASH incl.
+    # multi-layer EAGLE and DFLASH draft-window). Used for A/B and rollback;
+    # retires with the reserve path once fusion is the only mode.
+    SGLANG_DISABLE_FUSED_DRAFT_KV = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)

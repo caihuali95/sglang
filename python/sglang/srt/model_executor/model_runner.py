@@ -435,6 +435,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        # Fused-draft-KV region geometry; resolved by
+        # maybe_init_draft_kv_geometry() during initialize().
+        self.draft_kv_geometry = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker
@@ -805,6 +808,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
+
+        # Fused-draft-KV geometry (needs the resolved kv_cache_dtype; consumed
+        # by the unified pool factories in init_memory_pool).
+        self.maybe_init_draft_kv_geometry()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
         hf_config = self.model_config.hf_text_config
@@ -2403,6 +2410,91 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+            )
+
+    def maybe_init_draft_kv_geometry(self):
+        """Resolve and stash the draft model's fused-KV region geometry
+        (`self.draft_kv_geometry`).
+
+        Target worker + unified memory + a spec algorithm with draft KV only;
+        everything else leaves the `None` default. Must run after
+        `configure_kv_cache_dtype()` (the geometry stores the resolved dtype)
+        and before the memory pools are built (the unified factories attach
+        the geometry to the host sub-pool spec).
+        """
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            _should_enable_fused_draft_kv,
+        )
+
+        # Gate here so `draft_kv_geometry is not None` <=> fusion enabled —
+        # the single condition every consumer (factories, configurators,
+        # _init_unified_draft_pool via has_draft_region) keys on. Algorithm
+        # eligibility is the server_args unified spec allow-list (EAGLE /
+        # EAGLE3 / DFLASH carry draft KV; NGRAM has none).
+        if (
+            self.is_draft_worker
+            or not self.server_args.enable_unified_memory
+            or self.spec_algorithm.is_none()
+            or not self.spec_algorithm.has_draft_kv()
+        ):
+            return
+        if not _should_enable_fused_draft_kv():
+            logger.info(
+                "[unified-memory-pool] fused draft KV disabled "
+                "(SGLANG_DISABLE_FUSED_DRAFT_KV=1): falling back to the "
+                "virtual-index-sized private draft pool + admission reserve."
+            )
+            return
+
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+        from sglang.srt.speculative.draft_utils import resolve_draft_kv_geometry
+
+        # MTP self-draft: `speculative_draft_model_path` is None for targets
+        # outside the auto-path list (e.g. Qwen3.5 / Qwen3-Next), yet they DO
+        # carry an MTP head. Building the config from the TARGET path with
+        # `is_draft_model=True` is what makes it materialize —
+        # `ModelConfig._config_draft_model` swaps in the MTP arch and sets
+        # `num_nextn_predict_layers`. Reading the target config directly instead
+        # sees no MTP layers and silently skips fusion (the EAGLE
+        # cells fell back to the private pool while DFLASH fused correctly).
+        draft_path = self.server_args.speculative_draft_model_path
+        is_self_draft = draft_path is None
+        draft_model_config = self._build_model_config(
+            self.server_args,
+            model_path=draft_path or self.server_args.model_path,
+            model_revision=(
+                self.server_args.revision
+                if is_self_draft
+                else self.server_args.speculative_draft_model_revision
+            ),
+            is_draft_model=True,
+        )
+        self.draft_kv_geometry = resolve_draft_kv_geometry(
+            server_args=self.server_args,
+            spec_algorithm=self.spec_algorithm,
+            target_model_config=self.model_config,
+            draft_model_config=draft_model_config,
+            is_self_draft=is_self_draft,
+            kv_cache_dtype=self.kv_cache_dtype,
+            attn_tp_size=get_attention_tp_size(),
+        )
+        if self.draft_kv_geometry is None:
+            # We only get here when the gate above already established that
+            # unified memory is on and the algorithm CARRIES draft KV, so a
+            # geometry we cannot resolve is a config error, not a "no fusion"
+            # answer. Falling through would silently seat the run on the
+            # private-pool + reserve path, which sizes the draft pool over the
+            # whole virtual-id space and does not charge admission for it -- the
+            # run then boots, looks healthy, and quietly over-commits GPU memory.
+            # A config drift (e.g. num_nextn_predict_layers going missing from a
+            # nested config) must not be able to do that silently.
+            raise ValueError(
+                f"--enable-unified-memory with speculative algorithm "
+                f"{self.spec_algorithm} requires a resolvable draft KV geometry, "
+                "but none could be derived from the draft/target config (missing "
+                "layer count, head dim, or num_nextn_predict_layers). Fix the "
+                "config, or set SGLANG_DISABLE_FUSED_DRAFT_KV=1 to opt out "
+                "explicitly."
             )
 
     def init_cublas(self):

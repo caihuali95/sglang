@@ -98,6 +98,12 @@ def _selective_scan_update_kernel(
     pad_slot_id,
     intermediate_states_buffer,
     cache_steps,
+    # (slot, step) strides of intermediate_states_buffer, in elements. Dense
+    # layouts have slot == cache_steps*nheads*dim*dstate and step ==
+    # nheads*dim*dstate; the unified pool's envelope view is slot-strided, so
+    # the wrapper passes the real strides.
+    stride_inter_slot,
+    stride_inter_step,
     retrieve_parent_token_ptr,
     intermediate_state_indices_ptr,
     rand_seed_ptr,
@@ -233,11 +239,10 @@ def _selective_scan_update_kernel(
                 parent_step_idx = tl.load(parent_ptr).to(tl.int32)
 
                 if parent_step_idx >= 0 and parent_step_idx < T:
-                    step_offset = parent_step_idx * nheads * dim * dstate
                     cache_ptr = (
                         intermediate_states_buffer
-                        + cache_idx * cache_steps * nheads * dim * dstate
-                        + step_offset
+                        + cache_idx * stride_inter_slot
+                        + parent_step_idx * stride_inter_step
                         + pid_h * dim * dstate
                         + offs_m[:, None] * dstate
                         + offs_n[None, :]
@@ -289,8 +294,8 @@ def _selective_scan_update_kernel(
                 if state_batch_idx != pad_slot_id:
                     cache_ptr_base = (
                         intermediate_states_buffer
-                        + cache_idx * cache_steps * nheads * dim * dstate
-                        + current_step_idx * nheads * dim * dstate
+                        + cache_idx * stride_inter_slot
+                        + current_step_idx * stride_inter_step
                         + pid_h * dim * dstate
                     )
                     cache_ptrs = cache_ptr_base + (
@@ -513,6 +518,18 @@ def selective_state_update(
             pad_slot_id,
             intermediate_states_buffer,
             cache_steps if cache_steps is not None else 0,
+            # Real (slot, step) strides: identical to the old hardcoded dense
+            # math for contiguous buffers; required for unified envelope views.
+            (
+                intermediate_states_buffer.stride(0)
+                if intermediate_states_buffer is not None
+                else 0
+            ),
+            (
+                intermediate_states_buffer.stride(1)
+                if intermediate_states_buffer is not None
+                else 0
+            ),
             retrieve_parent_token,
             intermediate_state_indices,
             rand_seed,

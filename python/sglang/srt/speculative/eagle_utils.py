@@ -45,16 +45,36 @@ def per_step_draft_out_cache_loc(
     Single source of truth for the layout shared by EagleWorkerV2.draft_forward
     (per-step write target) and DeepseekV4AttnBackend (per-step compression
     write target baked into metadata).
+
+    Returns a CONTIGUOUS (num_steps, batch_size * topk) matrix. Row i holds the
+    slot ids step i writes to. Do not "optimize away" the copy -- see below.
     """
     expected = batch_size * topk * num_steps
     assert out_cache_loc.shape[0] == expected, (
         f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
         f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
     )
+    # The `.contiguous()` is LOAD-BEARING, and its absence is silent.
+    #
+    # The permute makes the layout merge-able, so `reshape` returns a strided
+    # VIEW, not a copy: each per-step row then has element stride num_steps.
+    # Torch honours that stride, so the values look right from Python -- but
+    # these rows are handed to Triton store kernels that read the slot ids with
+    # RAW POINTER ARITHMETIC (`tl.load(loc_ptr + i)`), walking flat memory with
+    # the stride ignored. Such a kernel reads the step-INTERLEAVED window instead
+    # of one step's ids: it writes row r's KV into row r//num_steps's slot and
+    # never writes (num_steps-1)/num_steps of the intended slots at all.
+    #
+    # The failure is invisible to every torch-side check (they all honour the
+    # stride the kernel ignores) and shows up only as a degraded accept length.
+    # Materializing here fixes all consumers at once. `draft_forward` already
+    # carried a `.contiguous()` special case for the Qwen3-MoE MTP fused-RoPE
+    # kernel -- the same hazard, patched for one arch.
     return (
         out_cache_loc.view(batch_size, topk, num_steps)
         .permute(2, 0, 1)
         .reshape(num_steps, -1)
+        .contiguous()
     )
 
 

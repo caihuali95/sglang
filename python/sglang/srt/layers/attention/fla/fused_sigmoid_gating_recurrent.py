@@ -23,7 +23,6 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Parameters for target_verify support (unused for decode)
     intermediate_states_buffer,
     intermediate_state_indices,
-    cache_steps,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
@@ -35,6 +34,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_k,
     stride_v,
     stride_b,
+    # Slot/step strides in ELEMENTS for the state pools. These were previously
+    # hard-coded to the contiguous values (`HV*K*V` / `cache_steps*HV*K*V`),
+    # which silently mis-addresses the page-major envelope's strided pool
+    # views (slot stride = entry_bytes // itemsize, layer-interleaved) — the
+    # GDN spec-verify state corruption (wrong-slot reads under strided pools).
+    # Inner (within-slot / within-step) layout stays contiguous either way.
+    stride_h0_slot,
+    stride_cache_slot,
+    stride_cache_step,
     NP2_T: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -94,11 +102,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        # int64: idx * slot-stride overflows int32 for envelope strides
+        # (entry_bytes // itemsize can be ~1e8) at modest slot indices.
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_slot
                 + i_hv * K * V
                 + o_v[None, :] * K
                 + o_k[:, None]
@@ -121,21 +131,28 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Prepare intermediate state cache index if enabled
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
     for _ in range(0, T):
         # Tree attention: load parent's cached state
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx == 0 uses b_h from USE_INITIAL_STATE
-            if step_idx != 0 and cache_idx >= 0:
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
-                step_offset = parent_step_idx * HV * K * V
+            parent_step_idx = tl.sum(
+                tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+            )
+            # A token the tree builder could not parent keeps the -1 sentinel (it
+            # warns and skips that token). Never let such a value reach the pointer
+            # arithmetic: it is scaled by stride_cache_step (~1e7 elements), so a
+            # junk index is an illegal access, not just a wrong state. Out-of-tree
+            # values are equally unusable. Skipping keeps b_h at the parent state
+            # already in hand -- the token is discarded downstream regardless.
+            parent_valid = (parent_step_idx >= 0) & (parent_step_idx < T)
+            if step_idx != 0 and cache_idx >= 0 and parent_valid:
+                step_offset = parent_step_idx.to(tl.int64) * stride_cache_step
                 cache_ptr = (
                     intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
+                    + cache_idx * stride_cache_slot
                     + step_offset
                     + i_hv * K * V
                     + o_v[None, :] * K
@@ -202,10 +219,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Cache intermediate states if enabled
         if CACHE_INTERMEDIATE_STATES:
             if cache_idx >= 0:
-                step_offset = step_idx * HV * K * V
+                step_offset = step_idx * stride_cache_step
                 cache_ptr = (
                     intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
+                    + cache_idx * stride_cache_slot
                     + step_offset
                     + i_hv * K * V
                     + o_v[None, :] * K
@@ -226,11 +243,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
         if USE_INITIAL_STATE:
-            idx = tl.load(h0_indices + i_n)
+            idx = tl.load(h0_indices + i_n).to(tl.int64)
             if idx >= 0:
                 p_h0 = (
                     h0_source
-                    + idx * HV * K * V
+                    + idx * stride_h0_slot
                     + i_hv * K * V
                     + o_v[None, :] * K
                     + o_k[:, None]
@@ -260,7 +277,7 @@ def fused_sigmoid_gating_delta_rule_update(
     intermediate_state_indices: Optional[torch.Tensor] = None,
     cache_steps: Optional[
         int
-    ] = None,  # kept for API compat; stride is derived from ``intermediate_states_buffer.shape[1]``
+    ] = None,  # kept for API compat; slot/step strides now come from ``intermediate_states_buffer.stride(0)/.stride(1)``
     retrieve_parent_token: Optional[torch.Tensor] = None,
 ):
     """
@@ -309,13 +326,37 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
-    # Per-req stride must match the buffer's allocated dim, not runtime steps
-    # (they can differ under --speculative-adaptive).
-    cache_stride_steps = (
-        intermediate_states_buffer.shape[1]
-        if intermediate_states_buffer is not None
-        else 0
-    )
+    # Slot/step strides in ELEMENTS, taken from the tensors instead of the
+    # previously hard-coded contiguous products (`HV*K*V`, and per-slot
+    # `shape[1] * HV*K*V` — which also covered --speculative-adaptive, since
+    # shape[1] is the allocated step dim). For contiguous pools these evaluate
+    # to exactly the old values (bit-identical); for the page-major envelope's
+    # strided views (slot stride = entry_bytes // itemsize, layer-interleaved)
+    # they are the ONLY correct addressing — the hard-coded versions silently
+    # read/wrote the wrong slot (GDN spec-verify corruption under strided
+    # pools). Inner (per-slot / per-step) layout must remain
+    # contiguous: the kernel's within-slot addressing assumes it.
+    if initial_state_source is not None:
+        stride_h0_slot = initial_state_source.stride(0)
+        assert initial_state_source[0].is_contiguous(), (
+            "fused_sigmoid_gating_delta_rule_update: initial_state_source must "
+            f"be contiguous within a slot; got strides "
+            f"{initial_state_source.stride()} shape {initial_state_source.shape}"
+        )
+    else:
+        stride_h0_slot = 0
+    if intermediate_states_buffer is not None:
+        stride_cache_slot = intermediate_states_buffer.stride(0)
+        stride_cache_step = intermediate_states_buffer.stride(1)
+        assert intermediate_states_buffer[0, 0].is_contiguous(), (
+            "fused_sigmoid_gating_delta_rule_update: intermediate_states_buffer "
+            f"must be contiguous within a (slot, step); got strides "
+            f"{intermediate_states_buffer.stride()} shape "
+            f"{intermediate_states_buffer.shape}"
+        )
+    else:
+        stride_cache_slot = 0
+        stride_cache_step = 0
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -333,7 +374,6 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
-        cache_steps=cache_stride_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
@@ -344,6 +384,9 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_k=stride_k,
         stride_v=stride_v,
         stride_b=stride_b,
+        stride_h0_slot=stride_h0_slot,
+        stride_cache_slot=stride_cache_slot,
+        stride_cache_step=stride_cache_step,
         NP2_T=NP2_T,
         B=B,
         H=H,

@@ -75,6 +75,83 @@ def _store_dtype_for(kv_cache_dtype: torch.dtype) -> torch.dtype:
     return kv_cache_dtype
 
 
+def _align_up(n: int, alignment: int) -> int:
+    return (n + alignment - 1) // alignment * alignment
+
+
+def _as_row_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """Make a KV source satisfy `store_cache_4d_kernel`'s row contract.
+
+    The kernel flattens (head_num, head_dim) into one ROW_DIM addressed by a
+    linear offset, so a row's elements must be adjacent in memory: for a 3-D
+    (N, head_num, head_dim) source that means `stride[-1] == 1` and
+    `stride[-2] == head_dim`. Only `stride(0)` is passed in, so any other
+    layout is read with the wrong element spacing -- the store then lands the
+    wrong bytes at the right slot, which no location-based check can see.
+
+    A model may legitimately hand us a non-contiguous k/v (a slice of a fused
+    QKV projection, a transpose). Copy those into a compact row layout instead
+    of rejecting them; rows already compact are returned untouched, so the
+    common path stays copy-free. `stride(0)` is deliberately NOT constrained --
+    the kernel takes it as an argument, so a row-compact slice of a wider
+    tensor is fine.
+    """
+    if t.ndim < 2:
+        return t
+    if t.stride(-1) == 1 and t.stride(-2) == t.shape[-1]:
+        return t
+    return t.contiguous()
+
+
+def fused_entry_bytes(host_entry_bytes: int, draft_region: "MHARegionGeometry") -> int:
+    """Per-slot bytes of a fused `[host KV | pad | draft KV]` envelope
+    . SINGLE SOURCE OF TRUTH for both the physical layout
+    (`MHASubPoolSpec.entry_bytes`) and the byte budget (the pool
+    configurators' per-token cell) — the two must never drift, or the solve
+    under- or over-provisions the buffer the views are built over."""
+    return (
+        _align_up(host_entry_bytes, draft_region.store_dtype.itemsize)
+        + draft_region.entry_bytes()
+    )
+
+
+class MHARegionGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Geometry of one MHA-shaped byte region inside a fused slot envelope.
+
+    Describes the DRAFT model's per-slot KV footprint when its KV is fused
+    into a host sub-pool's entry (`[target KV | draft KV]`, the fused
+    draft-KV layout). Mirrors `MHASubPoolSpec`'s MHA fields but
+    carries the draft's OWN geometry — EAGLE3/DFLASH drafts are separate
+    checkpoints whose head_num/head_dim differ from the target's.
+    `msgspec.Struct`, deliberately outside the grandfathered `SubPoolSpec`
+    `@dataclass` hierarchy (same convention as `SpecStateSubPoolSpec`).
+    """
+
+    layer_num: int
+    head_num: int
+    head_dim: int
+    v_head_dim: int
+    store_dtype: torch.dtype
+
+    def validate(self) -> None:
+        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
+        assert self.head_num > 0, f"head_num must be positive; got {self.head_num}"
+        assert self.head_dim > 0, f"head_dim must be positive; got {self.head_dim}"
+        assert (
+            self.v_head_dim > 0
+        ), f"v_head_dim must be positive; got {self.v_head_dim}"
+
+    def k_row_bytes(self) -> int:
+        return self.head_num * self.head_dim * self.store_dtype.itemsize
+
+    def v_row_bytes(self) -> int:
+        return self.head_num * self.v_head_dim * self.store_dtype.itemsize
+
+    def entry_bytes(self) -> int:
+        """Bytes for one slot's draft region across all draft layers."""
+        return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+
 @dataclass(frozen=True, kw_only=True)
 class SubPoolSpec(ABC):
     """Abstract per-slot layout of one sub-pool in a `UnifiedKVPool`."""
@@ -103,12 +180,21 @@ class SubPoolSpec(ABC):
 
 @dataclass(frozen=True, kw_only=True)
 class MHASubPoolSpec(SubPoolSpec):
-    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`."""
+    """Per-slot layout of one MHA-shaped sub-pool. `v_head_dim` defaults to `head_dim`.
+
+    With `draft_region` set, each slot is a FUSED envelope
+    `[host KV | pad | draft KV]` (fused draft KV): the
+    draft model's KV rides at byte offset `draft_region_offset_bytes()` inside
+    every slot, sharing this pool's slot ids, allocator, v2p mapping, and
+    compaction moves. `draft_region is None` keeps the layout byte-identical
+    to the pre-fusion one.
+    """
 
     head_num: int
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
+    draft_region: Optional[MHARegionGeometry] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -119,6 +205,8 @@ class MHASubPoolSpec(SubPoolSpec):
         assert (
             self.v_head_dim > 0
         ), f"v_head_dim must be positive; got {self.v_head_dim}"
+        if self.draft_region is not None:
+            self.draft_region.validate()
 
     def k_row_bytes(self) -> int:
         return self.head_num * self.head_dim * self.store_dtype.itemsize
@@ -126,8 +214,25 @@ class MHASubPoolSpec(SubPoolSpec):
     def v_row_bytes(self) -> int:
         return self.head_num * self.v_head_dim * self.store_dtype.itemsize
 
-    def entry_bytes(self) -> int:
+    def host_entry_bytes(self) -> int:
+        """Host (target-only) bytes for one slot — the pre-fusion entry."""
         return self.layer_num * (self.k_row_bytes() + self.v_row_bytes())
+
+    def draft_region_offset_bytes(self) -> int:
+        """Byte offset of the draft region within one slot's fused envelope
+        (host entry aligned up to the draft dtype's itemsize so the draft
+        views' element-space `storage_offset` never truncates)."""
+        assert self.draft_region is not None
+        return _align_up(
+            self.host_entry_bytes(), self.draft_region.store_dtype.itemsize
+        )
+
+    def entry_bytes(self) -> int:
+        if self.draft_region is None:
+            return self.host_entry_bytes()
+        # Via the shared helper so the configurators' cell math can never
+        # drift from the physical layout.
+        return fused_entry_bytes(self.host_entry_bytes(), self.draft_region)
 
     # Page-major byte math: within a page block K/V group per layer
     # [L0_K*ps | L0_V*ps | L1_K*ps | ...]; at ps==1 this collapses to the per-slot envelope.
@@ -286,6 +391,12 @@ class UnifiedKVPool:
         self._mamba_views: Dict[str, Tuple[List[torch.Tensor], torch.Tensor]] = {}
         # MLA sub-pools: one latent view list per layer (no K/V pair).
         self._mla_views: Dict[str, List[torch.Tensor]] = {}
+        # Draft-region K/V views of fused MHA sub-pools: same slot
+        # ids and per-page stride as the host views, offset into each slot's
+        # draft byte region.
+        self._mha_draft_views: Dict[
+            str, Tuple[List[torch.Tensor], List[torch.Tensor]]
+        ] = {}
 
         # Slot-0 dummy writes for both pools land in [0, entry_max); each pool's
         # first allocatable slot is chosen so real data starts at >= entry_max.
@@ -312,6 +423,13 @@ class UnifiedKVPool:
                     max_slots,
                     page_size=page_size,
                 )
+                if spec.draft_region is not None:
+                    self._mha_draft_views[spec.name] = self._build_mha_draft_views(
+                        spec,
+                        anchor,
+                        max_slots,
+                        page_size=page_size,
+                    )
             elif isinstance(spec, MambaSubPoolSpec):
                 self._mamba_views[spec.name] = self._build_mamba_views(
                     spec, anchor, max_slots
@@ -346,6 +464,19 @@ class UnifiedKVPool:
                 self._min_slot_index[s.name],
                 self._min_slot_index[s.name],
             )
+            if isinstance(s, MHASubPoolSpec) and s.draft_region is not None:
+                logger.info(
+                    "[unified-memory-pool]     fused draft region: layer_num=%d, "
+                    "head_num=%d, head_dim=%d/%d, entry_bytes=%d at slot offset %d "
+                    "(host entry_bytes=%d)",
+                    s.draft_region.layer_num,
+                    s.draft_region.head_num,
+                    s.draft_region.head_dim,
+                    s.draft_region.v_head_dim,
+                    s.draft_region.entry_bytes(),
+                    s.draft_region_offset_bytes(),
+                    s.host_entry_bytes(),
+                )
 
     # -- introspection --
 
@@ -390,6 +521,16 @@ class UnifiedKVPool:
     def mha_views_for(self, name: str) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         return self._mha_views[name]
 
+    def has_draft_region(self, name: str) -> bool:
+        """True when sub-pool `name` carries a fused draft KV region."""
+        return name in self._mha_draft_views
+
+    def draft_views_for(
+        self, name: str
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Draft-region K/V views of fused sub-pool `name` ."""
+        return self._mha_draft_views[name]
+
     def mamba_views_for(self, name: str) -> Tuple[List[torch.Tensor], torch.Tensor]:
         return self._mamba_views[name]
 
@@ -400,6 +541,9 @@ class UnifiedKVPool:
         max_slots: int,
         page_size: int,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        # page_stride_bytes uses the FUSED entry (== the host page bytes when
+        # draft_region is None): with a draft region, consecutive pages are
+        # entry_bytes() apart even for the host views.
         return build_page_major_mha_views(
             self._raw,
             layer_num=spec.layer_num,
@@ -429,6 +573,32 @@ class UnifiedKVPool:
             page_size=page_size,
             num_pages=max_slots // page_size,
             anchor_bytes=anchor_bytes,
+            page_stride_bytes=page_size * spec.entry_bytes(),
+        )
+
+    def _build_mha_draft_views(
+        self,
+        spec: MHASubPoolSpec,
+        anchor_bytes: int,
+        max_slots: int,
+        page_size: int,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """K/V views of the draft byte region inside `spec`'s fused slots:
+        same slot ids and page stride as the host views, based at the draft
+        region's offset within each page block."""
+        region = spec.draft_region
+        assert region is not None
+        return build_page_major_mha_views(
+            self._raw,
+            layer_num=region.layer_num,
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            v_head_dim=region.v_head_dim,
+            store_dtype=region.store_dtype,
+            page_size=page_size,
+            num_pages=max_slots // page_size,
+            anchor_bytes=anchor_bytes
+            + page_size * spec.draft_region_offset_bytes(),
             page_stride_bytes=page_size * spec.entry_bytes(),
         )
 
@@ -473,6 +643,16 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
         self._k_views = k_buffer
         self._v_views = v_buffer
         self._page_size = page_size
+        # Fused draft region : the host pool owns relocation for the
+        # WHOLE slot envelope, so compaction/accept moves must carry the draft
+        # bytes together with the host bytes.
+        if unified_buffer.has_draft_region(sub_pool_name):
+            draft_k, draft_v = unified_buffer.draft_views_for(sub_pool_name)
+            self._draft_k_views: List[torch.Tensor] = draft_k
+            self._draft_v_views: List[torch.Tensor] = draft_v
+        else:
+            self._draft_k_views = []
+            self._draft_v_views = []
 
         super().__init__(
             size=max_slots - 1,  # -1 for reserved slot 0
@@ -516,16 +696,74 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         # tgt_loc/src_loc are PHYSICAL slot ids; native move only (strided views).
+        # With a fused draft region the draft views ride in the same lists: one
+        # move relocates the whole [host KV | draft KV] envelope atomically
+        # (compaction, inverse-history rollback, and move_accept_kv all land
+        # here). move_kv_cache_native zips k/v pairwise, so heterogeneous
+        # host/draft shapes are fine.
         if tgt_loc.numel() == 0:
             return
         with record_function("UnifiedMHA.move_kv_cache"):
             move_kv_cache_native(
-                self.k_buffer,
-                self.v_buffer,
+                self.k_buffer + self._draft_k_views,
+                self.v_buffer + self._draft_v_views,
                 tgt_loc,
                 src_loc,
                 page_size=self._page_size,
             )
+
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale=None,
+        v_scale=None,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Commit only each row's valid prefix (DFLASH's block write).
+
+        MUST override: the parent's fused kernel writes through a packed
+        `row_dim` stride, but our K/V are 4-D strided envelope views
+        (stride[0] = page_bytes), so it would scatter to the WRONG addresses —
+        silently, no crash. This is the same assumption that forced the
+        `set_kv_buffer` override. Reduce to the valid rows and route through
+        the stride-aware `set_kv_buffer` (exactly what the parent already does
+        on non-CUDA). `loc_2d` is PHYSICAL — DFLASH translates at its choke
+        point (`_append_target_hidden_to_draft_kv_by_loc`).
+        """
+        if loc_2d.ndim != 2:
+            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+        row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        valid = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+        valid_idx = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
+        if valid_idx.numel() == 0:
+            return
+        self.set_kv_buffer(
+            layer,
+            loc_2d.reshape(-1).index_select(0, valid_idx),
+            cache_k.index_select(0, valid_idx),
+            cache_v.index_select(0, valid_idx),
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id_override,
+        )
+
+    def get_contiguous_buf_infos(self):
+        # PD-disaggregation KV transfer assumes densely packed rows; a fused
+        # slot interleaves draft bytes between host rows, so the item/len
+        # math would silently transfer garbage. Unified memory already
+        # excludes PD (server_args gate) — fail loud if anything reaches here.
+        if self._draft_k_views:
+            raise NotImplementedError(
+                "get_contiguous_buf_infos is not supported on a fused "
+                "draft-KV sub-pool : rows are strided, not "
+                "contiguous. PD transfer / HiCache must stay disabled with "
+                "--enable-unified-memory + speculative decoding."
+            )
+        return super().get_contiguous_buf_infos()
 
     def get_kv_size_bytes(self):
         return 0, 0  # UnifiedKVPool logs the total; per-sub-pool would double-count
@@ -546,6 +784,33 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             "UnifiedMHATokenToKVPool.set_kv_buffer: decode context parallel "
             "(dcp_kv_mask) is not supported with --enable-unified-memory."
         )
+        # Accept a bare loc OR a KVWriteLoc. Composite pools (HybridLinearKVPool,
+        # UnifiedSWAKVPool) unwrap and hand us a bare PHYSICAL tensor, which is
+        # the only way this pool was reached before fused draft KV. A fused DENSE
+        # draft (DFLASH / EAGLE3 checkpoint) binds UnifiedDraftKVPool as the
+        # runner's token_to_kv_pool DIRECTLY, so the backend's KVWriteLoc lands
+        # here raw ('KVWriteLoc' object has no attribute 'numel').
+        # `full_loc` is the pre-translated PHYSICAL loc; a bare `loc` is already
+        # physical.
+        was_write_loc = isinstance(loc, KVWriteLoc)
+        loc, _, full_loc = unwrap_write_loc(loc)
+        if full_loc is not None:
+            loc = full_loc
+        elif was_write_loc:
+            # A KVWriteLoc carrying no full_loc means the backend never ran the
+            # virtual->physical translate, so `loc` holds VIRTUAL ids. Writing
+            # them as physical does not crash -- it silently scribbles KV into
+            # whatever slots the virtual ids happen to name, and only shows up
+            # later as a degraded accept length. Backends that translate always
+            # populate full_loc; a backend that does not (any non-Triton one) has
+            # no business reaching this pool. Fail here rather than corrupt.
+            raise RuntimeError(
+                "unified pool received a KVWriteLoc with no physical loc "
+                "(full_loc=None): the attention backend did not translate the "
+                "virtual slot ids. The unified memory pool requires the Triton "
+                "attention backend on every path, including "
+                "--speculative-draft-attention-backend."
+            )
         # Bypass super().set_kv_buffer: the parent's `k_cache.view(-1, row_dim)` can't
         # merge our 4-D layer-major view (stride[0]=page_bytes) at page_size>1. Call
         # store_cache_4d_kernel directly. `loc` is PHYSICAL token ids — no v2p translate.
@@ -564,12 +829,48 @@ class UnifiedMHATokenToKVPool(MHATokenToKVPool):
             layer_id = (
                 layer.layer_id if layer_id_override is None else layer_id_override
             ) - self.start_layer
+            assert 0 <= layer_id < len(self.k_buffer), (
+                f"{type(self).__name__}: layer_id {layer_id} out of range for "
+                f"{len(self.k_buffer)} layer view(s) (layer_id_override="
+                f"{layer_id_override}, start_layer={self.start_layer}). A wrong "
+                f"layer index writes this token's KV over another layer's."
+            )
             k_view = self.k_buffer[layer_id]
             v_view = self.v_buffer[layer_id]
             ps = self._page_size
             N = loc.numel()
             if N == 0:
                 return
+
+            # We call `store_cache_4d_kernel` DIRECTLY (the `store_cache_4d`
+            # wrapper cannot merge our 4-D layer-major view at page_size > 1), so
+            # the wrapper's contract checks do not run and we must uphold them
+            # here. The kernel reads `loc` and each KV row with raw pointer
+            # arithmetic and walks FLAT memory -- a non-compact layout is read
+            # with the wrong element spacing, so the store lands the WRONG BYTES
+            # at the RIGHT slot. It does not fail: no index leaves its range, and
+            # every torch-side check passes, because torch honours the very stride
+            # the kernel ignores. The only symptom is degraded model quality.
+            #
+            # Both hazards are real, not theoretical:
+            #   - source rows: a model may hand us a slice of a fused QKV
+            #     projection, or a transpose;
+            #   - `loc`: a per-step draft slot table built with
+            #     permute(...).reshape(...) is a strided VIEW, and it made this
+            #     kernel scatter draft KV across the wrong requests.
+            # Normalize rather than reject -- both callers are legitimate.
+            cache_k = _as_row_contiguous(cache_k)
+            cache_v = _as_row_contiguous(cache_v)
+            if not loc.is_contiguous():
+                loc = loc.contiguous()
+            assert k_view.stride(-1) == 1 and k_view.stride(-2) == k_view.shape[-1], (
+                f"{type(self).__name__}: k_view trailing dims not contiguous; "
+                f"stride={k_view.stride()}, shape={tuple(k_view.shape)}"
+            )
+            assert v_view.stride(-1) == 1 and v_view.stride(-2) == v_view.shape[-1], (
+                f"{type(self).__name__}: v_view trailing dims not contiguous; "
+                f"stride={v_view.stride()}, shape={tuple(v_view.shape)}"
+            )
             head_num = k_view.shape[2]
             head_dim = k_view.shape[3]
             v_head_dim = v_view.shape[3]
@@ -818,6 +1119,86 @@ class UnifiedMLATokenToKVPool(MLATokenToKVPool):
         src_pg, src_in = src_loc // ps, src_loc % ps
         for kv in self.kv_buffer:
             kv[tgt_pg, tgt_in] = kv[src_pg, src_in]
+
+
+class UnifiedDraftKVPool(UnifiedMHATokenToKVPool):
+    """Draft-model KV pool over the DRAFT byte region of a fused host sub-pool
+
+    An envelope view into the target's `UnifiedKVPool._raw`: shares the host
+    sub-pool's slot ids, allocator, v2p mapping, and compaction; owns NO
+    memory. Draft-runner layer `i` maps to draft-region layer
+    `layer_offset + i` (multi-layer EAGLE gives each per-step runner its own
+    layer sub-range, keyed by `draft_model_idx`). Relocation is host-driven —
+    the host pool's `move_kv_cache` carries the whole fused envelope — so this
+    pool must never be asked to move or to describe contiguous buffers.
+    Like `UnifiedMambaPool`, skips the immediate parent's `__init__`: it binds
+    the draft views, then initializes `MHATokenToKVPool` state directly with
+    the draft region's geometry.
+    """
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        sub_pool_name: str,
+        page_size: int = 1,
+        layer_offset: int = 0,
+        layer_num: Optional[int] = None,
+        enable_alt_stream: bool = True,
+    ):
+        spec = unified_buffer.mha_spec(sub_pool_name)
+        region = spec.draft_region
+        assert (
+            region is not None
+        ), f"sub-pool {sub_pool_name!r} has no fused draft region"
+        draft_k, draft_v = unified_buffer.draft_views_for(sub_pool_name)
+        if layer_num is None:
+            layer_num = region.layer_num - layer_offset
+        assert 0 <= layer_offset and layer_offset + layer_num <= region.layer_num, (
+            f"draft layer sub-range [{layer_offset}, {layer_offset + layer_num}) "
+            f"out of the region's {region.layer_num} layers"
+        )
+        max_slots = unified_buffer.max_slots(sub_pool_name)
+
+        self._unified_buffer = unified_buffer
+        self._sub_pool_name = sub_pool_name
+        self._k_views = draft_k[layer_offset : layer_offset + layer_num]
+        self._v_views = draft_v[layer_offset : layer_offset + layer_num]
+        self._page_size = page_size
+        # Never a mover (see move_kv_cache below); the host pool's fused move
+        # lists carry this region.
+        self._draft_k_views: List[torch.Tensor] = []
+        self._draft_v_views: List[torch.Tensor] = []
+
+        MHATokenToKVPool.__init__(
+            self,
+            size=max_slots - 1,  # -1 for reserved slot 0
+            page_size=page_size,
+            dtype=region.store_dtype,
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            layer_num=layer_num,
+            device=unified_buffer.device,
+            enable_memory_saver=False,  # buffer owned by UnifiedKVPool
+            v_head_dim=region.v_head_dim,
+            start_layer=0,  # draft-runner layer ids are 0-based
+            end_layer=layer_num,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=False,  # strided views — no tiled copy
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "UnifiedDraftKVPool never moves KV: the HOST sub-pool's "
+            "move_kv_cache relocates the whole fused [host|draft] envelope."
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "get_contiguous_buf_infos is not supported on the fused draft "
+            "view pool (strided rows; PD transfer is excluded under "
+            "--enable-unified-memory)."
+        )
 
 
 class UnifiedMambaPool(MambaPool):
@@ -1169,6 +1550,7 @@ def init_unified_mamba_pools(
     lazy_compaction: bool = False,
     kv_lora_rank: Optional[int] = None,
     qk_rope_head_dim: Optional[int] = None,
+    draft_kv_geometry: Optional[MHARegionGeometry] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -1189,6 +1571,11 @@ def init_unified_mamba_pools(
         assert kv_lora_rank is not None and qk_rope_head_dim is not None, (
             "unified MLA-hybrid path needs the model's kv_lora_rank / "
             "qk_rope_head_dim"
+        )
+        # The fused draft-KV region geometry is MHA-shaped; no MLA-hybrid
+        # draft checkpoint exists to drive an MLA-shaped one.
+        assert draft_kv_geometry is None, (
+            "unified MLA-hybrid path does not support a fused draft KV region"
         )
         # The mamba-radix machinery of the current MLA-hybrid models runs
         # non-overlap at page_size 1; the pool-side layout is page-size-general
@@ -1218,6 +1605,9 @@ def init_unified_mamba_pools(
             grow_direction="down",
         )
     else:
+        # With draft_kv_geometry (fused draft KV), each full slot carries the
+        # draft model's KV region; the draft worker binds a UnifiedDraftKVPool
+        # over the same slots.
         full_spec = MHASubPoolSpec(
             name="full",
             layer_num=len(full_attention_layer_ids),
@@ -1225,6 +1615,7 @@ def init_unified_mamba_pools(
             head_dim=head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
+            draft_region=draft_kv_geometry,
         )
     cp = mamba2_cache_params
     mamba_spec = MambaSubPoolSpec(
@@ -1638,6 +2029,7 @@ def init_unified_swa_pools(
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
+    draft_kv_geometry: Optional[MHARegionGeometry] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1656,6 +2048,9 @@ def init_unified_swa_pools(
 
     store_dtype = _store_dtype_for(kv_cache_dtype)
     # full-attn at the high-byte end (grow-down), swa at the low-byte end (grow-up).
+    # With draft_kv_geometry (fused draft KV), each FULL slot carries
+    # the draft model's KV region — the draft is dense, so it fuses into the
+    # full sub-pool (a DSV4-style draft would instead attach to "swa").
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=len(full_attention_layer_ids),
@@ -1664,6 +2059,7 @@ def init_unified_swa_pools(
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
         grow_direction="down",
+        draft_region=draft_kv_geometry,
     )
     swa_spec = MHASubPoolSpec(
         name="swa",

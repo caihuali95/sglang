@@ -11,6 +11,21 @@ import triton
 import triton.language as tl
 
 
+def _trailing_dims_contiguous(t: torch.Tensor, ndim_prefix: int) -> bool:
+    """Whether dims `[ndim_prefix:]` of `t` are laid out contiguously (row-major
+    within one leading-index entry). The scatter kernels index the leading dims
+    through explicit strides but flat-copy the trailing element range, so full
+    `.is_contiguous()` is stronger than required — the unified memory pool's
+    envelope views are strided in the leading (layer/slot/step) dims while each
+    row stays contiguous."""
+    expected = 1
+    for i in range(t.ndim - 1, ndim_prefix - 1, -1):
+        if t.shape[i] != 1 and t.stride(i) != expected:
+            return False
+        expected *= t.shape[i]
+    return True
+
+
 @triton.jit
 def track_mamba_state_if_needed_kernel(
     conv_states_ptr,
@@ -271,11 +286,20 @@ def fused_mamba_state_scatter_with_mask(
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
 
-    # Ensure tensors are contiguous
-    if not dst.is_contiguous():
-        raise ValueError("dst tensor must be contiguous")
-    if not src.is_contiguous():
-        raise ValueError("src tensor must be contiguous")
+    # The kernel indexes (layer, req[, step]) through explicit strides and
+    # flat-copies the trailing state row, so only the TRAILING dims must be
+    # contiguous — the unified pool's envelope views (and the band slice of the
+    # intermediate view) are strided in the leading dims by design.
+    if not _trailing_dims_contiguous(dst, 2):
+        raise ValueError(
+            "dst tensor's trailing state dims (after [layer, cache]) must be "
+            f"contiguous; got shape={tuple(dst.shape)} strides={dst.stride()}"
+        )
+    if not _trailing_dims_contiguous(src, 3):
+        raise ValueError(
+            "src tensor's trailing state dims (after [layer, req, step]) must "
+            f"be contiguous; got shape={tuple(src.shape)} strides={src.stride()}"
+        )
 
     # Block size for copying elements
     BLOCK_SIZE = 1024
@@ -420,11 +444,16 @@ def fused_conv_window_scatter_with_mask(
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
 
-    # `dst` stays contiguous; `src` is an intentionally non-contiguous (overlapping)
-    # view, so we do NOT assert src contiguity here (unlike the dense scatter).
-    if not dst.is_contiguous():
+    # `src` is fully strided (an intentionally overlapping dedup view, or an
+    # envelope view), so no src guard. `dst` rows must be contiguous in
+    # (dim, K-1) order — leading (layer, cache) dims go through explicit
+    # strides, so trailing-dims contiguity is the exact requirement (full
+    # contiguity would reject the unified pool's envelope conv view).
+    if not _trailing_dims_contiguous(dst, 2):
         raise ValueError(
-            "dst tensor in fused_conv_window_scatter_with_mask must be contiguous"
+            "dst tensor's trailing (dim, K-1) dims in "
+            "fused_conv_window_scatter_with_mask must be contiguous; got "
+            f"shape={tuple(dst.shape)} strides={dst.stride()}"
         )
 
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()

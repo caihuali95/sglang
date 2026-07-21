@@ -1,9 +1,134 @@
 import logging
+from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.common import is_blackwell, is_hip, is_musa, is_npu
 
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.mem_cache.unified_memory_pool import MHARegionGeometry
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
 logger = logging.getLogger(__name__)
+
+# Draft archs whose per-runner layer count is forced to 1 regardless of config
+# (mirrors the ModelRunner layer-count override; these are the multi-layer
+# EAGLE families where each per-step runner loads ONE MTP module).
+_SINGLE_LAYER_MTP_ARCHS = ("MiMoV2MTP", "Step3p5MTP")
+
+
+def _draft_layer_count(model_config: "ModelConfig") -> Optional[int]:
+    """KV layer count of one draft runner, mirroring the ModelRunner rules:
+    the single-layer MTP arch override first, then `num_nextn_predict_layers`,
+    then the dense-draft hidden/attention layer count.
+
+    Returns None for an MTP/NextN draft whose head size cannot be determined —
+    falling back to `num_hidden_layers` there would size the draft region at the
+    WHOLE target (32 layers instead of 1, a 5x cell inflation). A
+    dense draft checkpoint (DFLASH / EAGLE3) legitimately uses its own layer
+    count, so only the MTP archs get the guard.
+    """
+    arch = model_config.hf_config.architectures[0]
+    if arch in _SINGLE_LAYER_MTP_ARCHS:
+        return 1
+    nnpl = model_config.num_nextn_predict_layers
+    if nnpl is not None and int(nnpl) > 0:
+        return int(nnpl)
+    if _is_mtp_draft_arch(model_config):
+        return None
+    return int(
+        max(model_config.num_hidden_layers, model_config.num_attention_layers)
+    )
+
+
+def _is_mtp_draft_arch(model_config: "ModelConfig") -> bool:
+    """True when a config re-read with `is_draft_model=True` actually became an
+    MTP/NextN draft (`ModelConfig._config_draft_model` swapped the arch). Guards
+    the self-draft path: a target with NO MTP head keeps its original arch, and
+    its layer count is the FULL model's — fusing that would size the draft region
+    at the whole target."""
+    arch = model_config.hf_config.architectures[0]
+    if arch.endswith("MTP") or arch.endswith("NextN"):
+        return True
+    nnpl = model_config.num_nextn_predict_layers
+    return nnpl is not None and int(nnpl) > 0
+
+
+def resolve_draft_kv_geometry(
+    *,
+    server_args: ServerArgs,
+    spec_algorithm: "SpeculativeAlgorithm",
+    target_model_config: "ModelConfig",
+    draft_model_config: Optional["ModelConfig"],
+    kv_cache_dtype: torch.dtype,
+    attn_tp_size: int,
+    is_self_draft: bool = False,
+) -> Optional["MHARegionGeometry"]:
+    """Resolve the draft model's per-slot KV geometry for the fused draft-KV layout.
+
+    Returns the geometry of the draft byte region that rides inside the host
+    sub-pool's fused slot entry, or None when there is no draft KV to fuse
+    (spec off, NGRAM, self-draft without MTP layers). Pure function of the
+    configs — config loading is the caller's job (ModelRunner helper) so each
+    case's geometry is unit-testable.
+
+    `is_self_draft` = the run has no `speculative_draft_model_path`, so the
+    caller built `draft_model_config` from the TARGET checkpoint with
+    `is_draft_model=True`. That is what materializes the MTP head (the arch
+    swap + `num_nextn_predict_layers` in `ModelConfig._config_draft_model`).
+    If the swap did NOT happen the target has no MTP head, and its layer count
+    is the FULL model's — fusing that would size the draft region at the whole
+    target, so return None instead.
+    """
+    from sglang.srt.mem_cache.unified_memory_pool import MHARegionGeometry
+
+    if spec_algorithm.is_none() or not spec_algorithm.has_draft_kv():
+        return None
+
+    cfg = draft_model_config if draft_model_config is not None else target_model_config
+
+    if is_self_draft and not _is_mtp_draft_arch(cfg):
+        return None
+
+    if server_args.enable_multi_layer_eagle:
+        # One ModelRunner per draft step, each loading its own MTP module.
+        # All step-runners share one config, so per-step geometric identity
+        # holds by construction; the fused draft region concatenates their
+        # layers (step i occupies layer sub-range i, keyed by draft_model_idx).
+        num_steps = int(server_args.speculative_num_steps or 0)
+        per_step = _draft_layer_count(cfg)
+        if num_steps <= 0 or per_step is None:
+            return None
+        layer_num = num_steps * per_step
+    elif spec_algorithm.is_dflash():
+        from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+        dflash_config = parse_dflash_draft_config(draft_hf_config=cfg.hf_config)
+        layer_num = int(dflash_config.require_num_layers())
+    elif draft_model_config is not None:
+        layer_num = _draft_layer_count(draft_model_config)
+        if layer_num is None:
+            return None
+    else:
+        # MTP/NEXTN self-draft: no MTP layers -> no draft KV to fuse.
+        nnpl = target_model_config.num_nextn_predict_layers
+        if nnpl is None or int(nnpl) <= 0:
+            return None
+        layer_num = int(nnpl)
+
+    head_dim = int(cfg.head_dim)
+    v_head_dim = int(cfg.v_head_dim) if cfg.v_head_dim is not None else head_dim
+    geometry = MHARegionGeometry(
+        layer_num=layer_num,
+        head_num=int(cfg.get_num_kv_heads(attn_tp_size)),
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        store_dtype=kv_cache_dtype,
+    )
+    geometry.validate()
+    return geometry
 
 
 class DraftBackendFactory:

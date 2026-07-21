@@ -830,11 +830,20 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     o,
     h0_source,
     h0_indices,
+    # Slot stride of h0_source, in elements. A dense pool has HV*K*V; the unified
+    # pool's temporal view is an envelope slice whose slot stride is the WHOLE
+    # mamba entry (all layers interleaved), so it must be passed, not assumed.
+    stride_h0_slot,
     cu_seqlens,
     scale,
     intermediate_states_buffer,
     intermediate_state_indices,
     cache_steps,
+    # (slot, step) strides of intermediate_states_buffer, in elements. Dense
+    # layouts have slot == cache_steps*HV*K*V and step == HV*K*V; the unified
+    # pool's envelope view is slot-strided, so the wrapper passes real strides.
+    stride_inter_slot,
+    stride_inter_step,
     retrieve_parent_token_ptr,
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
@@ -897,12 +906,12 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         # Add bounds checking for idx
         if idx >= 0:  # Assuming negative indices are invalid
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_slot
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
@@ -912,22 +921,25 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Prepare intermediate state cache variables if enabled
     cache_idx = -1
     if CACHE_INTERMEDIATE_STATES:
-        cache_idx = tl.load(intermediate_state_indices + i_n)
+        cache_idx = tl.load(intermediate_state_indices + i_n).to(tl.int64)
 
     step_idx = 0
     for _ in range(0, T):
         if HAS_EAGLE_TREE_CUSTOM_ATTN_MASK:
             # step_idx = 0 should use the b_h from USE_INITIAL_STATE
-            if step_idx != 0 and cache_idx >= 0:
-                # when calculating current step's attention, load the state from the parent token
-                parent_step_idx = tl.sum(
-                    tl.where(token_indices == step_idx, parent_idx_tokens, 0)
-                )
-                step_offset = parent_step_idx * HV * K * V
+            # when calculating current step's attention, load the state from the parent token
+            parent_step_idx = tl.sum(
+                tl.where(token_indices == step_idx, parent_idx_tokens, 0)
+            )
+            # -1 marks a token the tree builder could not parent (it warns and
+            # skips it). Scaled by stride_inter_step (~1e7 elements) such a value
+            # forms a wild pointer, so guard before the arithmetic, not after.
+            parent_valid = (parent_step_idx >= 0) & (parent_step_idx < T)
+            if step_idx != 0 and cache_idx >= 0 and parent_valid:
                 cache_ptr = (
                     intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
+                    + cache_idx * stride_inter_slot
+                    + parent_step_idx * stride_inter_step
                     + i_hv * K * V
                     + o_v[:, None] * K
                     + o_k[None, :]
@@ -964,11 +976,10 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
         if CACHE_INTERMEDIATE_STATES:
             if cache_idx >= 0:
                 # Compute cache pointer for this step
-                step_offset = step_idx * HV * K * V
                 cache_ptr = (
                     intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
+                    + cache_idx * stride_inter_slot
+                    + step_idx * stride_inter_step
                     + i_hv * K * V
                     + o_v[:, None] * K
                     + o_k[None, :]
@@ -987,11 +998,11 @@ def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     # Store final state back to h0_source with bounds checking
     # ssm states
     if not DISABLE_STATE_UPDATE:
-        idx = tl.load(h0_indices + i_n)
+        idx = tl.load(h0_indices + i_n).to(tl.int64)
         if idx >= 0:  # Add bounds checking
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx * stride_h0_slot
                 + i_hv * K * V
                 + o_v[:, None] * K
                 + o_k[None, :]
@@ -1053,11 +1064,28 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        stride_h0_slot=(
+            initial_state_source.stride(0)
+            if initial_state_source is not None
+            else 0
+        ),
         cu_seqlens=cu_seqlens,
         scale=scale,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
         cache_steps=0 if cache_steps is None else cache_steps,
+        # Real (slot, step) strides: identical to the old hardcoded dense math
+        # for contiguous buffers; required for the unified envelope views.
+        stride_inter_slot=(
+            intermediate_states_buffer.stride(0)
+            if intermediate_states_buffer is not None
+            else 0
+        ),
+        stride_inter_step=(
+            intermediate_states_buffer.stride(1)
+            if intermediate_states_buffer is not None
+            else 0
+        ),
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,

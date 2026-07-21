@@ -40,6 +40,20 @@ from sglang.srt.utils.common import (
 )
 
 
+def _resolve_fused_draft_geometry(mr: "ModelRunner"):
+    """The ModelRunner's fused-draft-KV region geometry, or None.
+
+    `mr.draft_kv_geometry is not None` <=> fusion enabled (gated once in
+    `maybe_init_draft_kv_geometry`). Type-checked rather than a bare getattr
+    so mock ModelRunners in tests (whose auto-attributes are truthy) don't
+    trip the fused sizing branch.
+    """
+    from sglang.srt.mem_cache.unified_memory_pool import MHARegionGeometry
+
+    geometry = getattr(mr, "draft_kv_geometry", None)
+    return geometry if isinstance(geometry, MHARegionGeometry) else None
+
+
 @dataclass
 class MemoryPoolConfig:
     """Resolved memory pool config, shared between target and draft workers."""
@@ -129,6 +143,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._cell_size = self._compute_cell_size(mr, num_layers)
+
+        # Fused draft KV: the draft's KV is part of the full-KV
+        # slot entry, so the per-token cell IS the fused entry — exact, from
+        # the draft's own geometry, via the same helper the physical layout
+        # uses (no drift). cell == base by construction: mamba/band bytes
+        # carry no draft backing and the admission solve's draft reserve
+        # degenerates to zero (there is no separate draft pool to back).
+        # `draft_kv_geometry is not None` <=> fusion enabled (gated in
+        # maybe_init_draft_kv_geometry); the ratio approximations below then
+        # price only the NON-fused private-pool fallback.
+        draft_kv_geometry = _resolve_fused_draft_geometry(mr)
+        if draft_kv_geometry is not None and not mr.is_draft_worker:
+            from sglang.srt.mem_cache.unified_memory_pool import fused_entry_bytes
+
+            self._cell_size = fused_entry_bytes(self._cell_size, draft_kv_geometry)
+            self._base_cell_size = self._cell_size
+            return
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
         # Assumes draft and target share the same per-layer KV size (head_dim,
@@ -332,6 +363,30 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         else:
             self._cell_size = (
                 self._full_per_token * self._full_layers_num
+                + self._swa_full_tokens_ratio
+                * self._swa_per_token
+                * self._swa_layers_num
+            )
+
+        # Fused draft KV: the draft region rides inside every FULL
+        # slot, so only the full-side per-token term grows — exact, via the
+        # same helper the physical layout uses. This also FILLS the 
+        # gap (this configurator had no draft scaling at all, a latent OOM on
+        # SWA-hybrid × spec); the non-fused fallback stays upstream-verbatim
+        # by design. `draft_kv_geometry is not None` <=> fusion enabled.
+        draft_kv_geometry = _resolve_fused_draft_geometry(mr)
+        if (
+            draft_kv_geometry is not None
+            and not mr.is_draft_worker
+            and self._full_layers_num > 0
+        ):
+            from sglang.srt.mem_cache.unified_memory_pool import fused_entry_bytes
+
+            fused_full_per_token = fused_entry_bytes(
+                self._full_per_token * self._full_layers_num, draft_kv_geometry
+            )
+            self._cell_size = (
+                fused_full_per_token
                 + self._swa_full_tokens_ratio
                 * self._swa_per_token
                 * self._swa_layers_num

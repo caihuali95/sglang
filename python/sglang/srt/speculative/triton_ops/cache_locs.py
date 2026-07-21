@@ -94,6 +94,20 @@ def assign_draft_cache_locs_contiguous(
 
 
 @triton.jit
+def _v2p_translate(virt, page_size: tl.constexpr, v2p_ptr, mask):
+    """Virtual token ids -> physical via the page-granular v2p table,
+    mirroring `MultiEndedAllocator._translate_kv_loc_impl` incl. the
+    tombstone clamp: a tombstoned page (-1) maps into [-page_size, -1],
+    clamped to the physical slot-0 padding sink. `mask` MUST be the source
+    load's mask — masked-out lanes hold undefined ids that must not gather
+    from the v2p table (OOB)."""
+    page = virt // page_size
+    off = virt % page_size
+    phys_page = tl.load(v2p_ptr + page, mask=mask, other=0)
+    return tl.maximum(phys_page * page_size + off, 0)
+
+
+@triton.jit
 def generate_draft_decode_kv_indices(
     req_pool_indices,
     req_to_token,
@@ -108,6 +122,12 @@ def generate_draft_decode_kv_indices(
     iter_upper: tl.constexpr,
     num_tokens_upper: tl.constexpr,
     page_size: tl.constexpr,
+    # Fused draft KV : the unified full sub-pool's v2p table.
+    # With HAS_V2P, every id read from req_to_token is translated in-kernel
+    # so the emitted kv_indices are PHYSICAL — the kernel translates exactly
+    # the entries it writes (no post-pass, no garbage-tail hazard).
+    v2p_ptr=None,
+    HAS_V2P: tl.constexpr = False,
 ):
     BLOCK_SIZE: tl.constexpr = 128
     iters = tl.program_id(axis=0)
@@ -137,6 +157,8 @@ def generate_draft_decode_kv_indices(
     for _ in range(num_loop):
         mask = kv_offset < seq_len
         data = tl.load(token_pool_ptr + kv_offset, mask=mask)
+        if HAS_V2P:
+            data = _v2p_translate(data, page_size, v2p_ptr, mask)
         tl.store(kv_ptr + kv_offset, data, mask=mask)
         kv_offset += BLOCK_SIZE
 
@@ -159,6 +181,10 @@ def generate_draft_decode_kv_indices(
         extend_data = tl.load(
             token_pool_ptr + start + extend_offset,
             mask=extend_offset < iters,
+        )
+    if HAS_V2P:
+        extend_data = _v2p_translate(
+            extend_data, page_size, v2p_ptr, extend_offset < iters
         )
 
     tl.store(kv_ptr + seq_len + extend_offset, extend_data, mask=extend_offset < iters)

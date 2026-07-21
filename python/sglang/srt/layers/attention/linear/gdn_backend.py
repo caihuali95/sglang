@@ -284,6 +284,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+        # Trivially satisfied for GDN (its dispatcher has target_verify), but
+        # keeps the capability contract structural: every dispatcher-based
+        # linear family self-checks at boot rather than corrupting at verify.
+        self._check_spec_target_verify_support(model_runner)
+        # Per-verify-row indices into the intermediate_ssm /
+        # intermediate_conv_window buffers (identity rows: row i of the verify
+        # batch uses intermediate slot i).
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )

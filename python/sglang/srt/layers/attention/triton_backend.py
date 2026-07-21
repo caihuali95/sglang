@@ -152,9 +152,32 @@ class TritonAttnBackend(AttentionBackend):
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
         # kernels need PHYSICAL. Applied eagerly so the captured graph has no translate.
-        self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc", None
+        # Capability on the POOL, not the worker role: a pool that declares
+        # `kv_ids_are_virtual` (the NON-fused private draft pool, invariant D8)
+        # opts out — its KV is indexed by VIRTUAL ids (relocation-stable;
+        # compaction moves target-pool bytes only, so translating would read
+        # the wrong draft slots). Absent => translate: target pools and the
+        # FUSED draft view pool (whose bytes ride in the target's
+        # relocatable slots) both need physical ids; non-unified allocators
+        # have no translate_kv_loc so the probe degenerates to None. Draft
+        # mamba states keep their own translate (_translate_mamba_indices)
+        # either way.
+        self._translate_kv_loc = (
+            None
+            if getattr(self.token_to_kv_pool, "kv_ids_are_virtual", False)
+            else getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
         )
+        if self._translate_kv_loc is not None:
+            # Unified pool: the CG replay-prep translate needs the exact filled
+            # counts (kv_indptr[bs] / the window sum), sourced from
+            # seq_lens_sum / seq_lens_cpu. Triton normally opts OUT of the
+            # FutureMap's CPU-mirror publication (class attr False), which
+            # under sync-free spec-v2 overlap would leave both unset and push
+            # EVERY replay onto the blocking `.item()` fallback. Opting in
+            # routes the mirror through the FutureMap's overlapped pinned-D2H
+            # publication (event-gated private stream) instead — the designed
+            # low-cost path (see overlap_utils.resolve_seq_lens_cpu).
+            self.needs_cpu_seq_lens = True
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -472,6 +495,12 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     token_to_kv_pool=self.token_to_kv_pool,
                     window_kv_indices=window_kv_indices,
+                    # Unified pool: leave the window VIRTUAL here — the deferred
+                    # cuda-graph translate (_translate_cuda_graph_shared_pool_locs)
+                    # applies full->swa exactly once. Without this the window
+                    # would be translated TWICE (here + deferred), reading wrong
+                    # slots. Mirrors _update_decode_kv_buffers.
+                    skip_full_to_swa_translation=(self._translate_kv_loc is not None),
                 )
             )
         custom_mask = self.cuda_graph_custom_mask
@@ -658,6 +687,63 @@ class TritonAttnBackend(AttentionBackend):
             )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
+    def _translate_window_kv_indices(
+        self, window_kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Sliding-window READ ids (virtual) -> physical.
+
+        Two pool families need different maps, and the discriminator is the
+        POOL, not the model: `sliding_window_size` merely says the MODEL has
+        window layers.
+          * Hybrid-SWA pools keep the window in a SEPARATE swa sub-pool with
+            its own id space -> `translate_loc_from_full_to_swa`.
+          * Single-pool models whose window layers read the SAME slots as the
+            full layers -> the ordinary v2p translate. This is the fused draft
+            view pool: a DFLASH draft has sliding-window layers but
+            its KV lives entirely in the target's fused full-pool slots, so its
+            window ids are plain full-pool ids. Before the translate flip the
+            draft skipped translation altogether, which is why this path was
+            never exercised (AttributeError under CG capture, and a
+            silent VIRTUAL-id window read in eager mode).
+        """
+        swa_translate = getattr(
+            self.token_to_kv_pool, "translate_loc_from_full_to_swa", None
+        )
+        if swa_translate is not None:
+            out = swa_translate(window_kv_indices)
+        elif self._translate_kv_loc is not None:
+            out = self._translate_kv_loc(window_kv_indices)
+        else:
+            return window_kv_indices  # non-unified: ids are already physical
+        # Preserve the caller's index dtype: `translate_loc_from_full_to_swa`
+        # returns INT32, and callers that REBIND (rather than assign in place
+        # into a static int64 buffer) would otherwise silently downcast their
+        # int64 index tensor. See `_translate_window_kv_indices_single_pool`.
+        if out.dtype != window_kv_indices.dtype:
+            out = out.to(window_kv_indices.dtype)
+        return out
+
+    def _translate_window_kv_indices_single_pool(
+        self, window_kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Eager-path window translate for SINGLE-pool models only.
+
+        Pools that own a separate SWA sub-pool are translated IN PLACE inside
+        `update_sliding_window_buffer` (unchanged, pre-Stage-4.1 behavior) — do
+        NOT re-route them through the returning helper: that translate yields
+        int32, and rebinding the caller's int64 index tensor to it silently
+        downcast the eager indices (observed as a total accuracy collapse
+        with spec OFF; the cuda-graph path was spared only because it
+        assigns in place into a static int64 buffer).
+
+        Only the fused draft view pool needs this: it has no SWA sub-pool, so
+        `update_sliding_window_buffer`'s hasattr guard leaves its window ids
+        VIRTUAL, and they need the ordinary v2p translate.
+        """
+        if hasattr(self.token_to_kv_pool, "translate_loc_from_full_to_swa"):
+            return window_kv_indices  # already translated in place by the util
+        return self._translate_window_kv_indices(window_kv_indices)
+
     def _translate_cuda_graph_shared_pool_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
@@ -672,8 +758,31 @@ class TritonAttnBackend(AttentionBackend):
         """
         if self._translate_kv_loc is None:
             return None
-        # Full-attention read path.
-        n_kv = int(self.kv_indptr[bs].item())
+        # Full-attention read path. kv_indptr[bs] == sum(padded seq_lens) ==
+        # forward_batch.seq_lens_sum, a CPU int the replay batch already carries
+        # (the replay wrapper adds the padded rows' fill contribution, keeping
+        # it equal to kv_indptr[bs]); read it instead of a per-step D2H
+        # `.item()` sync.
+        #
+        # The `.item()` fallbacks below CANNOT become asserts: gpu_only batches
+        # legitimately leave seq_lens_sum None AND seq_lens_cpu unset
+        # (forward_batch_info keeps them sync-free, see #26738). Worse, the
+        # replay wrapper hands out `buffers.seq_lens_cpu[:bs]` unconditionally
+        # while the buffer is only REFRESHED when the batch carries a CPU
+        # mirror — so under gpu_only the tensor is non-None but STALE. Use
+        # `seq_lens_sum is not None` as the single freshness signal for BOTH
+        # CPU-derived counts (the two fields are set/unset together).
+        # Steady state never falls back: with the unified pool the backend
+        # opts into needs_cpu_seq_lens (see __init__), so the FutureMap
+        # publishes fresh mirrors even under sync-free spec-v2 overlap; the
+        # fallback covers only mirror-less direct constructions (bench-style
+        # gpu_only batches).
+        cpu_mirrors_fresh = forward_batch.seq_lens_sum is not None
+        n_kv = (
+            forward_batch.seq_lens_sum
+            if cpu_mirrors_fresh
+            else int(self.kv_indptr[bs].item())
+        )
         if n_kv > 0:
             self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
                 self.cuda_graph_kv_indices[:n_kv]
@@ -683,7 +792,7 @@ class TritonAttnBackend(AttentionBackend):
             n_win = int(self.window_kv_indptr[bs].item())
             if n_win > 0:
                 self.cuda_graph_window_kv_indices[:n_win] = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    self._translate_window_kv_indices(
                         self.cuda_graph_window_kv_indices[:n_win]
                     )
                 )
@@ -755,6 +864,11 @@ class TritonAttnBackend(AttentionBackend):
                             self.token_to_kv_pool,
                         )
                     )
+                    # Pools WITH an swa sub-pool were translated in place above
+                    # (unchanged). Only the single-pool fused draft needs v2p.
+                    window_kv_indices = self._translate_window_kv_indices_single_pool(
+                        window_kv_indices
+                    )
                     window_num_kv_splits = torch.empty(
                         (bs,), dtype=torch.int32, device=self.device
                     )
@@ -817,6 +931,11 @@ class TritonAttnBackend(AttentionBackend):
                 forward_batch.req_pool_indices,
                 kv_indices,
             )
+            # Unified pool read path: req_to_token rows hold VIRTUAL ids;
+            # translate to physical for the verify attention read (mirrors the
+            # decode/extend branches — this branch was the missing one).
+            if self._translate_kv_loc is not None:
+                kv_indices = self._translate_kv_loc(kv_indices)
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 # window_kv_offsets gives the start position in custom mask
@@ -834,6 +953,11 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                )
+                # Pools WITH an swa sub-pool were translated in place above
+                # (unchanged). Only the single-pool fused draft needs v2p.
+                window_kv_indices = self._translate_window_kv_indices_single_pool(
+                    window_kv_indices
                 )
 
             custom_mask = spec_info.custom_mask
@@ -889,6 +1013,11 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                )
+                # Pools WITH an swa sub-pool were translated in place above
+                # (unchanged). Only the single-pool fused draft needs v2p.
+                window_kv_indices = self._translate_window_kv_indices_single_pool(
+                    window_kv_indices
                 )
 
             qo_indptr = self.qo_indptr
@@ -1880,6 +2009,48 @@ class TritonMultiStepDraftBackend:
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
+        # Fused draft KV: same pool capability gate as
+        # TritonAttnBackend, but the READ translate is fused INTO
+        # generate_draft_decode_kv_indices (the v2p table rides into the
+        # kernel), so all steps' kv_indices emerge PHYSICAL from the single
+        # metadata-build/replay-prep launch. The v2p mapping is fixed across
+        # the whole spec step (all alloc/free happens scheduler-side before
+        # the forward), so one pass covers every step.
+        full_mea = getattr(
+            model_runner.token_to_kv_pool_allocator, "full_attn_allocator", None
+        )
+        self._kv_v2p_table = (
+            full_mea.virtual_to_physical
+            if (
+                full_mea is not None
+                and hasattr(full_mea, "virtual_to_physical")
+                and not getattr(
+                    model_runner.token_to_kv_pool, "kv_ids_are_virtual", False
+                )
+            )
+            else None
+        )
+        self.cuda_graph_out_cache_loc_phys: Optional[torch.Tensor] = None
+
+    def _per_step_out_cache_loc_phys(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """Translate the pre-allocated multi-step out_cache_loc ONCE and view
+        it per step: `(num_steps, bs*topk)` PHYSICAL write locs. Each step's
+        slice goes into that step's sub-backend metadata — the whole buffer
+        must never reach KVWriteLoc (its __post_init__ silently truncates a
+        mismatched full_loc to step-0's locs: silent wrong-slot writes)."""
+        if self._kv_v2p_table is None or forward_batch.out_cache_loc is None:
+            return None
+        from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
+
+        phys = self.attn_backends[0]._translate_kv_loc(forward_batch.out_cache_loc)
+        return per_step_draft_out_cache_loc(
+            phys,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
+        )
 
     def common_template(
         self,
@@ -1914,6 +2085,8 @@ class TritonMultiStepDraftBackend:
             next_power_of_2(self.speculative_num_steps),
             next_power_of_2(bs),
             self.page_size,
+            v2p_ptr=self._kv_v2p_table,
+            HAS_V2P=self._kv_v2p_table is not None,
         )
 
         if call_fn is None:
@@ -1930,11 +2103,22 @@ class TritonMultiStepDraftBackend:
         kv_indices_width = draft_kv_indices_buffer_width(
             forward_batch.batch_size, self.topk, self.max_context_len
         )
-        kv_indices = torch.empty(
+        # Zeroed, not empty: `generate_draft_decode_kv_indices` writes only the
+        # entries a step actually uses, and the per-step slice below is sized from
+        # `seq_lens_sum` -- an UPPER BOUND when the exact sum isn't on hand. Any
+        # slack is therefore handed to attention as KV slot ids. Uninitialized
+        # there means reading arbitrary slots (another request's KV, or out of
+        # range); zeroed means the slot-0 sink, which is what every other
+        # padding path in the unified pool already targets. The cuda-graph buffer
+        # is zeroed for exactly this reason -- the eager one was not, which is why
+        # only the eager path was ever affected.
+        kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),
             dtype=torch.int64,
             device=self.device,
         )
+        # Fused draft KV: per-step PHYSICAL write locs (see helper docstring).
+        out_cache_loc_phys_steps = self._per_step_out_cache_loc_phys(forward_batch)
 
         def call_fn(i, forward_batch):
             forward_batch.spec_info.kv_indptr = (
@@ -1944,6 +2128,14 @@ class TritonMultiStepDraftBackend:
                 forward_batch.spec_info.kv_indices.clone()
             )
             self.attn_backends[i].init_forward_metadata(forward_batch)
+            if out_cache_loc_phys_steps is not None:
+                # Overwrite the sub-backend's own full-buffer translate
+                # (built from the not-yet-sliced forward_batch.out_cache_loc)
+                # with step i's slice; draft_forward later slices
+                # forward_batch.out_cache_loc identically.
+                self.attn_backends[i].forward_metadata.out_cache_loc_full_physical = (
+                    out_cache_loc_phys_steps[i]
+                )
 
         self.common_template(forward_batch, kv_indices, call_fn)
 
@@ -1971,6 +2163,19 @@ class TritonMultiStepDraftBackend:
                 cuda_graph_num_kv_splits_buf=self.cuda_graph_num_kv_splits,
             )
 
+        if self._kv_v2p_table is not None:
+            # Fused draft KV: capture-stable per-step PHYSICAL write-loc rows.
+            # The decode+spec capture branch builds its ForwardMetadata without
+            # out_cache_loc_full_physical (there is no such buffer on the
+            # plain multi-step path), so the captured KV save would fall back
+            # to the VIRTUAL out_cache_loc; each step's captured metadata
+            # instead references its row here, refilled at every replay-prep.
+            self.cuda_graph_out_cache_loc_phys = torch.zeros(
+                (self.speculative_num_steps, max_bs * self.topk),
+                dtype=torch.int64,
+                device=self.device,
+            )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1984,11 +2189,17 @@ class TritonMultiStepDraftBackend:
                 bs=forward_batch.batch_size,
                 forward_mode=ForwardMode.DECODE,
             )
+            capture_num_token = forward_batch.batch_size * self.topk
 
             def call_fn(i, _forward_batch):
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     inner_fb, in_capture=True
                 )
+                if self.cuda_graph_out_cache_loc_phys is not None:
+                    # Reference the capture-stable row; replay-prep refills it.
+                    self.attn_backends[i].forward_metadata.out_cache_loc_full_physical = self.cuda_graph_out_cache_loc_phys[
+                        i, :capture_num_token
+                    ]
 
             self.common_template(forward_batch, None, call_fn)
         else:
@@ -1999,6 +2210,34 @@ class TritonMultiStepDraftBackend:
             # - kv_indptr buffer (cuda graph and non-cuda graph)
             # - kv_indices buffer (cuda graph only)
             # So we don't need to assign the KV indices inside the attention backend.
+
+            # Fused draft KV: refill the captured per-step write-loc rows.
+            # Derive the live token count from the RAW out_cache_loc (the
+            # runner hands the outer, unpadded fb here); zero the stale tail
+            # first — a smaller replay batch leaves [n:] holding previous
+            # replays' physical ids that the captured store would write; send
+            # them to the slot-0 sink (same rule as
+            # _translate_cuda_graph_shared_pool_locs).
+            if (
+                self.cuda_graph_out_cache_loc_phys is not None
+                and forward_batch.out_cache_loc is not None
+            ):
+                from sglang.srt.speculative.eagle_utils import (
+                    per_step_draft_out_cache_loc,
+                )
+
+                live_bs = forward_batch.out_cache_loc.shape[0] // (
+                    self.topk * self.speculative_num_steps
+                )
+                phys = self.attn_backends[0]._translate_kv_loc(
+                    forward_batch.out_cache_loc
+                )
+                phys_steps = per_step_draft_out_cache_loc(
+                    phys, live_bs, self.topk, self.speculative_num_steps
+                )
+                num_token = live_bs * self.topk
+                self.cuda_graph_out_cache_loc_phys[:, num_token:].zero_()
+                self.cuda_graph_out_cache_loc_phys[:, :num_token].copy_(phys_steps)
 
             # Compute num_kv_splits only once
             num_token = bs * self.topk

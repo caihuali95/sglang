@@ -79,6 +79,25 @@ def fused_sigmoid_gating_delta_rule_update(
 
     grid = (NK, NV, N * HV)
 
+    # Slot/step strides in ELEMENTS from the tensors (must match the shared
+    # kernel's stride-aware signature — see the CUDA wrapper for the full
+    # rationale: the previously hard-coded HV*K*V products mis-address the
+    # page-major envelope's strided pool views). Contiguous pools evaluate to
+    # the same products, so this is a no-op there; it is the ONLY correct
+    # addressing under the envelope.
+    if initial_state_source is not None:
+        stride_h0_slot = initial_state_source.stride(0)
+        assert initial_state_source[0].is_contiguous()
+    else:
+        stride_h0_slot = 0
+    if intermediate_states_buffer is not None:
+        stride_cache_slot = intermediate_states_buffer.stride(0)
+        stride_cache_step = intermediate_states_buffer.stride(1)
+        assert intermediate_states_buffer[0, 0].is_contiguous()
+    else:
+        stride_cache_slot = 0
+        stride_cache_step = 0
+
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -95,7 +114,6 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         intermediate_states_buffer=intermediate_states_buffer,
         intermediate_state_indices=intermediate_state_indices,
-        cache_steps=0 if cache_steps is None else cache_steps,
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
@@ -106,6 +124,9 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_k=stride_k,
         stride_v=stride_v,
         stride_b=stride_b,
+        stride_h0_slot=stride_h0_slot,
+        stride_cache_slot=stride_cache_slot,
+        stride_cache_step=stride_cache_step,
         NP2_T=NP2_T,
         B=B,
         H=H,

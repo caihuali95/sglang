@@ -15,7 +15,7 @@ hold no allocator/ownership state. ``anchor_bytes`` is the byte offset of the
 pool's region inside the raw buffer (0 for a standalone pool).
 """
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 
@@ -60,32 +60,46 @@ def build_page_major_mha_views(
     page_size: int,
     num_pages: int,
     anchor_bytes: int = 0,
+    page_stride_bytes: Optional[int] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Per-layer K/V views over ``raw`` in the page-major layer-major layout.
 
     Each returned view is 4-D ``(num_pages, page_size, head_num, head_dim*)``
     with constant strides:
 
-        stride[0] = page_bytes / itemsize     # next page
+        stride[0] = page_stride_bytes / itemsize  # next page (defaults to this
+                                                  # region's own page_bytes)
         stride[1] = k_row_bytes / itemsize    # next slot within layer L's K block
         stride[2] = head_dim                  # next head
         stride[3] = 1                         # next element
 
     V is analogous with ``v_row_bytes`` / ``v_head_dim``. A token id ``t`` reads
     page ``t // page_size``, slot ``t % page_size``.
+
+    Fused slots : when several MHA regions share one page block
+    (``[host KV·ps | pad·ps | draft KV·ps]``), pass the FUSED block size as
+    ``page_stride_bytes`` (same stride[0] for every region) and the region's
+    base offset within the block as ``anchor_bytes`` — offsets are additive,
+    so ``anchor_bytes`` serves both roles.
     """
     itemsize = store_dtype.itemsize
     k_row_bytes = head_num * head_dim * itemsize
     v_row_bytes = head_num * v_head_dim * itemsize
     entry_bytes = layer_num * (k_row_bytes + v_row_bytes)
     page_bytes = page_size * entry_bytes
+    if page_stride_bytes is None:
+        page_stride_bytes = page_bytes
+    assert page_stride_bytes >= page_bytes, (
+        f"page_stride_bytes ({page_stride_bytes}) must cover this region's "
+        f"page_bytes ({page_bytes})"
+    )
     assert anchor_bytes % itemsize == 0
     assert k_row_bytes % itemsize == 0
     assert v_row_bytes % itemsize == 0
-    assert page_bytes % itemsize == 0
+    assert page_stride_bytes % itemsize == 0
 
     as_dtype_view = raw.view(store_dtype)
-    stride_page = page_bytes // itemsize
+    stride_page = page_stride_bytes // itemsize
     stride_tok_k = k_row_bytes // itemsize
     stride_tok_v = v_row_bytes // itemsize
 
