@@ -691,10 +691,17 @@ class ModelRunnerKVCacheMixin:
         # (its attention backends skip the v2p translate; see
         # TritonAttnBackend), so it must span the whole virtual-id space.
         if self.is_draft_worker and self.token_to_kv_pool_allocator is not None:
+            from sglang.srt.mem_cache.multi_ended_allocator import MultiEndedAllocator
+
             full_mea = getattr(
                 self.token_to_kv_pool_allocator, "full_attn_allocator", None
             )
-            if full_mea is not None:
+            # Gate on the allocator TYPE, not attribute presence: the BASELINE
+            # SWA allocator also exposes `full_attn_allocator`, but it is a
+            # plain TokenToKVPoolAllocator with no virtual-id space (and no
+            # `num_pages`). Only the unified pool's MultiEndedAllocator mints
+            # the virtual ids this resize exists for.
+            if isinstance(full_mea, MultiEndedAllocator):
                 virtual_capacity = full_mea.num_pages * full_mea.page_size
                 if virtual_capacity > self.max_total_num_tokens:
                     logger.info(

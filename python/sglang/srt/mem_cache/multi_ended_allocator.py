@@ -1825,6 +1825,15 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 seq_lens, seq_lens_cpu, last_loc
             )
 
+    def move_accept_kv(self, tgt_locs: torch.Tensor, src_locs: torch.Tensor) -> None:
+        """Relocate accepted spec tokens' KV inside the full pool: VIRTUAL token
+        ids in, physical move via the pure-store pool API (which is
+        physical-only by design)."""
+        with record_function("UnifiedMambaAlloc.move_accept_kv"):
+            tgt_phys = self.full_attn_allocator.translate_kv_loc(tgt_locs)
+            src_phys = self.full_attn_allocator.translate_kv_loc(src_locs)
+            self.full_attn_allocator._kvcache.move_kv_cache(tgt_phys, src_phys)
+
     def translate_kv_loc(
         self,
         loc: torch.Tensor,
@@ -2187,6 +2196,23 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
     def get_kvcache(self):
         return self._kvcache
+
+    def move_accept_kv(self, tgt_locs: torch.Tensor, src_locs: torch.Tensor) -> None:
+        """Relocate accepted spec tokens' KV: VIRTUAL token ids in; full-physical
+        move + swa-physical move (mirrors the non-unified
+        ``SWAKVPool.move_kv_cache`` full+window delegation). Tombstoned window
+        slots translate to the slot-0 sink, so aged-out moves land in reserved
+        padding — same clamp semantics as the read path."""
+        with record_function("UnifiedSWAAlloc.move_accept_kv"):
+            fa = self.full_attn_allocator
+            fa._kvcache.move_kv_cache(
+                fa.translate_kv_loc(tgt_locs), fa.translate_kv_loc(src_locs)
+            )
+            sa = self.swa_attn_allocator
+            sa._kvcache.move_kv_cache(
+                self.translate_loc_from_full_to_swa(tgt_locs).to(torch.int64),
+                self.translate_loc_from_full_to_swa(src_locs).to(torch.int64),
+            )
 
     def translate_kv_loc(
         self,

@@ -2359,10 +2359,47 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
             "(TODO: split token ids into page/slot for the 4-D index)."
         )
 
-    def set_kv_buffer_prefix_valid(self, *args, **kwargs):
-        raise NotImplementedError(
-            "prefix-valid commit is unsupported under the page-major layout "
-            "(_set_kv_buffer_prefix_valid_impl assumes 3-D contiguous + row_dim)."
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        # The tiled prefix kernel (_set_kv_buffer_prefix_valid_impl) assumes a
+        # per-layer 3-D contiguous row region; the 4-D page-major envelope has
+        # none. Route through the layout-agnostic strategy the base class uses
+        # on its non-CUDA path: select the valid prefix rows and hand them to
+        # the pool's own set_kv_buffer (page/slot-aware). One extra gather per
+        # commit — DFLASH-only, off the common decode path.
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if loc_2d.ndim != 2:
+            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+            raise ValueError(
+                "commit_lens must match loc_2d batch size: "
+                f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+            )
+        row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
+        valid_idx = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).flatten()
+        if valid_idx.numel() == 0:
+            return
+        self.set_kv_buffer(
+            layer,
+            loc_2d.reshape(-1).index_select(0, valid_idx),
+            cache_k.index_select(0, valid_idx),
+            cache_v.index_select(0, valid_idx),
+            k_scale,
+            v_scale,
+            layer_id_override=layer_id,
         )
 
 

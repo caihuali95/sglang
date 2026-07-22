@@ -404,6 +404,41 @@ class TritonAttnBackend(AttentionBackend):
         )
         return kv_indptr
 
+    def _translate_kv_indices_ragged(
+        self,
+        kv_indices: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        bs: int,
+        filled_len: Optional[int],
+    ) -> torch.Tensor:
+        """Virtual->physical translate of a ragged kv_indices buffer (unified
+        pool read path); no-op when translation is off (baseline / draft).
+
+        `kv_indices` is frequently OVER-ALLOCATED: when the CPU token total is
+        unavailable (gpu_only decode, and every spec TARGET_VERIFY batch, whose
+        `seq_lens_sum` is None), the caller sizes it to `bs * max_context_len`
+        with `torch.empty`, leaving the tail past the ragged frontier
+        UNINITIALIZED. The attention kernel reads only `[0, kv_indptr[bs])` via
+        the indptr, so that tail is harmless to it -- but `index_select` touches
+        every element, and an uninitialized tail id >= the v2p length trips a
+        device-side assert ("scatter gather kernel index out of bounds"). So
+        translate ONLY the `[0, filled_len)` prefix that
+        `_fill_kv_indptr_and_indices` actually wrote, and return it (downstream
+        reads are indptr-bounded, so a shorter buffer is equivalent).
+
+        `filled_len` is the exact ragged length when the caller already knows it
+        without a sync (`forward_batch.seq_lens_sum` / a CPU prefix-sum); None
+        falls back to reading `kv_indptr[bs]` (one D2H sync -- only reached on
+        mirror-less batches, and strictly better than the crash it replaces).
+        Translating the real prefix keeps the check honest: a genuinely
+        out-of-range id inside the written region still asserts.
+        """
+        if self._translate_kv_loc is None:
+            return kv_indices
+        if filled_len is None:
+            filled_len = int(kv_indptr[bs].item())
+        return self._translate_kv_loc(kv_indices[:filled_len])
+
     def _update_decode_kv_buffers(
         self,
         bs: int,
@@ -842,10 +877,14 @@ class TritonAttnBackend(AttentionBackend):
                         self.kv_indptr,
                     )
                 else:
-                    # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
-                    seq_lens_sum = forward_batch.seq_lens_sum
-                    if seq_lens_sum is None:
-                        seq_lens_sum = bs * self.max_context_len
+                    # gpu_only: seq_lens_sum may be None; over-allocate is safe
+                    # (ragged write + prefix-only translate).
+                    real_total = forward_batch.seq_lens_sum
+                    seq_lens_sum = (
+                        real_total
+                        if real_total is not None
+                        else bs * self.max_context_len
+                    )
                     kv_indices = torch.empty(
                         seq_lens_sum, dtype=torch.int64, device=self.device
                     )
@@ -855,8 +894,9 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.req_pool_indices,
                         kv_indices,
                     )
-                    if self._translate_kv_loc is not None:
-                        kv_indices = self._translate_kv_loc(kv_indices)
+                    kv_indices = self._translate_kv_indices_ragged(
+                        kv_indices, kv_indptr, bs, real_total
+                    )
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
@@ -927,13 +967,32 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
-            seq_lens_sum = forward_batch.seq_lens_sum
-            if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
+            # gpu_only: seq_lens_sum is None for spec TARGET_VERIFY batches
+            # (prepare_for_verify builds them without it) -> over-allocate +
+            # prefix-only translate.
+            real_total = forward_batch.seq_lens_sum
+            seq_lens_sum = (
+                real_total
+                if real_total is not None
+                else bs * self.max_context_len
             )
+            if self._translate_kv_loc is not None and real_total is not None:
+                # TARGET_VERIFY's seq_lens_sum may be an UPPER BOUND, not the
+                # exact ragged total: DFLASH publishes host seq_lens as
+                # prefix + one verify block while the GPU seq_lens (which
+                # drive the ragged fill) stay at the committed prefix
+                # (dflash_worker_v2 "Verify host bound"). The translate below
+                # covers [0, real_total), so a [filled, real_total)
+                # uninitialized tail would device-assert in index_select.
+                # Zero-init: virtual id 0 is always in-range (sink slot) and
+                # the attention read is kv_indptr-bounded regardless.
+                kv_indices = torch.zeros(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
+                )
+            else:
+                kv_indices = torch.empty(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
+                )
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs,
                 forward_batch.seq_lens,
@@ -942,9 +1001,12 @@ class TritonAttnBackend(AttentionBackend):
             )
             # Unified pool read path: req_to_token rows hold VIRTUAL ids;
             # translate to physical for the verify attention read (mirrors the
-            # decode/extend branches — this branch was the missing one).
-            if self._translate_kv_loc is not None:
-                kv_indices = self._translate_kv_loc(kv_indices)
+            # decode/extend branches — this branch was the missing one). Only the
+            # ragged prefix is translated: the over-allocated tail is
+            # uninitialized and would trip an index_select device assert.
+            kv_indices = self._translate_kv_indices_ragged(
+                kv_indices, kv_indptr, bs, real_total
+            )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 # window_kv_offsets gives the start position in custom mask
@@ -989,11 +1051,17 @@ class TritonAttnBackend(AttentionBackend):
                     self.kv_indptr,
                 )
             else:
-                # gpu_only leaves _cpu unset; over-allocate is safe (ragged write).
+                # gpu_only leaves _cpu unset; over-allocate is safe (ragged write
+                # + prefix-only translate).
                 if forward_batch.extend_prefix_lens_cpu is not None:
-                    kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
+                    real_total = sum(forward_batch.extend_prefix_lens_cpu)
                 else:
-                    kv_indices_len = bs * self.max_context_len
+                    real_total = None
+                kv_indices_len = (
+                    real_total
+                    if real_total is not None
+                    else bs * self.max_context_len
+                )
                 kv_indices = torch.empty(
                     kv_indices_len,
                     dtype=torch.int64,
@@ -1005,8 +1073,9 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     kv_indices,
                 )
-                if self._translate_kv_loc is not None:
-                    kv_indices = self._translate_kv_loc(kv_indices)
+                kv_indices = self._translate_kv_indices_ragged(
+                    kv_indices, kv_indptr, bs, real_total
+                )
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 (
                     window_kv_indptr,
