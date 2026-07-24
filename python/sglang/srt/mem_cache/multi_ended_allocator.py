@@ -1109,6 +1109,34 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 return
             self._inflight_forward = (forward_done, out_cache_loc_virtual)
 
+    def set_inflight_forward_pending(
+        self, out_cache_loc_virtual: Optional[torch.Tensor]
+    ) -> None:
+        """Register a forward's write-set BEFORE its `forward_done` event exists.
+
+        `set_inflight_forward` can only be called once the whole forward has been
+        enqueued (the event must record after the last kernel). That is too late
+        for a SPECULATIVE step: the spec worker allocates, frees and moves KV
+        *inside* its own call, and an allocation shortfall there runs
+        `_flush(urgent=True)`. At that moment the slot still holds the PREVIOUS
+        forward's entry — whose event has already fired, so the write-set
+        materializes as empty and the flush is free to relocate the pages the
+        in-progress forward is reading and writing.
+
+        Registering with `event=None` marks the forward as in flight but NOT yet
+        signalled: every consumer below treats a `None` event as "cannot be
+        proven complete", so its pages stay out of the move candidates and its
+        protection is never dropped. `set_inflight_forward` replaces the entry
+        with the real event once the forward is fully enqueued.
+        """
+        with record_function("MultiEndedAlloc.set_inflight_forward_pending"):
+            if not self.lazy_compaction:
+                return
+            if out_cache_loc_virtual is None or out_cache_loc_virtual.numel() == 0:
+                self._inflight_forward = None
+                return
+            self._inflight_forward = (None, out_cache_loc_virtual)
+
     def _materialize_inflight_write_set(self) -> Optional[Set[int]]:
         """Materialize the in-flight forward's write-set (physical PAGE ids it is
         about to write), or `None` if no in-flight forward / already completed.
@@ -1120,8 +1148,11 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return None
         event, oclv = inflight
         # Forward completed → no write race. Clear so later flushes in the same
-        # tick don't re-check the fired event.
-        if event.query():
+        # tick don't re-check the fired event. `event is None` means the forward
+        # is registered but not yet fully enqueued (see
+        # `set_inflight_forward_pending`): it cannot be proven complete, so keep
+        # protecting its pages.
+        if event is not None and event.query():
             self._inflight_forward = None
             return None
         # `oclv` is non-None here (set_inflight_forward clears the slot otherwise).
@@ -1334,6 +1365,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         to MOVE (write settled) and REUSE (read settled). The event is recorded
         after the WHOLE forward, so one wait covers both hazards; drop the write-set.
         """
+        inflight = self._inflight_forward
+        if inflight is not None and inflight[0] is None:
+            # Registered but not yet fully enqueued: `_latest_forward_done_event`
+            # belongs to a PREVIOUS forward, so waiting on it proves nothing about
+            # this one. Keep the write-set — dropping it here would hand the
+            # in-progress forward's pages to the move walk.
+            return
         ev = self._latest_forward_done_event
         if ev is not None:
             torch.cuda.current_stream().wait_event(ev)
@@ -1451,10 +1489,15 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                         dsts.clear()
                         v_moveds.clear()
                         inflight = self._inflight_forward
-                        if inflight is not None:
+                        if inflight is not None and inflight[0] is not None:
                             torch.cuda.current_stream().wait_event(inflight[0])
                             self._inflight_forward = None
-                        write_set = set()  # forward drained → no race
+                            write_set = set()  # forward drained → no race
+                        elif inflight is None:
+                            write_set = set()  # nothing in flight → no race
+                        # else: registered but not yet enqueued (event None) —
+                        # cannot drain it, so KEEP write_set and let the walk
+                        # continue to skip its pages.
                         latest_event = None
                         # DO NOT reset cursor/j_cursor: rewinding would re-pick the
                         # just-committed srcs (now p2v=-1, not in holes_cpu) and
@@ -1896,6 +1939,19 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
     # -- Lazy compaction hooks --
+
+    def on_forward_begin(self, out_cache_loc: Optional[torch.Tensor]) -> None:
+        """Pre-register the upcoming forward's write-set (no event yet).
+
+        Closes the window in which a speculative worker's own allocations can
+        trigger `_flush` while only the previous, already-completed forward is
+        registered. Mirrors `set_inflight_forward`'s split: full side gets the
+        write-set, mamba side is state-written (not via `set_kv_buffer`) so it
+        registers None, exactly as the event-carrying path does.
+        """
+        with record_function("UnifiedMambaAlloc.on_forward_begin"):
+            self.full_attn_allocator.set_inflight_forward_pending(out_cache_loc)
+            self.mamba_allocator.set_inflight_forward_pending(None)
 
     def on_forward_launched(
         self,
@@ -2468,6 +2524,16 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.free_group = []
 
     # -- Lazy compaction hooks --
+
+    def on_forward_begin(self, out_cache_loc: Optional[torch.Tensor]) -> None:
+        """Pre-register the upcoming forward's write-set (no event yet) on BOTH
+        sub-pools — the forward writes both sides per new token, so both need
+        protection during the speculative worker's own alloc/free/move traffic.
+        See the Mamba composite's hook for why this window exists.
+        """
+        with record_function("UnifiedSWAAlloc.on_forward_begin"):
+            self.full_attn_allocator.set_inflight_forward_pending(out_cache_loc)
+            self.swa_attn_allocator.set_inflight_forward_pending(out_cache_loc)
 
     def on_forward_launched(
         self,

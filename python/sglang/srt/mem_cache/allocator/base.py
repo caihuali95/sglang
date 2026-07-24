@@ -75,6 +75,22 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         if self.free_group:
             self.free(torch.cat(self.free_group))
 
+    def on_forward_begin(self, out_cache_loc: Optional[torch.Tensor]) -> None:
+        """Lifecycle hook: a forward is ABOUT to be built and launched.
+
+        Called by the scheduler on the scheduling thread immediately BEFORE the
+        worker runs, with the write-location tensor the forward will use. Unlike
+        ``on_forward_launched`` there is no completion event yet — the forward's
+        kernels have not been enqueued.
+
+        Default: no-op. Allocators that relocate pages need this because a
+        SPECULATIVE step allocates, frees and moves KV *inside* the worker call:
+        an allocation shortfall there can trigger compaction while the only
+        registered forward is the previous (already-completed) one, so the
+        in-progress forward's pages look free to move. Overriding this closes
+        that window; ``on_forward_launched`` then supplies the real event.
+        """
+
     def on_forward_launched(
         self,
         forward_stream: torch.Stream,

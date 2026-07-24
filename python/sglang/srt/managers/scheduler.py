@@ -3199,6 +3199,24 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    # Cross-stream lifetime for the spec-v2 seq_lens future.
+                    # resolve_seq_lens_cpu (above) gathers batch.seq_lens on
+                    # schedule_stream; this forward reads it on forward_stream.
+                    # wait_stream orders the EXECUTION but not the tensor's
+                    # lifetime: when the next iteration rebinds batch.seq_lens
+                    # its last reference drops, and the caching allocator is
+                    # free to reclaim the block on schedule_stream's timeline
+                    # while this forward is still reading it. Under
+                    # expandable_segments the reclaim can UNMAP the page,
+                    # turning the read into an illegal access. record_stream
+                    # ties the block's lifetime to the consuming stream, so the
+                    # allocator defers reuse until this forward has drained.
+                    if (
+                        not batch.spec_algorithm.is_none()
+                        and batch.seq_lens is not None
+                        and batch.seq_lens.is_cuda
+                    ):
+                        batch.seq_lens.record_stream(self.forward_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
@@ -3222,6 +3240,16 @@ class Scheduler(
                         )
 
                         # FIXME: pp is not compatible with overlap
+                        # Allocator lifecycle: pre-register this batch's pages
+                        # BEFORE the worker runs. A speculative step allocates,
+                        # frees and moves KV inside the call below, and an
+                        # allocation shortfall there runs an urgent flush while
+                        # the only registered forward is the previous (already
+                        # completed) one — leaving these pages free to relocate
+                        # underneath it. Base no-op for every other allocator.
+                        self.token_to_kv_pool_allocator.on_forward_begin(
+                            batch.out_cache_loc
+                        )
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
@@ -3278,8 +3306,18 @@ class Scheduler(
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
+                # Allocator lifecycle (see the overlap branch above): the
+                # speculative worker does its own alloc/free/move traffic inside
+                # the call, so its pages must be registered BEFORE it runs and
+                # the completion event supplied after. This path previously did
+                # neither, leaving compaction with no write-race protection at
+                # all on the non-overlap speculative schedule.
+                self.token_to_kv_pool_allocator.on_forward_begin(batch.out_cache_loc)
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(batch)
+                self.token_to_kv_pool_allocator.on_forward_launched(
+                    self.forward_stream, batch.out_cache_loc
+                )
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input
