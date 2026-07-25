@@ -1121,6 +1121,21 @@ class HybridLinearAttnBackend(AttentionBackend):
             ]
         )
 
+        # `mamba_track_indices` arrives VIRTUAL: every spec commit caller
+        # (spec_utils + dflash_worker_v2) passes the ScheduleBatch field, which
+        # set_mamba_track_indices_from_reqs rebuilds from allocator-minted
+        # ping-pong track ids. The scatters below address PHYSICAL state views,
+        # so translate at this seam — the forward path's equivalent translate
+        # (init_forward_metadata) only rebinds the ForwardBatch copy and never
+        # reaches this call. Identity for the non-unified pool. Untranslated
+        # ids are in-range physical slots, so the miss is SILENT: track states
+        # land in the wrong slot once eviction/compaction makes v2p diverge
+        # from identity — the radix×spec×mamba accuracy collapse.
+        if mamba_track_indices is not None:
+            mamba_track_indices = self.linear_attn_backend._translate_mamba_indices(
+                mamba_track_indices
+            )
+
         mamba_caches = (
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
