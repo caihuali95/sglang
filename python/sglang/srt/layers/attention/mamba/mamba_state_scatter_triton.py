@@ -183,8 +183,12 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     # Load destination index
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
 
-    # Source index is just the request index itself
-    src_idx = pid_req
+    # Source index is the request index itself. MUST be int64 BEFORE it
+    # multiplies src_req_stride: the intermediate-state slot stride is on the
+    # order of 1e8 ELEMENTS, so an i32 product wraps negative once src_idx (the
+    # verify-batch request index) reaches ~16 — an illegal address when the
+    # wrap lands outside the allocation, silent state corruption when inside.
+    src_idx = pid_req.to(tl.int64)
 
     # Bounds check to avoid illegal memory access
     if not (
@@ -364,7 +368,10 @@ def _fused_conv_window_scatter_with_mask_kernel(
         return
 
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
-    src_idx = pid_req
+    # int64 before the src_req_stride multiply — same i32-wrap hazard as the
+    # ssm kernel above; the deduped conv-window view's slot stride is even
+    # larger, wrapping from src_idx ~8.
+    src_idx = pid_req.to(tl.int64)
 
     if not (
         (dst_idx >= 0)
