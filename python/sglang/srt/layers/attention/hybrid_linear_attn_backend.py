@@ -997,6 +997,21 @@ class HybridLinearAttnBackend(AttentionBackend):
     def get_cpu_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cpu_graph_seq_len_fill_value()
 
+    def get_verify_buffers_to_fill_after_draft(self):
+        # The tree mask + position buffers live on the full-attention backend:
+        # verify attention runs there, and the linear/mamba layers do not use a
+        # tree mask. Without this delegation the hybrid backend inherits the base
+        # [None, None], which forces build_tree_kernel_efficient onto its heap
+        # fallback -> a worst-case (bs * max_context_len)-sized mask that overflows
+        # the fixed cuda-graph custom-mask buffer during target verify. Delegating
+        # writes the mask straight into the preallocated buffer instead.
+        return self.full_attn_backend.get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        self.full_attn_backend.update_verify_buffers_to_fill_after_draft(
+            spec_info, cuda_graph_bs
+        )
+
     def forward_decode(
         self,
         layer: RadixAttention,
