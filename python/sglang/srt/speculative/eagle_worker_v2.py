@@ -611,6 +611,55 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.speculative_num_steps,
         )
 
+        # Benign-initialize the draft's speculative KV region before the tree
+        # steps run. The step-0 tree attention reads the whole
+        # [seq_len, seq_len + topk*num_steps) span, including tree nodes that are
+        # masked out (not-yet-expanded branches / future steps). A fresh KV pool
+        # holds zeros there, so a masked node contributes cleanly; but under the
+        # unified FUSED draft pool with the radix cache, these physical slots
+        # carry a prior occupant's uninitialized draft bytes (near-bf16-max or
+        # NaN), and a NaN in a masked node still poisons the softmax
+        # (NaN + -inf = NaN), producing NaN draft logits. Zero the slots this
+        # forward writes so any position it does not (re)write reads as zeros --
+        # the same fresh-pool behavior the chunked-prefill path gets for free.
+        # Only the fused draft pool aliases foreign slots this way; a private
+        # (baseline) draft pool is untouched.
+        _draft_full = getattr(
+            self.draft_runner.token_to_kv_pool,
+            "full_kv_pool",
+            self.draft_runner.token_to_kv_pool,
+        )
+        # Restrict to tree drafting (topk > 1). Only a tree's step-0 attention
+        # reads masked, not-yet-written speculative slots; a chain draft
+        # (topk == 1) writes every slot it later reads, so it needs no
+        # pre-zeroing. Tree drafting is also confined to page_size == 1 (the
+        # unified pool rejects topk > 1 at page_size > 1), where out_cache_loc
+        # indexes the draft KV buffer directly. At page_size > 1 (chain only)
+        # those ids are virtual and would run past the physical buffer, so this
+        # guard also keeps the index_copy_ below in bounds.
+        if self.topk > 1 and type(_draft_full).__name__ == "UnifiedDraftKVPool":
+            # Runs inside the draft's CUDA graph capture, so every op here must be
+            # capturable:
+            #   * clamp(min=0) maps any -1 padding to slot 0 (a reserved sink slot
+            #     whose draft region is unused, so zeroing it is harmless). A
+            #     fixed-shape clamp stays capturable; a boolean filter (`[mask]`)
+            #     has a data-dependent size and is illegal.
+            #   * .long() because the scatter index must be int64; the ps>1 tree
+            #     layout can produce int32 out_cache_loc (a plain GPU cast,
+            #     capture-safe; a no-op when already int64).
+            #   * index_copy_ scatters a device-side zeros source entirely on the
+            #     GPU -- the same primitive the mamba/GDN state writes use under
+            #     capture. index_fill_(..., 0) and `kbuf[idx] = 0` instead
+            #     materialize a host scalar tensor for the fill value and copy it
+            #     to the GPU, which capture forbids ("Cannot copy between CPU and
+            #     CUDA tensors during CUDA graph capture").
+            _spec_slots = out_cache_loc.reshape(-1).clamp(min=0).long()
+            _n = _spec_slots.numel()
+            for _kb in _draft_full.k_buffer:
+                _kb.index_copy_(0, _spec_slots, _kb.new_zeros((_n, *_kb.shape[1:])))
+            for _vb in _draft_full.v_buffer:
+                _vb.index_copy_(0, _spec_slots, _vb.new_zeros((_n, *_vb.shape[1:])))
+
         # Return values
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
@@ -723,7 +772,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return parent_list, top_scores_index, draft_tokens, draft_probs
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            score_list,
+            token_list,
+            parents_list,
+            self.speculative_num_draft_tokens,
+            self.topk,
         )
 
         draft_probs = (

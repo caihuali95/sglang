@@ -103,7 +103,12 @@ __global__ void build_tree_efficient(
     retrive_index[bid * draft_token_num] = bid * draft_token_num;
   } else {
     int cur_position = tid - 1;
-    while (true) {
+    // Bounded ancestor walk: on consistent input the parent depth strictly
+    // decreases, so draft_token_num iterations always suffice. The explicit
+    // bound plus the search-miss break turn a corrupted selected_index (e.g.
+    // NaN draft scores) into a truncated attention mask instead of an
+    // out-of-row read or an infinite loop that wedges the device.
+    for (int walk = 0; walk < draft_token_num; ++walk) {
       position += 1;
       tree_mask[token_tree_idx + cur_position] = true;
       int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + cur_position] / topk;
@@ -112,11 +117,17 @@ __global__ void build_tree_efficient(
       }
 
       int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-      for (cur_position = 0; cur_position < draft_token_num; ++cur_position) {
-        if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) {
+      int next_position = -1;
+      for (int j = 0; j < draft_token_num - 1; ++j) {
+        if (selected_index[bid * (draft_token_num - 1) + j] == token_idx) {
+          next_position = j;
           break;
         }
       }
+      if (next_position < 0) {
+        break;
+      }
+      cur_position = next_position;
     }
     positions[bid * draft_token_num + tid] = position + seq_len;
   }
@@ -190,7 +201,10 @@ __global__ void build_tree_efficient_partial_packed(
     retrive_index[bid * draft_token_num] = bid * draft_token_num;
   } else {
     int cur_position = tid - 1;
-    while (true) {
+    // Bounded ancestor walk — same hardening as build_tree_efficient above:
+    // corrupted selected_index must degrade to a truncated mask, never an
+    // out-of-row read or a device-wedging infinite loop.
+    for (int walk = 0; walk < draft_token_num; ++walk) {
       position += 1;
       int byte_idx = (cur_position + 1) / 8;
       int bit_idx = (cur_position + 1) % 8;
@@ -201,11 +215,17 @@ __global__ void build_tree_efficient_partial_packed(
       }
 
       int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-      for (cur_position = 0; cur_position < draft_token_num; ++cur_position) {
-        if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) {
+      int next_position = -1;
+      for (int j = 0; j < draft_token_num - 1; ++j) {
+        if (selected_index[bid * (draft_token_num - 1) + j] == token_idx) {
+          next_position = j;
           break;
         }
       }
+      if (next_position < 0) {
+        break;
+      }
+      cur_position = next_position;
     }
     positions[bid * draft_token_num + tid] = position + seq_len;
   }

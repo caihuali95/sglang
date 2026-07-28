@@ -590,7 +590,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             hidden_states = logits_output.hidden_states
 
         return organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            score_list,
+            token_list,
+            parents_list,
+            self.speculative_num_draft_tokens,
+            self.topk,
         )
 
     def draft_extend(self):
