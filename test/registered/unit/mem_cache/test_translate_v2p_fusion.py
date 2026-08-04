@@ -166,6 +166,104 @@ class TestTranslateV2PFusion(unittest.TestCase):
         self.assertEqual(got.dtype, torch.int64)
 
 
+class TestInt32SwaOutput(unittest.TestCase):
+    """The SWA read path takes int32 ids, so the same kernel must narrow on
+    store. Page ids are pool-bounded, so the post-clamp value always fits."""
+
+    def _v2p(self, num_pages):
+        return torch.tensor(
+            [num_pages - p for p in range(num_pages)] + [-1],
+            dtype=torch.int64,
+            device=_DEV,
+        )
+
+    def test_int32_out_dtype_matches_int64_values(self):
+        for page_size in (1, 8):
+            with self.subTest(page_size=page_size):
+                v2p = self._v2p(16)
+                virt = torch.tensor(
+                    [0, page_size, 5 * page_size + (page_size - 1)],
+                    dtype=torch.int64,
+                    device=_DEV,
+                )
+                wide = translate_v2p(
+                    virt, v2p, page_size=page_size, page_stride=page_size
+                )
+                narrow = translate_v2p(
+                    virt,
+                    v2p,
+                    page_size=page_size,
+                    page_stride=page_size,
+                    out_dtype=torch.int32,
+                )
+                self.assertEqual(narrow.dtype, torch.int32)
+                self.assertTrue(torch.equal(narrow.to(torch.int64), wide))
+
+    def test_int32_out_buffer_is_written_in_place(self):
+        page_size = 4
+        v2p = self._v2p(16)
+        virt = torch.tensor([0, 4, 9], dtype=torch.int64, device=_DEV)
+        out = torch.full((3,), -999, dtype=torch.int32, device=_DEV)
+        ret = translate_v2p(
+            virt,
+            v2p,
+            page_size=page_size,
+            page_stride=page_size,
+            out=out,
+        )
+        self.assertIs(ret, out)
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertTrue(
+            torch.equal(
+                out.to(torch.int64),
+                _reference(virt, v2p, page_size=page_size, page_stride=page_size),
+            )
+        )
+
+
+class TestPoolLevelSwaTranslate(unittest.TestCase):
+    """Regressions on `UnifiedSWAKVPool.translate_loc_from_full_to_swa`, driven
+    through the real factory bundle (CPU)."""
+
+    def _bundle(self):
+        from test_unified_byte_budget_sizing import _swa_factory
+
+        return _swa_factory()
+
+    def test_tombstoned_entry_lands_on_the_sink_not_negative(self):
+        """Regression: the POOL-level translate had no tombstone clamp while
+        the composite's did — a tombstoned v2p_swa entry produced a NEGATIVE
+        id, which a captured graph reads out of bounds. It must land on the
+        padding sink like every other translate."""
+        bundle = self._bundle()
+        allocator = bundle.token_to_kv_pool_allocator
+        kvcache = bundle.token_to_kv_pool
+        v = allocator.alloc(8)
+        self.assertIsNotNone(v)
+        allocator.free_swa(v[:4])  # sliding window released -> tombstones
+        got = kvcache.translate_loc_from_full_to_swa(v)
+        self.assertEqual(got.dtype, torch.int32)
+        self.assertTrue(bool((got[:4] == 0).all()), got.tolist())  # sink
+        self.assertTrue(bool((got[4:] > 0).all()), got.tolist())  # live
+
+    def test_out_int64_written_in_place_without_narrowing_round_trip(self):
+        """The cuda-graph window refill passes its INT64 capture-stable buffer
+        as out= — the result must land there in the buffer's dtype, in place
+        (the old path narrowed to int32 only to be widened again by the
+        assignment)."""
+        bundle = self._bundle()
+        allocator = bundle.token_to_kv_pool_allocator
+        kvcache = bundle.token_to_kv_pool
+        v = allocator.alloc(4)
+        self.assertIsNotNone(v)
+        want = kvcache.translate_loc_from_full_to_swa(v).to(torch.int64)
+        buf = v.clone()  # int64, aliasing-style in-place like the refill
+        ret = kvcache.translate_loc_from_full_to_swa(buf, out=buf)
+        self.assertIs(ret, buf)
+        self.assertEqual(buf.dtype, torch.int64)
+        self.assertTrue(torch.equal(buf, want))
+
+
 class TestAllocatorTranslateSurface(unittest.TestCase):
     """The allocator methods must keep their published contracts on top of the
     fused kernel: dense == plain when the multiplier is 1, out= honoured."""

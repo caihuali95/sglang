@@ -33,6 +33,7 @@ import triton
 from torch.profiler import record_function
 
 from sglang.kernels.ops.kvcache.cache_move import store_cache_4d_kernel
+from sglang.kernels.ops.memory.virtual_slot import translate_v2p
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.mem_cache.layout.page_major import (
     build_dense_mla_views,
@@ -1401,19 +1402,38 @@ class UnifiedSWAKVPool(SWAKVPool):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
         return  # no-op in shared mode (the swa-side v2p IS the mapping)
 
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        """Virtual token ids -> swa-physical token ids (int32)."""
+    def translate_loc_from_full_to_swa(
+        self,
+        kv_indices: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ):
+        """Virtual token ids -> swa-physical token ids.
+
+        One fused kernel (`translate_v2p`) for the page math, matching the
+        composite allocator's method of the same name — including its
+        tombstone clamp, which this path previously lacked: a tombstoned (-1)
+        v2p_swa entry produced a NEGATIVE id that a captured graph would read
+        out of bounds. Both now route it to the reserved padding sink (0).
+
+        Returns int32 (the non-shared API's width) unless ``out=`` is given,
+        in which case the result is written in `out`'s dtype — the cuda-graph
+        window buffer is int64, so that path no longer round-trips through
+        int32 just to be widened again by the assignment.
+        """
         assert self._swa_allocator is not None, (
             "UnifiedSWAKVPool.translate_loc_from_full_to_swa called before "
             "attach_allocators"
         )
         ps = self._swa_allocator.page_size
-        if ps == 1:
-            return self._swa_allocator.virtual_to_physical[kv_indices].to(torch.int32)
-        virt_pages = kv_indices // ps
-        offsets = kv_indices % ps
-        swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
-        return (swa_phys_pages * ps + offsets).to(torch.int32)
+        return translate_v2p(
+            kv_indices,
+            self._swa_allocator.virtual_to_physical,
+            page_size=ps,
+            page_stride=ps,
+            out=out,
+            out_dtype=torch.int32,
+        )
 
     def get_state_buf_infos(self):
         return self.swa_kv_pool.get_contiguous_buf_infos()

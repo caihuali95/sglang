@@ -2377,31 +2377,19 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
                 f"{tuple(out.shape)} must match kv_indices shape "
                 f"{tuple(kv_indices.shape)}"
             )
-        # Tombstone-safety clamp (mirrors the full-side clamp): tombstoned (-1)
-        # v2p_swa entries must not reach `swa_k_buffer[-1]` (illegal under replay).
-        # Clamp to 0 routes them to the reserved padding sink (slot 0).
-        if self.swa_attn_allocator.page_size == 1:
-            if out is not None:
-                # Gather into a transient int64, then cast into out (`out.copy_`).
-                tmp = torch.index_select(
-                    self.swa_attn_allocator.virtual_to_physical, 0, kv_indices
-                )
-                tmp = torch.clamp_min(tmp, 0)
-                out.copy_(tmp.to(torch.int32))
-                return out
-            result = self.swa_attn_allocator.virtual_to_physical[kv_indices]
-            result = torch.clamp_min(result, 0)
-            return result.to(torch.int32)
-        ps = self.swa_attn_allocator.page_size
-        virt_pages = kv_indices // ps
-        offsets = kv_indices % ps
-        swa_phys_pages = self.swa_attn_allocator.virtual_to_physical[virt_pages]
-        result = (swa_phys_pages * ps + offsets).to(torch.int32)
-        result = torch.clamp_min(result, 0)
-        if out is not None:
-            out.copy_(result)
-            return out
-        return result
+        # Same fused kernel as the full-side translate, emitting int32. The
+        # tombstone-safety clamp is the kernel's: tombstoned (-1) v2p_swa
+        # entries must not reach `swa_k_buffer[-1]` (illegal under replay);
+        # clamping routes them to the reserved padding sink (slot 0).
+        sa = self.swa_attn_allocator
+        return translate_v2p(
+            kv_indices,
+            sa.virtual_to_physical,
+            page_size=sa.page_size,
+            page_stride=sa.page_size,
+            out=out,
+            out_dtype=torch.int32,
+        )
 
     # -- alloc --
 

@@ -687,10 +687,10 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 n_win = int(self.window_kv_indptr[bs].item())
             if n_win > 0:
-                self.cuda_graph_window_kv_indices[:n_win] = (
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        self.cuda_graph_window_kv_indices[:n_win]
-                    )
+                # In-place via out=, like the full-side refills above.
+                win_view = self.cuda_graph_window_kv_indices[:n_win]
+                self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    win_view, out=win_view
                 )
         # Full-attention write path: translate out_cache_loc -> physical into the
         # capture-stable buffer and RETURN the [:n] view.
