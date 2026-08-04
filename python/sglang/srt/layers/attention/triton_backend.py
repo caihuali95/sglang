@@ -672,9 +672,10 @@ class TritonAttnBackend(AttentionBackend):
             else int(self.kv_indptr[bs].item())
         )
         if n_kv > 0:
-            self.cuda_graph_kv_indices[:n_kv] = self._translate_kv_loc(
-                self.cuda_graph_kv_indices[:n_kv]
-            )
+            # In-place via out= (the API's cuda-graph contract): no fresh
+            # result tensor + copy-back per replay.
+            kv_view = self.cuda_graph_kv_indices[:n_kv]
+            self._translate_kv_loc(kv_view, out=kv_view)
         # SWA window read path. window_kv_indptr[bs] == sum(min(seq_len, window)).
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             if have_cpu_mirror:
@@ -698,8 +699,8 @@ class TritonAttnBackend(AttentionBackend):
         # Zero the padded tail first: a smaller replay batch leaves [n:] holding
         # stale ids that the captured store would write; send them to slot 0 (sink).
         self.cuda_graph_out_cache_loc_full_physical[n:].zero_()
-        self.cuda_graph_out_cache_loc_full_physical[:n].copy_(
-            self._translate_kv_loc(out_cache_loc)
+        self._translate_kv_loc(
+            out_cache_loc, out=self.cuda_graph_out_cache_loc_full_physical[:n]
         )
         return self.cuda_graph_out_cache_loc_full_physical[:n]
 
