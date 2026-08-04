@@ -3864,6 +3864,11 @@ class Scheduler(
                 self.invariant_checker._report_leak(
                     "pool-bytes", "\n".join(byte_violations)
                 )
+                if envs.SGLANG_ENABLE_STRICT_UNIFIED_BYTE_CHECK.get():
+                    raise RuntimeError(
+                        "unified byte-accounting violation (strict mode):\n"
+                        + "\n".join(byte_violations)
+                    )
 
         # tree cache sanity check
         self.invariant_checker._check_tree_cache()
