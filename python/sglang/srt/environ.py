@@ -349,8 +349,6 @@ class Envs:
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
-    # Sort the multi-ended allocator's free list after a merge (perf A/B knob).
-    SGLANG_SORT_FREE_LIST_AFTER_MERGE = EnvBool(False)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
     SGLANG_LOG_LAZY_COMPACTION_STATS_INTERVAL_SEC = EnvInt(30)
@@ -1321,6 +1319,9 @@ def _convert_SGL_to_SGLANG():
     # Superseded by the unified JIT per_token_group_quant, the default CUDA path.
     _print_deprecated_env("SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT")
     _print_deprecated_env("SGLANG_MASKED_GEMM_FAST_ACT")
+    # The unified free list is kept unsorted between flushes by design; the
+    # sort-after-merge A/B knob never left its off default and is gone.
+    _print_deprecated_env("SGLANG_SORT_FREE_LIST_AFTER_MERGE")
     _print_deprecated_env("SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN")
     # sconv-family kernels always use the CUDA-JIT ports when supported; no toggle.
     _print_deprecated_env("SGLANG_OPT_USE_CUDA_SCONV")
