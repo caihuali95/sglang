@@ -329,12 +329,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- state --
 
-    def clear(self) -> None:
-        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+    def _reset_watermarks(self) -> None:
+        """Reset frontier state to empty (float middles override)."""
         if self.grow_direction == "up":
             self.watermark_physical = self.min_page_index
         else:
             self.watermark_physical = self.num_pages - 1
+
+    def clear(self) -> None:
+        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+        self._reset_watermarks()
         self.virtual_to_physical.fill_(-1)
         # Virtual page 0 <-> physical page 0 (padding sink).
         self.virtual_to_physical[0] = 0
@@ -1316,39 +1320,50 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if src_list:
             src_pages = torch.tensor(src_list, dtype=torch.int64, device=self.device)
             dst_pages = torch.tensor(dst_list, dtype=torch.int64, device=self.device)
-            v_moved = self.physical_to_virtual[
-                src_pages
-            ].clone()  # read before clearing
-
-            # Expand page ids to token ids for the token-granular move kernel.
-            if self.page_size == 1:
-                src_t, dst_t = src_pages, dst_pages
-            else:
-                offsets = torch.arange(
-                    self.page_size, dtype=torch.int64, device=self.device
-                )
-                src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
-                dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
-
-            # Un-translated copy: the public copy_from translates virtual ids,
-            # which we must NOT do here.
-            move_fn = getattr(self._kvcache, "move_kv_cache", None)
-            if move_fn is not None:
-                move_fn(dst_t, src_t)
-            else:
-                copy_phys = getattr(self._kvcache, "_copy_from_physical", None)
-                assert copy_phys is not None, (
-                    f"sub-pool {self.sub_pool_name!r} supports neither move_kv_cache "
-                    "nor _copy_from_physical"
-                )
-                copy_phys(src_t, dst_t)
-            # Clear the vacated band, then re-bind the relocated dst pages.
+            # `dst` holes are outside the vacated band by construction, so
+            # rebinding them before the band wipe is order-equivalent.
+            self._move_pages_and_rebind(src_pages, dst_pages)
             self.physical_to_virtual[vacated_lo:vacated_hi] = -1
-            self.virtual_to_physical[v_moved] = dst_pages
-            self.physical_to_virtual[dst_pages] = v_moved
-            self._inverse_history.append((src_pages, dst_pages, v_moved))
         else:
             self.physical_to_virtual[vacated_lo:vacated_hi] = -1
+
+    def _move_pages_and_rebind(
+        self, src_pages: torch.Tensor, dst_pages: torch.Tensor
+    ) -> torch.Tensor:
+        """Copy live pages src->dst (disjoint sets), rebind v2p/p2v for the
+        moved virtuals, and record inverse history. Does NOT clear p2v[src] —
+        callers own vacated-region clearing (end pools wipe the whole vacated
+        band; float middles clear exactly the src set). Returns the moved
+        virtual page ids.
+        """
+        v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
+
+        # Expand page ids to token ids for the token-granular move kernel.
+        if self.page_size == 1:
+            src_t, dst_t = src_pages, dst_pages
+        else:
+            offsets = torch.arange(
+                self.page_size, dtype=torch.int64, device=self.device
+            )
+            src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
+            dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
+
+        # Un-translated copy: the public copy_from translates virtual ids,
+        # which we must NOT do here.
+        move_fn = getattr(self._kvcache, "move_kv_cache", None)
+        if move_fn is not None:
+            move_fn(dst_t, src_t)
+        else:
+            copy_phys = getattr(self._kvcache, "_copy_from_physical", None)
+            assert copy_phys is not None, (
+                f"sub-pool {self.sub_pool_name!r} supports neither move_kv_cache "
+                "nor _copy_from_physical"
+            )
+            copy_phys(src_t, dst_t)
+        self.virtual_to_physical[v_moved] = dst_pages
+        self.physical_to_virtual[dst_pages] = v_moved
+        self._inverse_history.append((src_pages, dst_pages, v_moved))
+        return v_moved
 
     # -- lazy compaction primitives --
 
@@ -1955,6 +1970,539 @@ def _end_pair_chain(
     """Order an end pair low→high by grow direction (the factories and the
     unit fixtures orient the pair differently; the chain check must not care)."""
     return sorted((a, b), key=lambda x: x.grow_direction != "up")
+
+
+class FloatMultiEndedAllocator(MultiEndedAllocator):
+    """Float MIDDLE cache pool: a span ``[low_wm_page, high_wm_page)`` between
+    two chain neighbors, with freed HOLES allowed inside the span.
+
+    Holes-first model (a middle CACHE pool is not a band):
+    - ``free`` marks interior holes (zero copies) and absorbs boundary holes;
+    - alloc reuses holes first (zero copies — steady-state churn recycles in
+      place), then extends the boundary on the side with the LARGER free gap;
+      from empty it positions the span at the MIDPOINT of the inter-frontier
+      region, so free gap exists on both sides and neighbor growth does not
+      immediately force a data move;
+    - data moves happen only ON DEMAND: ``make_room(side, min_bytes)`` opens
+      contiguous space on ``side`` by relocating live boundary pages into
+      interior holes / the far gap (cost min(L_live, G): when the demand
+      exceeds the live bytes this degenerates into moving every live page —
+      the whole-pool leapfrog); ``compact_holes`` closes all holes, shrinking
+      the span from a chosen side.
+    - An EMPTY float (no live pages) resets its span and is
+      frontier-transparent: it occupies no bytes and must never wall off free
+      space (its parked position is irrelevant to neighbors).
+
+    Floats skip the lazy event pipeline (`lazy_compaction` must be False):
+    frees/allocs are zero-copy by design, so only the on-demand moves need
+    write-set safety, which their scheduler-phase call sites provide.
+    """
+
+    # The span IS this pool's capacity state (it has no watermark): moving it
+    # changes its own availability AND — via transparency + the chain frontier
+    # walks — both neighbors' gaps. Same `_CapacityField` contract as the end
+    # pools' `watermark_physical`, so a span move on the hole-free extension
+    # path (which rebinds no free-list) still invalidates every capacity memo.
+    low_wm_page: _CapacityField[int] = _CapacityField()
+    high_wm_page: _CapacityField[int] = _CapacityField()
+
+    # Host-side "a free may have put a hole ON a boundary since the last
+    # absorb". Only `free` can make a boundary page a hole (alloc DRAINS holes
+    # into live pages, and extension adds live pages), so a clean flag means
+    # the boundaries are provably still live and the deferred absorb can skip
+    # its D2H entirely. Span-moving relocation re-arms it.
+    _holes_dirty: bool = False
+
+    def __init__(self, **kwargs):
+        assert not kwargs.get("lazy_compaction", False), (
+            "FloatMultiEndedAllocator is holes-first; the lazy event pipeline "
+            "is end-pool machinery and must stay off for float middles"
+        )
+        # Base __init__ ends with self.clear(), which reads these via our
+        # _reset_watermarks override — pre-seed so the override can run.
+        self.low_wm_page = 0
+        self.high_wm_page = 0
+        super().__init__(**kwargs)
+        assert self.grow_direction == "float", (
+            f"FloatMultiEndedAllocator needs a 'float' sub-pool spec; got "
+            f"{self.grow_direction!r}"
+        )
+
+    # -- span / frontier state --
+
+    def _reset_watermarks(self) -> None:
+        # Park empty at the buffer top; empty-transparency makes the parked
+        # position irrelevant to neighbors.
+        self.low_wm_page = self.num_pages
+        self.high_wm_page = self.num_pages
+        self.watermark_physical = -1  # unused for float pools (logs only)
+
+    def _span_pages(self) -> int:
+        return self.high_wm_page - self.low_wm_page
+
+    def _hole_pages(self) -> int:
+        return int(self._free_phys_pages.numel())
+
+    def _live_pages(self) -> int:
+        return self._span_pages() - self._hole_pages()
+
+    def _is_frontier_transparent(self) -> bool:
+        return self._live_pages() == 0
+
+    def _allocated_pages(self) -> int:
+        return self._live_pages()
+
+    def _byte_low_frontier(self) -> int:
+        return self.low_wm_page * self.entry_bytes_per_page
+
+    def _byte_high_frontier(self) -> int:
+        return self.high_wm_page * self.entry_bytes_per_page
+
+    def _region_bounds_pages(self) -> Tuple[int, int]:
+        """Page bounds ``[lo, hi)`` of the inter-frontier region available to
+        this float (chain-transparent walk; clamped to the slot-0 sink
+        reservation). Rounded conservatively: ``lo`` up, ``hi`` down."""
+        epp = self.entry_bytes_per_page
+        lo = (self._chain_high_frontier_below_bytes() + epp - 1) // epp
+        lo = max(lo, self.min_page_index)
+        hi = self._chain_low_frontier_above_bytes() // epp
+        hi = min(hi, self.num_pages)
+        return lo, hi
+
+    def _gap_pages(self) -> Tuple[int, int]:
+        """(gap_low, gap_high) in own page units; both == the whole region
+        when the span is empty/parked."""
+        lo, hi = self._region_bounds_pages()
+        if self._is_frontier_transparent():
+            room = max(0, hi - lo)
+            return room, room
+        return max(0, self.low_wm_page - lo), max(0, hi - self.high_wm_page)
+
+    # -- availability --
+
+    def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
+        gap_low, gap_high = self._gap_pages()
+        gap_pages = max(gap_low, gap_high)  # a single alloc extends ONE side
+        gap_pages += extra_gap_bytes // self.entry_bytes_per_page
+        pages_by_index_space = (
+            self.num_pages - self.min_page_index - self._live_pages()
+        )
+        pages_extend = min(gap_pages, pages_by_index_space)
+        return (pages_extend + self._hole_pages()) * self.page_size
+
+    # -- physical page primitives (holes-first) --
+
+    def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        if num_pages <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        n_drain = min(num_pages, self._hole_pages())
+        need_more = num_pages - n_drain
+
+        fresh: Optional[torch.Tensor] = None
+        if need_more > 0:
+            lo, hi = self._region_bounds_pages()
+            if self._is_frontier_transparent():
+                # Reposition-on-alloc-from-empty: collapse to the midpoint so
+                # free gap remains on BOTH sides.
+                if need_more > hi - lo:
+                    return None
+                start = lo + (hi - lo - need_more) // 2
+                self.low_wm_page = start
+                self.high_wm_page = start + need_more
+                fresh = torch.arange(
+                    start, start + need_more, dtype=torch.int64, device=self.device
+                )
+            else:
+                gap_low = self.low_wm_page - lo
+                gap_high = hi - self.high_wm_page
+                # Extend toward the roomier gap; fall back to the other side.
+                sides = ("high", "low") if gap_high >= gap_low else ("low", "high")
+                for side in sides:
+                    if side == "high" and need_more <= gap_high:
+                        start = self.high_wm_page
+                        self.high_wm_page += need_more
+                        break
+                    if side == "low" and need_more <= gap_low:
+                        start = self.low_wm_page - need_more
+                        self.low_wm_page = start
+                        break
+                else:
+                    return None  # neither side fits; state untouched
+                fresh = torch.arange(
+                    start, start + need_more, dtype=torch.int64, device=self.device
+                )
+
+        if n_drain > 0:
+            drained = self._free_phys_pages[:n_drain].clone()
+            self._free_phys_pages = self._free_phys_pages[n_drain:]
+        else:
+            drained = None
+
+        if drained is None:
+            return fresh
+        if fresh is None:
+            return drained
+        return torch.cat([drained, fresh])
+
+    def take_physical(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        assert need_size % self.page_size == 0, (
+            f"take_physical: need_size={need_size} must be a multiple of "
+            f"page_size={self.page_size}"
+        )
+        return self.take_physical_pages(need_size // self.page_size)
+
+    def _alloc_bind_fast_or_slow(
+        self, v_pages: torch.Tensor, N: int
+    ) -> Optional[torch.Tensor]:
+        # Holes-first always routes through take_physical_pages (no fused
+        # watermark fast path — float alloc cadence doesn't need it).
+        if N == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        phys_pages = self.take_physical_pages(N)
+        if phys_pages is None:
+            return None
+        self.bind(v_pages, phys_pages)
+        return phys_pages
+
+    # -- free: hole-marking, boundary absorption, park-on-empty --
+
+    def free(
+        self, free_index: torch.Tensor, *, _pages: Optional[torch.Tensor] = None
+    ) -> None:
+        """Mark the freed pages as interior HOLES / absorb boundary ones.
+
+        `_pages` carries virtual PAGE ids the caller already derived (segment
+        frees from `start_pos` arithmetic; the SWA composite's page-rep
+        release) — same contract as the base allocator, and it must be
+        honoured here for the same reason: deriving them again via
+        `torch.unique` is a data-dependent-shape op, i.e. a HOST SYNC on the
+        per-step free path.
+        """
+        with record_function("FloatMultiEndedAlloc.free"):
+            if free_index is None or free_index.numel() == 0:
+                return
+            if not self.is_not_in_free_group:
+                self.free_group.append(free_index)
+                return
+            # Same page-derivation ladder as `_free_lazy`: caller-supplied
+            # ids, the ps==1 identity, then the dedup fallback for arbitrary
+            # (radix-shaped) input. No stale-slot `.item()` assert — same
+            # contract as the lazy path: callers must not double-free (a
+            # tombstoned page here would be appended to the hole list), and
+            # the composite's tombstone filters uphold it. The idle byte
+            # verifier's span == p2v-bound + holes conservation catches a
+            # violation after the fact without a per-free host sync.
+            free_v_pages_raw = free_index.detach().to(torch.int64)
+            if _pages is not None:
+                free_v_pages = _pages
+            elif self.page_size == 1:
+                free_v_pages = free_v_pages_raw
+            else:
+                free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
+            freed_p_pages = self.virtual_to_physical[free_v_pages]
+            self.virtual_to_physical[free_v_pages] = -1
+            self.physical_to_virtual[freed_p_pages] = -1
+            if self.is_id_owner:
+                self.free_virtual_ids = torch.cat(
+                    [self.free_virtual_ids, free_v_pages]
+                )
+            self._free_phys_pages = torch.cat(
+                [self._free_phys_pages, freed_p_pages]
+            )
+            # Park is sync-free (span/hole COUNTS only); boundary absorption is
+            # DEFERRED — see `_absorb_span_boundary_holes`.
+            self._holes_dirty = True
+            self._park_if_empty()
+
+    def _park_if_empty(self) -> bool:
+        """Reset the span and go frontier-transparent once no live page
+        remains. Sync-free: `_live_pages()` is span minus hole COUNT, both
+        host-side (`numel()` is tensor metadata). Returns whether it parked."""
+        if self._live_pages() != 0:
+            return False
+        self._reset_watermarks()
+        self._free_phys_pages = torch.empty(
+            0, dtype=torch.int64, device=self.device
+        )
+        self._holes_dirty = False
+        return True
+
+    def _absorb_span_boundary_holes(self) -> int:
+        """Shrink the span past any holes touching its boundaries (zero-copy),
+        returning the number of pages handed back to the neighbours.
+
+        DEFERRED, not per-free: deciding how far to walk needs the hole set on
+        the HOST (the watermarks are host ints), so this is the float's one
+        D2H — exactly the base allocator's model, whose `_free_lazy` does "no
+        boundary absorb" and pays a single sync inside `_flush`. Doing it per
+        free put a host sync on the per-decode-step path.
+
+        Called where a sync is already free or already warranted: the per-step
+        opportunistic flush (the scheduler runs it at the sync boundary with
+        the forward stream drained) and the head of the tri's shortfall ladder
+        (a stale-wide span would otherwise inflate the rebalance deficit and
+        buy data movement that this zero-copy shrink makes unnecessary).
+
+        Skipping it is only ever CONSERVATIVE: the span reads wider than its
+        live content, so neighbours see less gap. `_live_pages()`, hence
+        transparency and the byte-conservation identity, stay exact either way.
+        """
+        if self._park_if_empty():
+            self._holes_dirty = False
+            return 0
+        if not self._holes_dirty or self._free_phys_pages.numel() == 0:
+            # Nothing freed since the last absorb => both boundaries are still
+            # live => the walk provably finds nothing. Skip the D2H; steady
+            # churn with only INTERIOR holes then costs no sync at all.
+            self._holes_dirty = False
+            return 0
+        self._holes_dirty = False
+        before = self._span_pages()
+        holes = set(int(x) for x in self._free_phys_pages.tolist())
+        changed = False
+        while self.low_wm_page in holes:
+            holes.remove(self.low_wm_page)
+            self.low_wm_page += 1
+            changed = True
+        while (self.high_wm_page - 1) in holes:
+            holes.remove(self.high_wm_page - 1)
+            self.high_wm_page -= 1
+            changed = True
+        if changed:
+            self._free_phys_pages = torch.tensor(
+                sorted(holes), dtype=torch.int64, device=self.device
+            )
+        return before - self._span_pages()
+
+    # -- on-demand data movement --
+
+    def make_room(self, *, side: str, min_bytes: int) -> int:
+        """Open >= ``min_bytes`` of CONTIGUOUS free space between this pool's
+        ``side`` boundary and the region bound on that side, relocating the
+        minimum set of live boundary pages (holes-first destinations, then the
+        far gap). Returns the bytes now open on ``side`` (may exceed the ask;
+        < min_bytes iff impossible now — state is then unchanged).
+
+        Cost model: moving k pages costs k page-copies; k <= min(L_live, G).
+        Scheduler-phase only — callers own write-set / stream safety.
+        """
+        assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
+        epp = self.entry_bytes_per_page
+        lo, hi = self._region_bounds_pages()
+        gap_low, gap_high = self._gap_pages()
+        gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
+        if gap_side_bytes >= min_bytes or self._is_frontier_transparent():
+            return gap_side_bytes
+
+        # Capacity: even packing every live page flush against the far side
+        # cannot open more than (region - live) bytes.
+        live = self._live_pages()
+        if (hi - lo - live) * epp < min_bytes:
+            return gap_side_bytes  # impossible now; untouched
+
+        need_pages = (min_bytes - gap_side_bytes + epp - 1) // epp
+
+        holes = set(int(x) for x in self._free_phys_pages.tolist())
+        span = range(self.low_wm_page, self.high_wm_page)
+        live_pages_sorted = [p for p in span if p not in holes]
+
+        if need_pages >= live:
+            # Whole-pool LEAPFROG: pack every live page flush against the far
+            # region edge (cost L_live <= G); the capacity check above
+            # guarantees the resulting gap satisfies the ask.
+            if side == "high":
+                final = list(range(lo, lo + live))
+            else:
+                final = list(range(hi - live, hi))
+            self._relocate_to_positions(live_pages_sorted, final)
+            gap_low2, gap_high2 = self._gap_pages()
+            return (gap_low2 if side == "low" else gap_high2) * epp
+
+        # Boundary relocation (G < L_live):
+        # Sources: live pages nearest the demanded side, retreating inward.
+        if side == "high":
+            srcs = list(reversed(live_pages_sorted))[: min(need_pages, live)]
+        else:
+            srcs = live_pages_sorted[: min(need_pages, live)]
+        src_set = set(srcs)
+
+        # Destinations, all strictly on the far side of EVERY source (keeps
+        # the batched move src/dst-disjoint and actually retreats the edge):
+        # interior holes beyond the source block first (deepest-first, pushing
+        # live mass toward the far side), then fresh far-gap pages (extending
+        # the far boundary).
+        if side == "high":
+            usable_holes = sorted(h for h in holes if h < min(srcs))
+        else:
+            usable_holes = sorted(
+                (h for h in holes if h > max(srcs)), reverse=True
+            )
+        dsts: List[int] = list(usable_holes[: len(srcs)])
+        n_fresh = len(srcs) - len(dsts)
+        if n_fresh > 0:
+            # Far-gap feasibility for the fresh destinations.
+            if side == "high":
+                if n_fresh > gap_low:
+                    return gap_side_bytes
+                dsts += list(
+                    range(self.low_wm_page - 1, self.low_wm_page - 1 - n_fresh, -1)
+                )
+            else:
+                if n_fresh > gap_high:
+                    return gap_side_bytes
+                dsts += list(range(self.high_wm_page, self.high_wm_page + n_fresh))
+
+        if srcs:
+            self._move_pages_and_rebind(
+                torch.tensor(srcs, dtype=torch.int64, device=self.device),
+                torch.tensor(dsts, dtype=torch.int64, device=self.device),
+            )
+            self.physical_to_virtual[
+                torch.tensor(srcs, dtype=torch.int64, device=self.device)
+            ] = -1
+
+        # Reconstruct the span from final live positions: everything between
+        # the extremes is span; non-live pages inside are holes.
+        final_live = sorted((set(live_pages_sorted) - src_set) | set(dsts))
+        self.low_wm_page = final_live[0]
+        self.high_wm_page = final_live[-1] + 1
+        final_live_set = set(final_live)
+        new_holes = [
+            p
+            for p in range(self.low_wm_page, self.high_wm_page)
+            if p not in final_live_set
+        ]
+        self._free_phys_pages = torch.tensor(
+            new_holes, dtype=torch.int64, device=self.device
+        )
+        self._holes_dirty = True  # the span moved; re-check its boundaries
+        self._absorb_span_boundary_holes()
+
+        gap_low2, gap_high2 = self._gap_pages()
+        return (gap_low2 if side == "low" else gap_high2) * epp
+
+    def _relocate_to_positions(
+        self, live_sorted: List[int], final: List[int]
+    ) -> int:
+        """Order-preserving relocation of the live pages onto the ``final``
+        positions (an ascending hole-free block). Batched disjoint move when
+        possible; otherwise ORDERED singleton moves (uniform shift direction:
+        each destination is a hole or an already-vacated source by induction).
+        Sets span to the final block, clears holes. Returns pages moved.
+        """
+        assert len(live_sorted) == len(final)
+        pairs = [(s, d) for s, d in zip(live_sorted, final) if s != d]
+        if pairs:
+            src_set = {s for s, _ in pairs}
+            dst_set = {d for _, d in pairs}
+            if src_set.isdisjoint(dst_set):
+                src_t = torch.tensor(
+                    [s for s, _ in pairs], dtype=torch.int64, device=self.device
+                )
+                dst_t = torch.tensor(
+                    [d for _, d in pairs], dtype=torch.int64, device=self.device
+                )
+                self._move_pages_and_rebind(src_t, dst_t)
+                self.physical_to_virtual[src_t] = -1
+            else:
+                # Overlapping shift: process toward the move direction so each
+                # destination is free by the time it is written.
+                ordered = pairs if final[0] <= live_sorted[0] else list(
+                    reversed(pairs)
+                )
+                for s, d in ordered:
+                    s_t = torch.tensor([s], dtype=torch.int64, device=self.device)
+                    d_t = torch.tensor([d], dtype=torch.int64, device=self.device)
+                    self._move_pages_and_rebind(s_t, d_t)
+                    self.physical_to_virtual[s_t] = -1
+        if final:
+            self.low_wm_page = final[0]
+            self.high_wm_page = final[-1] + 1
+        else:
+            self._reset_watermarks()
+        self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
+        return len(pairs)
+
+    def _flush(self, *, urgent: bool) -> int:
+        """Boundary absorption only — never data movement. The base `_flush`
+        treats `_free_phys_pages` as a lazy compaction backlog to be drained,
+        but for a float those entries are INTERIOR HOLES, reusable assets by
+        design; relocation happens on demand via `make_room` /
+        `compact_holes`. What a float CAN do at a flush point is hand back
+        span it no longer needs, which is where its deferred D2H belongs — so
+        neighbours' urgent-flush ladders and the per-step opportunistic flush
+        both reclaim the boundary holes."""
+        return self._absorb_span_boundary_holes()
+
+    def flush_opportunistic(self) -> int:
+        """Public gated wrapper around `_flush(urgent=False)` — the base's
+        exact shape. The ONLY reason for the override is the gate: the base
+        keys its fast path on `lazy_compaction`, which a float never has; a
+        float's flushable work is its deferred boundary absorption, so the
+        fast path keys on `_holes_dirty` instead. The scheduler calls this at
+        the sync boundary with the forward stream drained, so the D2H the
+        flush costs is the cheapest one available; the clean fast path keeps
+        the common step sync-free."""
+        with record_function("FloatMultiEndedAlloc.flush_opportunistic"):
+            if not self._holes_dirty or self._free_phys_pages.numel() == 0:
+                return 0
+            return self._flush(urgent=False)
+
+    def backup_state(self):
+        # Span-aware snapshot (base backs up watermark_physical, meaningless
+        # here). Spec decode is asserted off under unified today; kept correct
+        # for when the gate lifts.
+        return (
+            self.low_wm_page,
+            self.high_wm_page,
+            self._free_phys_pages.clone(),
+            (len(self.free_virtual_ids) if self.is_id_owner else None),
+            len(self._inverse_history),
+        )
+
+    def restore_state(self, state):
+        low_wm, high_wm, holes, _n_free_virtual, n_inverse = state
+        self.low_wm_page = low_wm
+        self.high_wm_page = high_wm
+        self._free_phys_pages = holes
+        new_entries = self._inverse_history[n_inverse:]
+        if new_entries:
+            logger.warning(
+                "FloatMultiEndedAllocator.restore_state: %d relocation(s) inside "
+                "a backup window (sub_pool=%s) — float moves are not reversible.",
+                len(new_entries),
+                self.sub_pool_name,
+            )
+        del self._inverse_history[n_inverse:]
+        return new_entries
+
+    def compact_holes(self, *, retreat_side: str) -> int:
+        """Close ALL interior holes by packing live pages toward the side
+        OPPOSITE ``retreat_side`` (order-preserving), shrinking the span on
+        ``retreat_side`` by the hole count. Returns pages moved."""
+        assert retreat_side in ("low", "high")
+        if self._hole_pages() == 0:
+            return 0
+        holes = set(int(x) for x in self._free_phys_pages.tolist())
+        live_sorted = [
+            p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes
+        ]
+        if retreat_side == "high":
+            final = list(range(self.low_wm_page, self.low_wm_page + len(live_sorted)))
+        else:
+            final = list(
+                range(self.high_wm_page - len(live_sorted), self.high_wm_page)
+            )
+        return self._relocate_to_positions(live_sorted, final)
+
+    # -- band-incompatible base APIs --
+
+    def bind_peer(self, peer: "MultiEndedAllocator") -> None:  # pragma: no cover
+        raise AssertionError(
+            "float middles must be wired via bind_low_peer/bind_high_peer"
+        )
 
 
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):

@@ -30,6 +30,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.multi_ended_allocator import (
+    FloatMultiEndedAllocator,
     MultiEndedAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -2670,6 +2671,313 @@ class TestChainFrontierWalk(unittest.TestCase):
         # Opaque non-lazy middle blocks the far end's credit.
         stub.transparent = False
         self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
+
+
+class TestFloatMultiEndedAllocator(unittest.TestCase):
+    """Holes-first float middle: midpoint placement, in-place hole recycling,
+    larger-gap boundary extension, boundary absorption + park-on-empty
+    transparency, and the on-demand data movers (`make_room` boundary
+    relocation / leapfrog, `compact_holes` ordered pack) with data-move
+    verification through the fake KV marker.
+
+    Guarded failure modes: a float that copies on steady-state churn, walls
+    off free space when empty, extends toward the tighter gap, moves more
+    than min(L_live, G) pages, loses data across relocation, or corrupts
+    v2p/p2v span/hole bookkeeping.
+    """
+
+    def _build_tri(self, n_state=8, n_float=32, n_full=32):
+        state = _make_mamba_spec("state", "up", layer_num=2)
+        fl = _make_mha_spec("swa", "float", layer_num=2)
+        full = _make_mha_spec("full", "down", layer_num=2)
+        total = (
+            state.entry_bytes() * n_state
+            + fl.entry_bytes() * n_float
+            + full.entry_bytes() * n_full
+        )
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, fl, state],
+            device=_DEV,
+            enable_memory_saver=False,
+        )
+        sa = MultiEndedAllocator(
+            kvcache=_FakeKVCache(pool.max_slots("state")),
+            unified_buffer=pool,
+            sub_pool_name="state",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        fkv = _FakeKVCache(pool.max_slots("swa"))
+        fla = FloatMultiEndedAllocator(
+            kvcache=fkv,
+            unified_buffer=pool,
+            sub_pool_name="swa",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        dkv = _FakeKVCache(pool.max_slots("full"))
+        da = MultiEndedAllocator(
+            kvcache=dkv,
+            unified_buffer=pool,
+            sub_pool_name="full",
+            device=_DEV,
+            is_id_owner=True,
+        )
+        # Chain wiring state <-> float <-> full.
+        sa.bind_high_peer(fla)
+        fla.bind_low_peer(sa)
+        fla.bind_high_peer(da)
+        da.bind_low_peer(fla)
+        return pool, sa, fla, da, fkv
+
+    def _stamp(self, alloc, kv, v):
+        kv.buf[alloc.virtual_to_physical[v]] = v
+
+    def _interior_block(self, fla, blocks):
+        """The allocated block whose physical pages touch neither span
+        boundary (robust to the extend-direction policy)."""
+        for v in blocks:
+            pages = set(int(x) for x in fla.virtual_to_physical[v].tolist())
+            if fla.low_wm_page not in pages and (fla.high_wm_page - 1) not in pages:
+                return v
+        raise AssertionError("no interior block in layout")
+
+    def _check_float_state(self, fla, kv):
+        holes = set(int(x) for x in fla._free_phys_pages.tolist())
+        span = range(fla.low_wm_page, fla.high_wm_page)
+        live = [p for p in span if p not in holes]
+        self.assertEqual(fla._live_pages(), len(live))
+        for h in holes:
+            self.assertTrue(fla.low_wm_page < h < fla.high_wm_page - 1)
+        for p in live:
+            v = int(fla.physical_to_virtual[p].item())
+            self.assertNotEqual(v, -1, f"live page {p} unbound")
+            self.assertEqual(int(fla.virtual_to_physical[v].item()), p)
+            self.assertEqual(int(kv.buf[p].item()), v, f"data lost at {p}")
+
+    def test_midpoint_initial_placement(self):
+        _, _, fla, _, _ = self._build_tri()
+        self.assertTrue(fla._is_frontier_transparent())
+        v = fla.alloc(4)
+        self.assertIsNotNone(v)
+        lo, hi = fla._region_bounds_pages()
+        self.assertEqual(fla.low_wm_page, lo + (hi - lo - 4) // 2)
+        self.assertEqual(fla._span_pages(), 4)
+        # Gap on BOTH sides.
+        gap_low, gap_high = fla._gap_pages()
+        self.assertGreater(gap_low, 0)
+        self.assertGreater(gap_high, 0)
+
+    def test_holes_first_reuse_is_zero_copy(self):
+        _, _, fla, _, kv = self._build_tri()
+        va = fla.alloc(2)
+        vb = fla.alloc(2)
+        vc = fla.alloc(2)
+        for v in (va, vb, vc):
+            self._stamp(fla, kv, v)
+        span_before = (fla.low_wm_page, fla.high_wm_page)
+        fla.free(self._interior_block(fla, (va, vb, vc)))  # interior -> holes
+        self.assertEqual(fla._hole_pages(), 2)
+        self.assertEqual((fla.low_wm_page, fla.high_wm_page), span_before)
+        vd = fla.alloc(2)  # must recycle the holes in place
+        self._stamp(fla, kv, vd)
+        self.assertEqual(fla._hole_pages(), 0)
+        self.assertEqual((fla.low_wm_page, fla.high_wm_page), span_before)
+        self.assertEqual(len(fla._inverse_history), 0)  # zero copies
+        self._check_float_state(fla, kv)
+
+    def test_boundary_free_absorbed_at_the_deferred_point(self):
+        """Boundary holes shrink the span ZERO-COPY — but the shrink is
+        DEFERRED out of `free`, which must stay host-sync-free (deciding how
+        far to walk needs the hole set on the host). `free` records the holes;
+        `_absorb_span_boundary_holes` (per-step flush / shortfall ladder) reclaims
+        the span. Skipping it is only ever conservative."""
+        _, _, fla, _, kv = self._build_tri()
+        va = fla.alloc(2)
+        vb = fla.alloc(2)  # extends one side; frees at that edge absorb
+        self._stamp(fla, kv, va)
+        self._stamp(fla, kv, vb)
+        span = fla._span_pages()
+        fla.free(vb)
+        # Deferred: span still claims the freed edge, the pages are holes.
+        self.assertEqual(fla._hole_pages(), 2)
+        self.assertEqual(fla._span_pages(), span)
+        self.assertEqual(fla._live_pages(), 2)  # exact regardless
+        absorbed = fla._flush(urgent=False)
+        self.assertEqual(absorbed, 2)
+        self.assertEqual(fla._hole_pages(), 0)
+        self.assertEqual(fla._span_pages(), span - 2)
+        self.assertEqual(len(fla._inverse_history), 0)  # zero copies
+        self._check_float_state(fla, kv)
+
+    def test_free_is_host_sync_free(self):
+        """The per-decode-step property: no D2H anywhere in the float's free
+        (the base's lazy free earns this by deferring absorption to `_flush`;
+        the float now follows the same model)."""
+        from unittest import mock
+
+        _, _, fla, _, kv = self._build_tri()
+        v = fla.alloc(4)
+        self._stamp(fla, kv, v)
+        with mock.patch.object(
+            torch.Tensor, "tolist", side_effect=AssertionError("tolist = D2H")
+        ), mock.patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("item = D2H")
+        ), mock.patch.object(
+            torch, "unique", side_effect=AssertionError("unique = host sync")
+        ):
+            fla.free(v[:2], _pages=v[:2])
+
+    def test_deferred_absorption_reaches_the_same_state_as_eager(self):
+        """Derived property: deferring must not change WHERE the span lands,
+        only when. Two floats, identical ops; one absorbs after every free,
+        one only at the end."""
+        _, _, f1, _, kv1 = self._build_tri()
+        _, _, f2, _, kv2 = self._build_tri()
+        for f, kv, absorb_each in ((f1, kv1, True), (f2, kv2, False)):
+            blocks = [f.alloc(2) for _ in range(3)]
+            for v in blocks:
+                self._stamp(f, kv, v)
+            for v in (blocks[2], blocks[0]):
+                f.free(v)
+                if absorb_each:
+                    f._flush(urgent=False)
+        f2._flush(urgent=False)
+        self.assertEqual(f1.low_wm_page, f2.low_wm_page)
+        self.assertEqual(f1.high_wm_page, f2.high_wm_page)
+        self.assertEqual(f1._hole_pages(), f2._hole_pages())
+        self.assertEqual(f1.available_size(), f2.available_size())
+
+    def test_park_on_empty_restores_transparency(self):
+        _, sa, fla, da, _ = self._build_tri()
+        base_gap = da._current_gap_bytes()
+        v = fla.alloc(4)
+        self.assertLess(da._current_gap_bytes(), base_gap)  # float blocks
+        fla.free(v)
+        self.assertTrue(fla._is_frontier_transparent())
+        self.assertEqual(fla._hole_pages(), 0)
+        self.assertEqual(da._current_gap_bytes(), base_gap)  # sees through again
+        self.assertEqual(sa._current_gap_bytes(), base_gap)
+
+    def test_extends_toward_larger_gap(self):
+        _, _, fla, da, kv = self._build_tri()
+        v = fla.alloc(4)
+        self._stamp(fla, kv, v)
+        # Consume most of the high gap with the full end; low gap now larger.
+        self.assertIsNotNone(da.alloc(24))
+        gap_low, gap_high = fla._gap_pages()
+        self.assertGreater(gap_low, gap_high)
+        lo_before = fla.low_wm_page
+        hi_before = fla.high_wm_page
+        v2 = fla.alloc(2)
+        self.assertIsNotNone(v2)
+        self._stamp(fla, kv, v2)
+        self.assertEqual(fla.low_wm_page, lo_before - 2)  # grew low side
+        self.assertEqual(fla.high_wm_page, hi_before)
+        self._check_float_state(fla, kv)
+
+    def test_available_is_max_gap_plus_holes(self):
+        _, _, fla, da, _ = self._build_tri()
+        va = fla.alloc(2)
+        vb = fla.alloc(2)
+        vc = fla.alloc(2)
+        fla.free(self._interior_block(fla, (va, vb, vc)))
+        self.assertEqual(fla._hole_pages(), 2)
+        gap_low, gap_high = fla._gap_pages()
+        self.assertEqual(fla.available_size(), max(gap_low, gap_high) + 2)
+        del da
+
+    def test_make_room_boundary_relocation(self):
+        _, _, fla, da, kv = self._build_tri()
+        v = fla.alloc(6)
+        self._stamp(fla, kv, v)
+        epp = fla.entry_bytes_per_page
+        _, gap_high = fla._gap_pages()
+        ask = (gap_high + 3) * epp  # 3 pages beyond the current high gap
+        opened = fla.make_room(side="high", min_bytes=ask)
+        self.assertGreaterEqual(opened, ask)
+        # Cost min(L_live, G): moved exactly the 3 boundary pages, not 6.
+        moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
+        self.assertEqual(moved, 3)
+        self._check_float_state(fla, kv)
+        # The opened space is real: the full end can now take it.
+        self.assertGreaterEqual(da.available_size(), 3)
+
+    def test_make_room_leapfrog_cost_bounded_by_live(self):
+        _, _, fla, _, kv = self._build_tri()
+        v = fla.alloc(2)  # tiny live mass
+        self._stamp(fla, kv, v)
+        epp = fla.entry_bytes_per_page
+        _, gap_high = fla._gap_pages()
+        ask = (gap_high + 10) * epp  # demand >> live
+        opened = fla.make_room(side="high", min_bytes=ask)
+        self.assertGreaterEqual(opened, ask)
+        moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
+        self.assertEqual(moved, 2)  # min(L_live, G) == L_live
+        self._check_float_state(fla, kv)
+
+    def test_make_room_impossible_leaves_state_unchanged(self):
+        _, _, fla, _, kv = self._build_tri(n_float=8)
+        v = fla.alloc(6)
+        self._stamp(fla, kv, v)
+        lo, hi = fla._region_bounds_pages()
+        epp = fla.entry_bytes_per_page
+        snapshot = (
+            fla.low_wm_page,
+            fla.high_wm_page,
+            fla._hole_pages(),
+            len(fla._inverse_history),
+        )
+        opened = fla.make_room(side="high", min_bytes=(hi - lo) * epp)
+        self.assertLess(opened, (hi - lo) * epp)
+        self.assertEqual(
+            snapshot,
+            (
+                fla.low_wm_page,
+                fla.high_wm_page,
+                fla._hole_pages(),
+                len(fla._inverse_history),
+            ),
+        )
+        self._check_float_state(fla, kv)
+
+    def test_make_room_uses_far_holes_before_far_gap(self):
+        _, _, fla, _, kv = self._build_tri()
+        va = fla.alloc(2)
+        vb = fla.alloc(2)
+        vc = fla.alloc(2)
+        for v in (va, vb, vc):
+            self._stamp(fla, kv, v)
+        lo_before = fla.low_wm_page
+        fla.free(self._interior_block(fla, (va, vb, vc)))  # 2 interior holes
+        self.assertEqual(fla._hole_pages(), 2)
+        epp = fla.entry_bytes_per_page
+        _, gap_high = fla._gap_pages()
+        opened = fla.make_room(side="high", min_bytes=(gap_high + 2) * epp)
+        self.assertGreaterEqual(opened, (gap_high + 2) * epp)
+        # The two holes absorbed the two moved pages: low side untouched.
+        self.assertEqual(fla.low_wm_page, lo_before)
+        self.assertEqual(fla._hole_pages(), 0)
+        self._check_float_state(fla, kv)
+
+    def test_compact_holes_ordered_pack(self):
+        _, _, fla, _, kv = self._build_tri()
+        vs = [fla.alloc(2) for _ in range(4)]
+        for v in vs:
+            self._stamp(fla, kv, v)
+        fla.free(vs[1])  # interleaved holes
+        span_before = fla._span_pages()
+        moved = fla.compact_holes(retreat_side="high")
+        self.assertEqual(fla._hole_pages(), 0)
+        self.assertEqual(fla._span_pages(), span_before - 2)
+        self.assertGreater(moved, 0)
+        self._check_float_state(fla, kv)
+
+    def test_bind_peer_raises_on_float(self):
+        _, sa, fla, _, _ = self._build_tri()
+        with self.assertRaises(AssertionError):
+            fla.bind_peer(sa)
 
 
 if __name__ == "__main__":
