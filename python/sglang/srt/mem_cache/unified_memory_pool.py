@@ -850,7 +850,10 @@ class UnifiedMambaSlotAllocator:
         self._multi_ended_allocator = mea
         self._max_size = max_size  # excludes reserved slot 0
         self._device = device
-        self._alloc_iter = None  # active alloc_group batch iterator
+        # Active alloc_group batch: `alloc(1)` draws slices off a cursor
+        # (views of one tensor — no per-slot object churn).
+        self._alloc_batch: Optional[torch.Tensor] = None
+        self._alloc_cursor = 0
 
     # -- translation (owns the v<->p mapping) --
 
@@ -898,34 +901,36 @@ class UnifiedMambaSlotAllocator:
 
     def alloc(self, need_size: int):
         # alloc_group fast path: single-slot draws from the prefetched batch.
-        if self._alloc_iter is not None and need_size == 1:
-            slot = next(self._alloc_iter, None)
-            if slot is not None:
-                return slot
+        if self._alloc_batch is not None and need_size == 1:
+            cursor = self._alloc_cursor
+            if cursor < int(self._alloc_batch.numel()):
+                self._alloc_cursor = cursor + 1
+                return self._alloc_batch[cursor : cursor + 1]
         return self._multi_ended_allocator.alloc(need_size)  # VIRTUAL ids
 
     def free(self, free_index: torch.Tensor):
         return self._multi_ended_allocator.free(free_index)
 
     def clear(self):
-        self._alloc_iter = None
+        self._alloc_batch = None
+        self._alloc_cursor = 0
         return self._multi_ended_allocator.clear()
 
     def alloc_group_begin(self, num_reqs: int):
         """Pre-allocate a batch that ``alloc(1)`` then draws from."""
-        self._alloc_iter = None
+        self._alloc_batch = None
+        self._alloc_cursor = 0
         if num_reqs > 0:
-            result = self._multi_ended_allocator.alloc(num_reqs)
-            if result is not None:
-                self._alloc_iter = iter(result.split(1))
+            self._alloc_batch = self._multi_ended_allocator.alloc(num_reqs)
 
     def alloc_group_end(self):
         """Return any unused pre-allocated slots from the current group."""
-        if self._alloc_iter is not None:
-            remaining = list(self._alloc_iter)
-            if remaining:
-                self._multi_ended_allocator.free(torch.cat(remaining))
-        self._alloc_iter = None
+        if self._alloc_batch is not None:
+            remaining = self._alloc_batch[self._alloc_cursor :]
+            if remaining.numel() > 0:
+                self._multi_ended_allocator.free(remaining)
+        self._alloc_batch = None
+        self._alloc_cursor = 0
 
     def is_slot_allocated(self, slot) -> bool:
         return self._multi_ended_allocator.is_slot_allocated(int(slot))

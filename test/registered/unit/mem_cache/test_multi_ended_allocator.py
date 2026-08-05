@@ -636,6 +636,52 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         kvcache.swa_kv_pool.buf[valid_swa] = -1
         allocator.free(v)
 
+    def test_decode_count_computed_once_and_passed_through(self):
+        """O1 regression pin: the composite computes `get_num_new_pages` for
+        its joint pre-check + virtual-page snapshot, then PASSES it to the
+        band. Pre-O1 the band recomputed it (2 calls/step); if the
+        pass-through is ever dropped in a refactor, the count silently doubles
+        again AND the snapshot-consistency guarantee (band consumes exactly
+        the slice the composite snapshotted) degrades back to coincidence."""
+        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+
+        pool, allocator, kvcache = self._build()
+        v = self._alloc(allocator, kvcache, 4)
+        self.assertIsNotNone(v)
+
+        seq_lens = torch.tensor([5], dtype=torch.int64, device=_DEV)
+        seq_lens_cpu = torch.tensor([5], dtype=torch.int64)
+        last_loc = v[-1:].clone()
+
+        class _NoOpKernelGrid:
+            def __getitem__(self, _grid):
+                return self
+
+            def __call__(self, *a, **kw):
+                pass
+
+        calls = 0
+        orig_count = mea_mod.get_num_new_pages
+        orig_kernel = mea_mod.alloc_decode_kernel
+
+        def _counting(**kw):
+            nonlocal calls
+            calls += 1
+            return orig_count(**kw)
+
+        mea_mod.get_num_new_pages = _counting
+        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
+        try:
+            out = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+        finally:
+            mea_mod.get_num_new_pages = orig_count
+            mea_mod.alloc_decode_kernel = orig_kernel
+
+        self.assertIsNotNone(out)
+        self.assertEqual(
+            calls, 1, "band must receive the composite's count, not recompute"
+        )
+
     def _check_sub_pool_invariants(self, sub, kv):
         """Per-sub-pool: v2p ∘ p2v identity on the live set, hole-free
         allocated band, data followed relocations."""
@@ -2671,6 +2717,91 @@ class TestChainFrontierWalk(unittest.TestCase):
         # Opaque non-lazy middle blocks the far end's credit.
         stub.transparent = False
         self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
+
+
+class TestFloatFusedAllocBind(unittest.TestCase):
+    """The float's fused span-extend + bind fast path (O1).
+
+    Derived-property guard: the fused path exists because the fresh float
+    range is contiguous ascending, so one `alloc_bind_inplace` launch is
+    byte-identical to arange + two scatters. That equivalence spans THREE
+    span-extension shapes (midpoint reposition, extend-high, extend-low) and
+    is exactly the kind of "looks equivalent" rewrite that can silently break
+    one path only — so each shape is asserted fused == slow on twin fixtures.
+
+    Bookkeeping guards: the fused gate must NOT fire while holes exist
+    (holes-first invariant — firing would leak holes and grow the span,
+    raising make_room pressure with no visible failure), and a too-large ask
+    must leave the watermarks untouched (the take_physical_pages contract).
+    CPU-driven via alloc_bind_inplace's pure-torch reference.
+    """
+
+    def _float(self):
+        inst = TestFloatMultiEndedAllocator(
+            [m for m in dir(TestFloatMultiEndedAllocator) if m.startswith("test_")][0]
+        )
+        _pool, _sa, fla, _da, _kv = inst._build_tri()
+        return fla
+
+    def test_fused_matches_slow_across_all_extension_shapes(self):
+        fa, fb = self._float(), self._float()
+        lows, highs = set(), set()
+        v_lo = 0
+        # N sequence chosen so the tie-break walks all three shapes:
+        # midpoint (transparent), then high (gaps tied -> high), then low
+        # (high gap now smaller). Sanity-checked below, not assumed.
+        for n in (3, 4, 2):
+            v = torch.arange(v_lo, v_lo + n, dtype=torch.int64, device=_DEV)
+            v_lo += n
+            self.assertEqual(fa._hole_pages(), 0)  # fused path armed
+            phys_fast = fa._alloc_bind_fast_or_slow(v, n)
+            phys_slow = fb.take_physical_pages(n)
+            fb.bind(v, phys_slow)
+            self.assertIsNotNone(phys_fast)
+            self.assertTrue(bool(torch.equal(phys_fast, phys_slow)))
+            self.assertEqual(fa.low_wm_page, fb.low_wm_page)
+            self.assertEqual(fa.high_wm_page, fb.high_wm_page)
+            self.assertTrue(
+                bool(torch.equal(fa.virtual_to_physical, fb.virtual_to_physical))
+            )
+            self.assertTrue(
+                bool(torch.equal(fa.physical_to_virtual, fb.physical_to_virtual))
+            )
+            lows.add(fa.low_wm_page)
+            highs.add(fa.high_wm_page)
+        # The sequence really did extend BOTH directions (else the
+        # equivalence above silently covered one shape twice).
+        self.assertGreater(len(lows), 1)
+        self.assertGreater(len(highs), 1)
+
+    def test_holes_disarm_the_fused_path(self):
+        fla = self._float()
+        v = torch.arange(0, 4, dtype=torch.int64, device=_DEV)
+        self.assertIsNotNone(fla._alloc_bind_fast_or_slow(v, 4))
+        hole_phys = int(fla.virtual_to_physical[1].item())
+        fla.free(torch.tensor([1], dtype=torch.int64, device=_DEV))
+        self.assertEqual(fla._hole_pages(), 1)
+        lo, hi = fla.low_wm_page, fla.high_wm_page
+        v2 = torch.tensor([9], dtype=torch.int64, device=_DEV)
+        phys = fla._alloc_bind_fast_or_slow(v2, 1)
+        # Holes-first: the freed page is reused, the span does not grow.
+        self.assertEqual(int(phys.item()), hole_phys)
+        self.assertEqual((fla.low_wm_page, fla.high_wm_page), (lo, hi))
+        self.assertEqual(fla._hole_pages(), 0)
+
+    def test_failed_ask_leaves_watermarks_untouched(self):
+        fla = self._float()
+        v = torch.arange(0, 2, dtype=torch.int64, device=_DEV)
+        self.assertIsNotNone(fla._alloc_bind_fast_or_slow(v, 2))
+        lo, hi = fla.low_wm_page, fla.high_wm_page
+        region_lo, region_hi = fla._region_bounds_pages()
+        too_many = (region_hi - region_lo) + 1
+        v_big = torch.arange(2, 2 + too_many, dtype=torch.int64, device=_DEV)
+        self.assertIsNone(fla._alloc_bind_fast_or_slow(v_big, too_many))
+        self.assertEqual((fla.low_wm_page, fla.high_wm_page), (lo, hi))
+        # A fitting ask still succeeds afterwards.
+        v_ok = torch.tensor([2], dtype=torch.int64, device=_DEV)
+        self.assertIsNotNone(fla._alloc_bind_fast_or_slow(v_ok, 1))
 
 
 class TestFloatMultiEndedAllocator(unittest.TestCase):
