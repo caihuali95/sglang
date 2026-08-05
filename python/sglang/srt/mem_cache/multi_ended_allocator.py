@@ -30,7 +30,13 @@ from typing import Dict, Generic, List, Optional, Sequence, Set, Tuple, TypeVar
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace, translate_v2p
+import msgspec
+
+from sglang.kernels.ops.memory.virtual_slot import (
+    alloc_bind_inplace,
+    alloc_decode_dual_bind,
+    translate_v2p,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -93,6 +99,30 @@ def _install_signal_handlers_once() -> None:
 
 
 _T = TypeVar("_T")
+
+
+class _PhysReservation(msgspec.Struct):
+    """COMMITTED physical-page reservation, before any tensor materializes.
+
+    `_reserve_phys_pages` performs the state side of taking pages (watermark /
+    span advance, hole-slice consumption, live count — all Python ints and
+    epoch-bumping rebinds) and returns this plan. Page `i` of the reservation
+    is `drained[i]` for `i < n_drained` (holes drain from the slice front on
+    every band type), else `start_phys + (i - n_drained)`. Consumers either
+    materialize the id tensor (`_materialize_reservation`, the classic
+    `take_physical` surface) or bind straight from the plan in-kernel
+    (`alloc_decode_dual_bind`).
+    """
+
+    drained: Optional[torch.Tensor]  # hole-slice view; None when n_drained == 0
+    n_drained: int
+    start_phys: int  # ascending extension base; 0 when n_extended == 0
+    n_extended: int
+
+
+_EMPTY_RESERVATION = _PhysReservation(
+    drained=None, n_drained=0, start_phys=0, n_extended=0
+)
 
 
 class _CapacityField(Generic[_T]):
@@ -742,78 +772,102 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"take_physical: need_size={need_size} must be a multiple of "
                 f"page_size={self.page_size}"
             )
-            num_pages = need_size // self.page_size
+            plan = self._reserve_phys_pages(need_size // self.page_size)
+            if plan is None:
+                return None
+            return self._materialize_reservation(plan)
 
-            if not self.lazy_compaction:
-                return self._take_physical_eager(num_pages)
+    def _reserve_phys_pages(self, num_pages: int) -> Optional[_PhysReservation]:
+        """Commit the STATE side of taking `num_pages` physical pages — no id
+        tensor yet (see `_PhysReservation`). Returns None on shortfall with
+        state untouched.
 
-            # Lazy: slice the GPU free list (no D2H). sort ON: take deepest-in-band
-            # per direction (greedy clustering). sort OFF: take from front.
-            n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
-            need_more = num_pages - n_drain
-
-            # Extend first (state untouched on failure), then drain holes.
-            if need_more > 0:
-                if not self._extend_watermark(need_more):
-                    return None
-
-            if n_drain > 0:
-                drained_t = self._free_phys_pages[:n_drain]
-                self._free_phys_pages = self._free_phys_pages[n_drain:]
-            else:
-                drained_t = None
-
-            self.live_page_count += num_pages
-
-            if drained_t is None:
-                return self._take_physical_arange(num_pages)
-
-            # Pure drain — clone off the free-list view so rebindings don't pin it.
-            if need_more == 0:
-                return drained_t.clone()
-
-            # Mixed: drained holes ++ extended pages (`bind` is order-agnostic).
+        Eager: pure watermark advance. Lazy: extend first (state untouched on
+        failure), then consume the hole slice from the front (no D2H)."""
+        if num_pages <= 0:
+            return _EMPTY_RESERVATION
+        if not self.lazy_compaction:
             if self.grow_direction == "up":
-                new_wm = self.watermark_physical
-                extended_t = torch.arange(
-                    new_wm - need_more,
-                    new_wm,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
+                start = self.watermark_physical
+                if start + num_pages > self.num_pages:
+                    return None
+                self.watermark_physical = start + num_pages
             else:
-                new_wm = self.watermark_physical
-                extended_t = torch.arange(
-                    new_wm + need_more,
-                    new_wm,
-                    -1,
-                    dtype=torch.int64,
-                    device=self.device,
-                )
-            return torch.cat([drained_t, extended_t])
+                start = self.watermark_physical - num_pages + 1
+                if start < self.min_page_index:
+                    return None
+                self.watermark_physical -= num_pages
+            return _PhysReservation(
+                drained=None,
+                n_drained=0,
+                start_phys=start,
+                n_extended=num_pages,
+            )
 
-    def _take_physical_eager(self, num_pages: int) -> Optional[torch.Tensor]:
-        """Eager-mode take_physical — contiguous range."""
-        if self.grow_direction == "up":
-            start = self.watermark_physical
-            end_exclusive = start + num_pages
-            if end_exclusive > self.num_pages:
-                return None
-            phys_pages = torch.arange(
-                start, end_exclusive, dtype=torch.int64, device=self.device
-            )
-            self.watermark_physical = end_exclusive
-            return phys_pages
+        n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
+        need_more = num_pages - n_drain
+        # Extend first (state untouched on failure), then drain holes.
+        if need_more > 0 and not self._extend_watermark(need_more):
+            return None
+
+        if n_drain > 0:
+            drained = self._free_phys_pages[:n_drain]
+            self._free_phys_pages = self._free_phys_pages[n_drain:]
         else:
-            end = self.watermark_physical
-            start = end - num_pages + 1
-            if start < self.min_page_index:
-                return None
-            phys_pages = torch.arange(
-                start, end + 1, dtype=torch.int64, device=self.device
+            drained = None
+
+        self.live_page_count += num_pages
+        if need_more > 0:
+            start = (
+                self.watermark_physical - need_more
+                if self.grow_direction == "up"
+                else self.watermark_physical + 1
             )
-            self.watermark_physical -= num_pages
-            return phys_pages
+        else:
+            start = 0
+        return _PhysReservation(
+            drained=drained,
+            n_drained=n_drain,
+            start_phys=start,
+            n_extended=need_more,
+        )
+
+    def _materialize_reservation(self, plan: _PhysReservation) -> torch.Tensor:
+        """Physical PAGE ids of a reservation, byte-identical to the historical
+        `take_physical` tensors. The mixed grow-down case keeps its historical
+        DESCENDING extension order; fresh-page pairing is otherwise order-free
+        (`bind` is order-agnostic), which is why the fused decode kernel may
+        bind the same reservation in plain ascending order instead."""
+        if plan.n_drained == 0 and plan.n_extended == 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        if plan.n_drained == 0:
+            return torch.arange(
+                plan.start_phys,
+                plan.start_phys + plan.n_extended,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        # Pure drain — clone off the free-list view so rebindings don't pin it.
+        if plan.n_extended == 0:
+            return plan.drained.clone()
+        # Mixed: drained holes ++ extended pages (`bind` is order-agnostic).
+        if self.grow_direction == "down":
+            extended_t = torch.arange(
+                plan.start_phys + plan.n_extended - 1,
+                plan.start_phys - 1,
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            extended_t = torch.arange(
+                plan.start_phys,
+                plan.start_phys + plan.n_extended,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        return torch.cat([plan.drained, extended_t])
+
 
     def _extend_watermark(self, num_pages: int) -> bool:
         """Advance the watermark by `num_pages` (lazy-path helper). Returns False
@@ -851,22 +905,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.watermark_physical = new_wm
         return True
 
-    def _take_physical_arange(self, num_pages: int) -> torch.Tensor:
-        """Contiguous arange for an already-applied watermark extension."""
-        if self.grow_direction == "up":
-            return torch.arange(
-                self.watermark_physical - num_pages,
-                self.watermark_physical,
-                dtype=torch.int64,
-                device=self.device,
-            )
-        return torch.arange(
-            self.watermark_physical + 1,
-            self.watermark_physical + num_pages + 1,
-            dtype=torch.int64,
-            device=self.device,
-        )
-
     def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
         """Page-granular wrapper around ``take_physical``."""
         with record_function("MultiEndedAlloc.take_physical_pages"):
@@ -903,7 +941,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 start_wm = self.watermark_physical  # kernel's `start_phys`
 
                 # Lazy uses `_extend_watermark` (index + peer checks); eager
-                # inlines the index-only check to match `_take_physical_eager`.
+                # inlines the index-only check to match the eager reservation.
                 if self.lazy_compaction:
                     if not self._extend_watermark(N):
                         return None
@@ -2246,33 +2284,42 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
                 return start
         return None  # neither side fits; state untouched
 
-    def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+    def _reserve_phys_pages(self, num_pages: int) -> Optional[_PhysReservation]:
+        """Float variant: span extension via `_extend_span_pages` (extend
+        first — state untouched on failure), then hole-slice consumption from
+        the front. The float's fresh range is contiguous ascending regardless
+        of which side the span grew; the inherited materialization is exact
+        (its grow-down descending quirk never fires — grow_direction is
+        "float")."""
         if num_pages <= 0:
-            return torch.empty(0, dtype=torch.int64, device=self.device)
+            return _EMPTY_RESERVATION
         n_drain = min(num_pages, self._hole_pages())
         need_more = num_pages - n_drain
-
-        fresh: Optional[torch.Tensor] = None
+        start = 0
         if need_more > 0:
-            # Extend first (state untouched on failure), then drain holes.
-            start = self._extend_span_pages(need_more)
-            if start is None:
+            extended_start = self._extend_span_pages(need_more)
+            if extended_start is None:
                 return None
-            fresh = torch.arange(
-                start, start + need_more, dtype=torch.int64, device=self.device
-            )
-
+            start = extended_start
         if n_drain > 0:
-            drained = self._free_phys_pages[:n_drain].clone()
+            drained = self._free_phys_pages[:n_drain]
             self._free_phys_pages = self._free_phys_pages[n_drain:]
         else:
             drained = None
+        return _PhysReservation(
+            drained=drained,
+            n_drained=n_drain,
+            start_phys=start,
+            n_extended=need_more,
+        )
 
-        if drained is None:
-            return fresh
-        if fresh is None:
-            return drained
-        return torch.cat([drained, fresh])
+    def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
+        if num_pages <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        plan = self._reserve_phys_pages(num_pages)
+        if plan is None:
+            return None
+        return self._materialize_reservation(plan)
 
     def take_physical(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size <= 0:
@@ -3413,32 +3460,59 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Paged decode. One new token per request (a page is consumed iff the
-        decode wraps). Same one-kernel-in-virtual-space discipline as ``alloc_extend``.
+        """Paged decode, fully fused: ONE kernel computes the per-request token
+        slots AND binds each consumed virtual page in BOTH physical spaces.
+
+        The Python side only plans: the joint capacity gate, then a per-side
+        `_reserve_phys_pages` (watermark/span/hole state — epoch-bumping ints),
+        then the single `alloc_decode_dual_bind` launch reads straight from the
+        two reservations. Replaces the historical chain of alloc_decode kernel
+        + two snapshot clones + two `alloc_bind_inplace` launches per step.
         """
         with record_function("UnifiedSWAAlloc.alloc_decode"):
+            fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+            bs = len(seq_lens)
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
+            if num_new_pages > len(fa.free_virtual_ids):
+                return None
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
+            if fa.need_sort and bs > len(fa.free_virtual_ids):
+                fa.merge_and_sort_free()
 
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = fa.alloc_decode(
-                seq_lens, seq_lens_cpu, last_loc, num_new_pages=num_new_pages
+            plan_f = fa._reserve_phys_pages(num_new_pages)
+            assert plan_f is not None, (
+                "UnifiedSWA.alloc_decode: full-side reservation failed after "
+                "joint pre-check passed — internal-state inconsistency"
             )
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_decode: full.alloc_decode returned None "
-                "after joint pre-check passed — internal-state inconsistency"
+            plan_s = sa._reserve_phys_pages(num_new_pages)
+            assert plan_s is not None, (
+                "UnifiedSWA.alloc_decode: swa-side reservation failed after "
+                "joint pre-check passed — internal-state inconsistency"
             )
 
-            if new_virtual_pages.numel() > 0:
-                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-
+            out_indices = alloc_decode_dual_bind(
+                seq_lens=seq_lens,
+                last_loc=last_loc,
+                free_virtual_pages=fa.free_virtual_ids,
+                num_new_pages=num_new_pages,
+                page_size=self.page_size,
+                v2p_a=fa.virtual_to_physical,
+                p2v_a=fa.physical_to_virtual,
+                holes_a=plan_f.drained,
+                nd_a=plan_f.n_drained,
+                start_a=plan_f.start_phys,
+                v2p_b=sa.virtual_to_physical,
+                p2v_b=sa.physical_to_virtual,
+                holes_b=plan_s.drained,
+                nd_b=plan_s.n_drained,
+                start_b=plan_s.start_phys,
+            )
+            fa.free_virtual_ids = fa.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual TOKEN ids
 
     def is_slot_allocated(self, slot: int) -> bool:
