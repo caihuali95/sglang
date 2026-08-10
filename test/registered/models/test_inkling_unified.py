@@ -9,8 +9,9 @@ machinery) and hybrid-SWA, so booting AT ALL proves the tri routing branch
 pre-tri hazard — or fail loud).
 
 Guards (undertrained checkpoint — code-path correctness, not answer quality):
-  - tri boot + generation through the Triton backend (unified forces triton;
-    Inkling's fa4 default is NOT unified-compatible);
+  - tri boot + generation through the pinned Triton backend, plus a
+    resolved-default boot (Inkling is uniform-row, so since G1 the dense-view
+    MHA family — fa3/fa4/flashinfer/trtllm_mha — is allowed too);
   - decode/prefill KV consistency via the input-vs-output logprobs match
     (catches wrong-slot reads through the v2p translate on any of the three
     pools);
@@ -45,23 +46,24 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1000, stage="base-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
 
 
-def _unified_args():
+def _unified_args(pin_backend: bool = True):
     """Server args for the tri-pool boot. Mirrors test_inkling.py's fixture
     minus the multimodal/parser surface (KV-path focus), plus the unified
     flags. The ratios still feed boot sizing until the byte configurator
-    lands; the runtime split floats regardless."""
+    lands; the runtime split floats regardless.
+
+    ``pin_backend=False`` runs whatever the host resolves — Inkling is
+    uniform-row, so its MHA + SWA sub-pools flip to dense views and the
+    resolved default must be in the G1 allow-list or the boot fails."""
     args = [
         "--trust-remote-code",
         "--enable-unified-memory",
-        # Unified requires the Triton strided page-major read/write paths.
-        "--attention-backend",
-        "triton",
         "--page-size",
         "128",
         "--mamba-radix-cache-strategy",
@@ -73,6 +75,8 @@ def _unified_args():
         "--mem-fraction-static",
         "0.5",
     ]
+    if pin_backend:
+        args += ["--attention-backend", "triton"]
     if _MODEL_REVISION:
         args += ["--revision", _MODEL_REVISION]
     return args
@@ -177,6 +181,24 @@ class TestInklingUnifiedTriPool(CustomTestCase):
             max_new_tokens=512,
         )
         self.assertGreater(len(data["text"].strip()), 0, data)
+
+
+class TestInklingUnifiedTriPoolResolvedDefault(TestInklingUnifiedTriPool):
+    """Tri-pool boot with NO backend pin: dense MHA/SWA views under whatever
+    the host resolves (fa3 on Hopper). The resolved default must be in the G1
+    allow-list or the boot itself fails — the tripwire a pinned cell hides."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=_unified_args(pin_backend=False),
+            env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+        )
 
 
 @unittest.skipUnless(

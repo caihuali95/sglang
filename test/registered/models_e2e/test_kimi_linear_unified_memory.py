@@ -32,7 +32,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=600, suite="nightly-4-gpu", nightly=True)
+register_cuda_ci(est_time=1200, suite="nightly-4-gpu", nightly=True)
 
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
@@ -52,6 +52,20 @@ class TestKimiLinearUnifiedMemory(
         "--chunked-prefill-size",
         "2048",
         "--enable-unified-memory",
+    ]
+
+
+class TestKimiLinearUnifiedMemoryFlashMLA(TestKimiLinearUnifiedMemory):
+    """flashmla at its ps=64 snap: the R5-wired block-table route
+    (KVIndexSource.build_into into flashmla's padded tables) plus the ps=64
+    sub-pool sizing (64-token sink floor, dense-view tail pad) end to end.
+    Hopper-only, like the rest of this nightly suite."""
+
+    other_args = TestKimiLinearUnifiedMemory.other_args + [
+        "--attention-backend",
+        "flashmla",
+        "--page-size",
+        "64",
     ]
 
 
