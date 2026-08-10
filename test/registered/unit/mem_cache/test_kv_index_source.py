@@ -271,6 +271,71 @@ class TestCanonicalBuild(unittest.TestCase):
             self.assertEqual(int(table[2, 0]), 0, "tombstone not sunk")
 
 
+class TestBuildInto(unittest.TestCase):
+    """build_into fills a backend-owned padded block table's live prefix with
+    FULL-side canonical entries — the trtllm_mla / flashmla consumption route
+    (their rows ARE the canonical rows)."""
+
+    def test_prefix_filled_tail_sentinel_preserved_width_capped(self):
+        """Three contracts in one batch: entries equal the canonical formula,
+        lanes past each row's live pages keep the backend's -1 sentinel
+        (prefix-only — a tail write scatters the trtllm sentinel contract),
+        and a table padded WIDER than the req_to_token page span (trtllm's
+        LCM alignment) is capped instead of tripping the builder's width
+        assert."""
+        ps = 4
+        full_mult = 2 * _FULL_L
+        allocator = _build_composite(ps, full_mult=full_mult)
+        lens = [5, 2 * ps + 1, 1]
+        req_to_token, rows, seq_lens = TestCanonicalBuild._alloc_and_fill(
+            self, allocator, ps, lens=lens
+        )
+        src = _make_source(allocator, req_to_token, ps)
+        self.assertTrue(src.enabled)
+
+        width_pages = req_to_token.shape[1] // ps + 3  # wider than the span
+        out = torch.full((len(lens), width_pages), -1, dtype=torch.int32)
+        got = src.build_into(out=out, req_pool_indices=rows, seq_lens=seq_lens)
+        self.assertIs(got, out)
+
+        want = _reference_table(
+            req_to_token,
+            rows,
+            seq_lens,
+            allocator.full_v2p_page_table,
+            full_mult,
+            ps,
+            width_pages,
+        )
+        for b, n in enumerate(lens):
+            n_pages = -(-n // ps)
+            self.assertTrue(
+                torch.equal(out[b, :n_pages], want[b, :n_pages]),
+                f"row {b} live prefix off-formula",
+            )
+            self.assertTrue(
+                bool((out[b, n_pages:] == -1).all()),
+                f"row {b} tail sentinel clobbered",
+            )
+
+    def test_passthrough_source_refuses(self):
+        """Callers dispatch on `enabled`; a passthrough source has no v2p to
+        build from and must fail loud, not fill garbage."""
+        src = KVIndexSource(
+            req_to_token=torch.zeros((2, 4), dtype=torch.int64),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(),
+            page_size=1,
+            device=_DEV,
+        )
+        with self.assertRaises(AssertionError):
+            src.build_into(
+                out=torch.zeros((1, 4), dtype=torch.int32),
+                req_pool_indices=torch.tensor([0]),
+                seq_lens=torch.tensor([1]),
+            )
+
+
 class TestCaptureContract(unittest.TestCase):
     def test_capture_buffers_zero_filled_idempotent_and_prefix_only(self):
         ps = 4
