@@ -1,12 +1,14 @@
 """
-End-to-end accuracy test for the unified memory pool on a GDN-hybrid model.
+End-to-end accuracy tests for the unified memory pool on a GDN-hybrid model.
 
 Launches Qwen3.5-4B (a gated-delta-net / linear-attention hybrid) with
-``--enable-unified-memory`` on the Triton attention + linear-attn + Mamba
-backends and checks that GSM8K accuracy holds. This exercises the unified
-envelope's most bug-prone path: the Mamba conv/SSM state stored as a strided
-envelope view, plus the full-attention KV stored as dense per-layer views,
-both read/written by the GDN prefill and decode kernels.
+``--enable-unified-memory`` across the dense-view backend matrix, checking
+GSM8K accuracy on each. The GDN hybrid exercises the path most prone to
+subtle bugs: the Mamba conv/SSM state is a strided envelope view (its kernels
+are stride-aware by design), while the full-attention KV is DENSE per-layer
+views the fa3 / flashinfer cells read through the choke point's canonical
+page tables. The resolved-default cell pins the no-pin path (a pinned backend
+hides default-resolution breakage by construction).
 
 Registered to the label-gated ``run-ci-extra`` suite (opt-in, not per-commit).
 
@@ -22,8 +24,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=300, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1800, stage="extra-a", runner_config="1-gpu-large")
 
+# The Mamba conv/SSM state is envelope-strided under the unified pool, so the
+# linear/mamba backends stay Triton in every cell (enforced by the gate).
 _UNIFIED_COMMON_ARGS = [
     "--trust-remote-code",
     "--mem-fraction-static",
@@ -74,6 +78,28 @@ class TestUnifiedQwenHybridTriton(DefaultServerBase):
             f"(threshold: {self.gsm8k_threshold})"
         )
         self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
+
+
+class TestUnifiedQwenHybridFa3(TestUnifiedQwenHybridTriton):
+    """Unified pool, fa3 pinned: canonical page tables (eager direct-bind +
+    captured fused copy)."""
+
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "fa3"]
+
+
+class TestUnifiedQwenHybridFlashinfer(TestUnifiedQwenHybridTriton):
+    """Unified pool, flashinfer pinned: dense token ids reconstructed from the
+    canonical by the ENTRY_PAGE_SIZE CSR builder (page-1 addressing IS dense
+    addressing, so the cell is pool-page-size-agnostic)."""
+
+    other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "flashinfer"]
+
+
+class TestUnifiedQwenHybridResolvedDefault(TestUnifiedQwenHybridTriton):
+    """Unified pool, NO backend pin: whatever the host resolves must be in the
+    backend allow-list or the server fails to boot under its own defaults."""
+
+    other_args = _UNIFIED_COMMON_ARGS
 
 
 if __name__ == "__main__":
