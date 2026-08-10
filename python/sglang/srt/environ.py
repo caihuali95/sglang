@@ -356,6 +356,11 @@ class Envs:
     # diagnostic, verify_byte_accounting) from a leak report to a hard
     # RuntimeError. Validation/CI knob; default off in production.
     SGLANG_ENABLE_STRICT_UNIFIED_BYTE_CHECK = EnvBool(False)
+    # Force the unified pool's MHA/SWA sub-pools onto the STRIDED page-major
+    # views (Triton-only) even when uniform K/V rows make dense views eligible.
+    # A/B escape hatch for the dense-view rollout; the backend allow-list
+    # narrows to triton accordingly. Default False (dense when eligible).
+    SGLANG_FORCE_STRIDED_UNIFIED_MHA = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)
 
