@@ -3100,6 +3100,8 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        full_kernel_page_multiplier: int = 1,
+        swa_kernel_page_multiplier: int = 1,
     ):
         # Set _size_full / _size_swa BEFORE base init (read during it). STATIC
         # partition caps — the slot-conservation value the leak invariant expects.
@@ -3134,6 +3136,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            kernel_page_multiplier=full_kernel_page_multiplier,
         )
         self.swa_attn_allocator = self._build_swa_attn_allocator(
             kvcache=kvcache.swa_kv_pool,
@@ -3143,6 +3146,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            kernel_page_multiplier=swa_kernel_page_multiplier,
         )
         self._wire_peers()
 
@@ -3382,15 +3386,60 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         # tombstone-safety clamp is the kernel's: tombstoned (-1) v2p_swa
         # entries must not reach `swa_k_buffer[-1]` (illegal under replay);
         # clamping routes them to the reserved padding sink (slot 0).
+        #
+        # `page_stride` carries the swa side's dense scale: multiplier 1
+        # (strided views) collapses to plain physical ids; multiplier 2*L_swa
+        # (dense views) emits swa-DENSE ids. int32 stays safe by construction:
+        # emitted ids are < the swa sub-pool's n_dense, which UnifiedKVPool
+        # asserts < 2^31 when building dense views.
         sa = self.swa_attn_allocator
         return translate_v2p(
             kv_indices,
             sa.virtual_to_physical,
             page_size=sa.page_size,
-            page_stride=sa.page_size,
+            page_stride=sa.page_size * sa.kernel_page_multiplier,
             out=out,
             out_dtype=torch.int32,
         )
+
+    # -- dense (kernel-facing) id surface --
+    #
+    # Mirrors the mamba composite: presence of `translate_kv_loc_dense` /
+    # `full_v2p_page_table` is what flips the dense-first probes in
+    # `apply_unified_kv_loc_rebind` and the attention backends. With both
+    # multipliers left at 1 (strided views) every entry point below collapses
+    # to the physical translate, byte-identical to the pre-dense composite.
+
+    @property
+    def kernel_page_multiplier(self) -> int:
+        return self.full_attn_allocator.kernel_page_multiplier
+
+    @property
+    def full_v2p_page_table(self) -> torch.Tensor:
+        """Page-level virtual->physical table of the full sub-pool; block-table
+        builders gather through this then scale by `kernel_page_multiplier`."""
+        return self.full_attn_allocator.virtual_to_physical
+
+    def translate_kv_loc_dense(
+        self,
+        loc: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Full-pool virtual TOKEN ids -> DENSE (kernel-facing) ids. Falls back
+        to the physical translate when `kernel_page_multiplier == 1` (strided)."""
+        return self.full_attn_allocator.translate_kv_loc_dense(loc, out=out)
+
+    @property
+    def swa_kernel_page_multiplier(self) -> int:
+        return self.swa_attn_allocator.kernel_page_multiplier
+
+    @property
+    def swa_v2p_page_table(self) -> torch.Tensor:
+        """Page-level virtual->physical table of the SWA sub-pool. The swa read
+        table is built DIRECTLY from virtual ids through this (never chained
+        through full-physical), scaled by `swa_kernel_page_multiplier`."""
+        return self.swa_attn_allocator.virtual_to_physical
 
     # -- alloc --
 
@@ -3769,6 +3818,8 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
         lazy_compaction: bool = False,
+        full_kernel_page_multiplier: int = 1,
+        swa_kernel_page_multiplier: int = 1,
     ):
         super().__init__(
             unified_buffer=unified_buffer,
@@ -3780,6 +3831,8 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
             need_sort=need_sort,
             forward_stream=forward_stream,
             lazy_compaction=lazy_compaction,
+            full_kernel_page_multiplier=full_kernel_page_multiplier,
+            swa_kernel_page_multiplier=swa_kernel_page_multiplier,
         )
         # Per-request state END pool (grow-up; page_size=1 — state is
         # per-request, orthogonal to KV paging).

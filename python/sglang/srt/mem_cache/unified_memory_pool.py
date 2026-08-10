@@ -1674,7 +1674,8 @@ class UnifiedSWAKVPool(SWAKVPool):
         *,
         out: Optional[torch.Tensor] = None,
     ):
-        """Virtual token ids -> swa-physical token ids.
+        """Virtual token ids -> swa kernel-facing ids (physical for strided
+        views, swa-DENSE for dense views).
 
         One fused kernel (`translate_v2p`) for the page math, matching the
         composite allocator's method of the same name — including its
@@ -1691,12 +1692,15 @@ class UnifiedSWAKVPool(SWAKVPool):
             "UnifiedSWAKVPool.translate_loc_from_full_to_swa called before "
             "attach_allocators"
         )
+        # `page_stride` carries the swa side's dense scale (1x for strided
+        # views, 2*L_swa for dense views) — must match the composite
+        # allocator's method of the same name.
         ps = self._swa_allocator.page_size
         return translate_v2p(
             kv_indices,
             self._swa_allocator.virtual_to_physical,
             page_size=ps,
-            page_stride=ps,
+            page_stride=ps * self._swa_allocator.kernel_page_multiplier,
             out=out,
             out_dtype=torch.int32,
         )
