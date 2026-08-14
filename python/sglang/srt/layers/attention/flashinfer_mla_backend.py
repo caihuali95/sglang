@@ -28,12 +28,12 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.dcp import (
     DecodeContextParallelMetadata,
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTable
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
@@ -238,6 +238,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_index_translator = model_runner.kv_index_translator
         self.enable_chunk_kv = (
             not skip_prefill
             and get_disagg().disaggregation_mode != "decode"
@@ -342,6 +343,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
+        index_table = self.kv_index_translator.build_index_table(
+            req_pool_indices=req_pool_indices[:bs],
+            seq_lens=seq_lens[:bs],
+            captured=True,
+        )
+
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             seq_lens_sum = seq_lens.sum().item()
@@ -364,6 +371,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     decode_wrapper=decode_wrapper,
                     init_metadata_replay=False,
                     spec_info=spec_info,
+                    index_table=index_table,
                 )
                 self.decode_cuda_graph_metadata[bs] = decode_wrapper
                 self.forward_metadata = DecodeMetadata(decode_wrapper)
@@ -395,6 +403,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
+                index_table=index_table,
                 in_capture=True,
             )
             if forward_mode.is_target_verify() and (
@@ -412,9 +421,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                index_table=index_table,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        index_table = self.kv_index_translator.index_table_for_batch(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -422,6 +433,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_batch.seq_lens_sum,
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
+                index_table=index_table,
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
         elif forward_batch.forward_mode.is_target_verify():
@@ -433,6 +445,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefill_wrapper_paged=self.prefill_wrapper_verify,
                 use_ragged=False,
                 spec_info=forward_batch.spec_info,
+                index_table=index_table,
             )
             self.forward_metadata = PrefillMetadata(self.prefill_wrapper_verify, False)
         else:
@@ -481,6 +494,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 qo_indptr_cpu=qo_indptr_cpu,
                 kv_indptr_cpu=kv_indptr_cpu,
                 kv_len_arr_cpu=kv_len_arr_cpu,
+                index_table=index_table,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -492,6 +506,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        self.kv_index_translator.ensure_capture_buffers(
+            max_bs=max_bs, max_context_len=self.max_context_len
+        )
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len,),
@@ -535,6 +552,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        index_table: KVIndexTable,
         in_capture: bool = False,
     ):
         """Shared capture+replay body for the cuda-graph init path.
@@ -563,6 +581,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 decode_wrapper=self.decode_cuda_graph_metadata[bs],
                 init_metadata_replay=True,
                 spec_info=spec_info,
+                index_table=index_table,
                 **self.fast_decode_kwargs,
             )
         elif forward_mode.is_target_verify():
@@ -613,6 +632,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     if use_generic_fast_plan
                     else None
                 ),
+                index_table=index_table,
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -845,12 +865,7 @@ class FlashInferMLAIndicesUpdaterDecode:
 
         # Buffers and wrappers
         self.kv_indptr = attn_backend.kv_indptr
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.q_indptr = attn_backend.q_indptr_decode
-        # Unified dense MLA pool: VIRTUAL -> DENSE kv_indices (see prefill updater).
-        self._translate_kv_loc_dense = unified_mla_hooks(
-            model_runner.token_to_kv_pool_allocator
-        ).translate_kv_loc_dense
 
     def update(
         self,
@@ -860,6 +875,8 @@ class FlashInferMLAIndicesUpdaterDecode:
         decode_wrapper: BatchMLAPagedAttentionWrapper,
         init_metadata_replay: bool = False,
         spec_info: Optional[SpecInput] = None,
+        *,
+        index_table: KVIndexTable,
         **fast_decode_kwargs,
     ):
         decode_wrapper = decode_wrapper or self.decode_wrapper
@@ -872,6 +889,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             self.kv_indptr,
             init_metadata_replay,
             spec_info,
+            index_table=index_table,
             **fast_decode_kwargs,
         )
 
@@ -885,6 +903,8 @@ class FlashInferMLAIndicesUpdaterDecode:
         kv_indptr: torch.Tensor,
         init_metadata_replay: bool = False,
         spec_info: Optional[SpecInput] = None,
+        *,
+        index_table: KVIndexTable,
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
@@ -900,29 +920,15 @@ class FlashInferMLAIndicesUpdaterDecode:
                 else fast_decode_kwargs["kv_indices"]
             )
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
+                index_table.ids,
+                index_table.row_ids,
                 paged_kernel_lens,
                 kv_indptr,
                 None,
                 kv_indices,
-                self.req_to_token.shape[1],
+                index_table.row_stride,
+                ENTRY_PAGE_SIZE=index_table.entry_page_size,
             )
-            # Unified pool: VIRTUAL -> DENSE, written back IN PLACE.
-            #
-            # On the cuda-graph replay path `kv_indices` IS the capture-stable
-            # buffer (fast_decode_kwargs["kv_indices"] == cuda_graph_kv_indices)
-            # that the captured wrapper reads, and `fast_mla_decode_plan` ignores
-            # the kv_indices argument entirely -- rebinding the local name to a
-            # fresh tensor would leave the graph reading VIRTUAL ids. Only the
-            # [:paged_kernel_lens_sum] prefix the index kernel just filled is
-            # translated; the stale tail is left alone so it can never index the
-            # v2p table out of bounds. The int64 translate result narrows back to
-            # the buffer's int32 on copy_ (flashinfer requires int32; dense ids
-            # fit comfortably).
-            if self._translate_kv_loc_dense is not None:
-                valid = kv_indices[:paged_kernel_lens_sum]
-                valid.copy_(self._translate_kv_loc_dense(valid))
 
             if get_parallel().dcp_enabled:
                 plan_dcp_decode_metadata(
@@ -988,12 +994,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
         self.qo_indptr = attn_backend.qo_indptr
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
-        # Unified dense MLA pool: kv_indices built from req_to_token are VIRTUAL;
-        # the paged wrapper reads the dense per-layer view, so remap them to DENSE
-        # token ids. None (identity) unless the unified MLA pool is active.
-        self._translate_kv_loc_dense = unified_mla_hooks(
-            model_runner.token_to_kv_pool_allocator
-        ).translate_kv_loc_dense
 
     def update(
         self,
@@ -1006,6 +1006,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput] = None,
         attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
         fast_verify_plan_kwargs: Optional[dict] = None,
+        *,
+        index_table: KVIndexTable,
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
@@ -1034,6 +1036,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             qo_indptr_cpu=qo_indptr_cpu,
             kv_indptr_cpu=kv_indptr_cpu,
             kv_len_arr_cpu=kv_len_arr_cpu,
+            index_table=index_table,
         )
 
     def call_begin_forward(
@@ -1051,6 +1054,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput] = None,
         attn_dcp_metadata: Optional[DecodeContextParallelMetadata] = None,
         fast_verify_plan_kwargs: Optional[dict] = None,
+        *,
+        index_table: KVIndexTable,
         qo_indptr_cpu: Optional[torch.Tensor] = None,
         kv_indptr_cpu: Optional[torch.Tensor] = None,
         kv_len_arr_cpu: Optional[torch.Tensor] = None,
@@ -1068,20 +1073,15 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 device=req_pool_indices.device,
             )
             create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
+                index_table.ids,
+                index_table.row_ids,
                 paged_kernel_lens,
                 kv_indptr,
                 None,
                 kv_indices,
-                self.req_to_token.shape[1],
+                index_table.row_stride,
+                ENTRY_PAGE_SIZE=index_table.entry_page_size,
             )
-            # Unified pool: VIRTUAL -> DENSE token ids for the paged wrapper.
-            # Prefill is not cuda-graph captured under unified memory, so an eager
-            # gather is safe. Dense ids fit int32 (max = full_slots*num_layers ~
-            # 1e7 << 2^31); the flashinfer wrapper requires int32.
-            if self._translate_kv_loc_dense is not None:
-                kv_indices = self._translate_kv_loc_dense(kv_indices).to(torch.int32)
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
