@@ -195,7 +195,7 @@ def update_trtllm_mha_graph_metadata(
         num_out_tokens,
         swa_out_len,
         req_to_token.stride(0),
-        page_table.stride(0),
+        page_table.stride(0) if page_table is not None else 0,
         swa_page_table.stride(0) if has_swa else 0,
         PAGE_SIZE=page_size,
         HAS_SWA=has_swa,

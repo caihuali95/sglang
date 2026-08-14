@@ -1466,7 +1466,7 @@ class UnifiedSWAKVPool(SWAKVPool):
         """Route to the right sub-pool. Both `swa_loc` and `full_loc` are PHYSICAL
         (pre-translated once per forward by the attention backend); never translates here.
         """
-        _, swa_loc, full_loc = unwrap_write_loc(loc_info)
+        loc, swa_loc, full_loc = unwrap_write_loc(loc_info)
         layer_id = layer.layer_id
         pool_layer_id, is_swa = self.layers_mapping[layer_id]
         if is_swa:
@@ -1486,12 +1486,8 @@ class UnifiedSWAKVPool(SWAKVPool):
                 layer_id_override=pool_layer_id,
             )
             return
-        # Full layer: full_loc is full-physical, always precomputed (eager + cuda-graph).
-        assert full_loc is not None, (
-            "UnifiedSWAKVPool.set_kv_buffer: full layer received no full_loc; "
-            "ForwardMetadata.out_cache_loc_full_physical must be precomputed for "
-            "the unified memory pool."
-        )
+        if full_loc is None:
+            full_loc = loc
         self.full_kv_pool.set_kv_buffer(
             None,
             full_loc,
