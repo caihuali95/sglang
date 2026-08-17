@@ -30,7 +30,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
+from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace, translate_v2p
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -683,36 +683,25 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         self,
         virt_tokens: torch.Tensor,
         out: Optional[torch.Tensor],
+        *,
+        page_stride: Optional[int] = None,
     ) -> torch.Tensor:
-        # Tombstone-safety clamp: tombstoned v2p entries (-1) must not reach
-        # `k_buffer[-1]` (illegal access under captured graph replay). Clamp to 0
-        # routes any tombstoned read/write to physical slot 0 — reserved
-        # padding-sink space by the `min_slot_index` invariant (bytes [0, entry_max)
-        # across all sub-pools hold no real data).
-        if self.page_size == 1:
-            if out is not None:
-                # `index_select(out=out)` forbids index/out aliasing, but the
-                # canonical caller does in-place `translate(kv_indices, out=kv_indices)`.
-                # Route through a transient gather + `copy_` to satisfy that contract.
-                tmp = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-                tmp = torch.clamp_min(tmp, 0)
-                out.copy_(tmp)
-                return out
-            result = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-            return torch.clamp_min(result, 0)
-        # page_size > 1: page math. `virt_pages`/`offsets` are fresh, so they
-        # cannot alias `out` — `index_select(out=out)` is safe.
-        virt_pages = virt_tokens // self.page_size
-        offsets = virt_tokens % self.page_size
-        if out is not None:
-            torch.index_select(self.virtual_to_physical, 0, virt_pages, out=out)
-            out.mul_(self.page_size)
-            out.add_(offsets)
-            out.clamp_(min=0)  # tombstoned page: -1*ps + offset in [-ps, -1]
-            return out
-        phys_pages = self.virtual_to_physical[virt_pages]
-        result = phys_pages * self.page_size + offsets
-        return torch.clamp_min(result, 0)
+        # One fused kernel for the whole page math (see `translate_v2p`): it
+        # also handles `out is virt_tokens`, which `index_select(out=)` forbids
+        # and the canonical in-place caller does.
+        #
+        # Tombstone-safety clamp (inside the kernel): tombstoned v2p entries
+        # (-1) must not reach `k_buffer[-1]` (illegal access under captured
+        # graph replay). Clamping to 0 routes any tombstoned read/write to
+        # physical slot 0 — reserved padding-sink space by the `min_slot_index`
+        # invariant (bytes [0, entry_max) across all sub-pools hold no real data).
+        return translate_v2p(
+            virt_tokens,
+            self.virtual_to_physical,
+            page_size=self.page_size,
+            page_stride=self.page_size if page_stride is None else page_stride,
+            out=out,
+        )
 
     def translate_kv_loc_dense(
         self,
@@ -744,28 +733,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 f"match virt_tokens shape {tuple(virt_tokens.shape)}"
             )
         with record_function("MultiEndedAlloc.translate_kv_loc_dense"):
-            dense_page_stride = self.page_size * self.kernel_page_multiplier
-            if self.page_size == 1:
-                # dense = phys * multiplier; tombstone -1 scales negative → clamp 0.
-                if out is not None:
-                    tmp = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-                    tmp = torch.clamp_min(tmp * dense_page_stride, 0)
-                    out.copy_(tmp)
-                    return out
-                result = torch.index_select(self.virtual_to_physical, 0, virt_tokens)
-                return torch.clamp_min(result * dense_page_stride, 0)
-            virt_pages = virt_tokens // self.page_size
-            offsets = virt_tokens % self.page_size
-            if out is not None:
-                torch.index_select(self.virtual_to_physical, 0, virt_pages, out=out)
-                out.mul_(dense_page_stride)
-                out.add_(offsets)
-                # tombstoned page: -1*dense_page_stride + offset < 0
-                out.clamp_(min=0)
-                return out
-            phys_pages = self.virtual_to_physical[virt_pages]
-            result = phys_pages * dense_page_stride + offsets
-            return torch.clamp_min(result, 0)
+            # Same fused kernel as the physical translate, with the page stride
+            # scaled by the dense-view multiplier.
+            return self._translate_kv_loc_impl(
+                virt_tokens,
+                out,
+                page_stride=self.page_size * self.kernel_page_multiplier,
+            )
 
     # -- alloc --
 
