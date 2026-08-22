@@ -2934,6 +2934,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_lazy_post_decode_at_boundary.
         """
         pool = self.req_to_token_pool
+        # Select first, then draw once: the slots are interchangeable, so one
+        # alloc(k) costs ONE slot-binding kernel where k alloc(1)s cost k (under
+        # the unified pool each bind is a launch on the scheduler thread).
+        at_boundary: List[Tuple[Req, int]] = []
         for i, req in enumerate(self.reqs):
             buf = req.mamba_ping_pong_track_buffer
             assert buf is not None
@@ -2945,15 +2949,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # With overlap the previous forward's post-processing
                 # (which frees this slot) hasn't run yet. Skip.
                 continue
-            if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
-                new_slot = None
-            else:
-                # No evict-retry: a transient slot is not worth evicting a
-                # cached checkpoint for; on failure tracking degrades in place.
-                new_slot = pool.mamba_allocator.alloc(1)
-            if new_slot is not None:
-                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
-                req.mamba_next_track_idx = other_idx
+            at_boundary.append((req, other_idx))
+
+        if not at_boundary:
+            return
+        if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
+            return  # fault injection: every draw fails, tracking degrades in place
+
+        # No evict-retry: a transient slot is not worth evicting a cached
+        # checkpoint for; on failure tracking degrades in place.
+        allocator = pool.mamba_allocator
+        new_slots = allocator.alloc(len(at_boundary))
+        if new_slots is None:
+            # The batch does not fit; retry per request so a partial set still
+            # tracks (identical to drawing one at a time under tight capacity).
+            new_slots = [allocator.alloc(1) for _ in at_boundary]
+            new_slots = [s[0] if s is not None else None for s in new_slots]
+        for (req, other_idx), new_slot in zip(at_boundary, new_slots):
+            if new_slot is None:
+                continue
+            pool.set_mamba_ping_pong_slot(req, other_idx, new_slot)
+            req.mamba_next_track_idx = other_idx
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
