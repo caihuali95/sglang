@@ -728,6 +728,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         virt_tokens: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        multiplier: Optional[int] = None,
     ) -> torch.Tensor:
         """Translate virtual token ids to DENSE (kernel-facing) ids.
 
@@ -748,7 +749,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         at the point it fills that buffer, not here.
         """
         ps = self.page_size
-        stride = ps * self.kernel_page_multiplier
+        # `multiplier` overrides for a SECOND dense family over the same pages
+        # and v2p table — the fused draft-KV region, whose rows have their own
+        # width and therefore their own page stride (see
+        # MHASubPoolSpec.draft_kernel_page_multiplier).
+        stride = ps * (
+            self.kernel_page_multiplier if multiplier is None else multiplier
+        )
         if out is None:
             with record_function("MultiEndedAlloc.translate_kv_loc_dense"):
                 # `v2p[idx]`, never `index_select`: the SWA read rail translates

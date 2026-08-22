@@ -31,6 +31,7 @@ consumer's bound-reads-by-cache_seqlens contract.
 
 from __future__ import annotations
 
+import functools
 import weakref
 from typing import Optional, Tuple
 
@@ -43,6 +44,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
 
 
 class KVIndexBatchView(msgspec.Struct, frozen=True):
@@ -94,12 +96,39 @@ class KVIndexSource:
         # Capability probe, by TYPE, once: only the unified composites carry a
         # kernel-facing id surface, and only for the runner whose pool IS the
         # one the allocator's ids address — a runner sharing the allocator but
-        # owning a separate pool must stay untranslated (ids would overrun it).
-        self.enabled = isinstance(
+        # owning a separate pool must stay untranslated (a speculative draft
+        # runner with a private KV pool: dense ids would overrun its rows).
+        is_unified_target = isinstance(
             token_to_kv_pool_allocator,
             (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
         ) and (token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool)
-        if self.enabled:
+        # Fused draft KV: the draft runner reads/writes the DRAFT region fused
+        # into the target's pages — same v2p table, its own dense stride. The
+        # host_allocator identity replaces the target's get_kvcache() identity
+        # (the draft pool is deliberately NOT the allocator's kvcache).
+        # Private-pool drafts (DSPARK / DFLASH) match NEITHER branch and keep
+        # the strict passthrough — their virtual-indexed buffers must never be
+        # translated (see the class docstring).
+        is_fused_draft = (
+            isinstance(token_to_kv_pool, UnifiedDraftKVPool)
+            and token_to_kv_pool.host_allocator is token_to_kv_pool_allocator
+        )
+        self.enabled = is_unified_target or is_fused_draft
+        if is_fused_draft:
+            alloc = token_to_kv_pool_allocator
+            draft_mult = token_to_kv_pool.draft_kernel_page_multiplier
+            self._full_v2p = alloc.full_v2p_page_table
+            self._full_mult = draft_mult
+            self._translate_full = functools.partial(
+                alloc.full_attn_allocator.translate_kv_loc_dense,
+                multiplier=draft_mult,
+            )
+            # The draft family is dense-only; it has no SWA rail.
+            self._swa_v2p = None
+            self._swa_mult = 1
+            self._translate_swa = None
+            self._static_full_to_swa = None
+        elif self.enabled:
             alloc = token_to_kv_pool_allocator
             self._full_v2p = alloc.full_v2p_page_table
             self._full_mult = alloc.kernel_page_multiplier
