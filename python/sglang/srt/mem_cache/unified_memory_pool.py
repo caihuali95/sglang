@@ -1517,12 +1517,20 @@ class UnifiedSWAKVPool(SWAKVPool):
             "attach_allocators"
         )
         ps = self._swa_allocator.page_size
+        # Tombstone-safety clamp (the composite allocator's translate carries
+        # the same clamp and documents it as required): a tombstoned v2p_swa
+        # entry — a token slid out of the window and released by `free_swa` —
+        # yields a NEGATIVE token id, and a captured graph gathers through
+        # the result, so a -1 is an out-of-bounds `swa_k_buffer[-1]` read at
+        # replay time, not an error message. Clamp to 0 routes tombstones to
+        # the reserved padding sink like every other translate.
         if ps == 1:
-            return self._swa_allocator.virtual_to_physical[kv_indices].to(torch.int32)
+            phys = self._swa_allocator.virtual_to_physical[kv_indices]
+            return torch.clamp_min(phys, 0).to(torch.int32)
         virt_pages = kv_indices // ps
         offsets = kv_indices % ps
         swa_phys_pages = self._swa_allocator.virtual_to_physical[virt_pages]
-        return (swa_phys_pages * ps + offsets).to(torch.int32)
+        return torch.clamp_min(swa_phys_pages * ps + offsets, 0).to(torch.int32)
 
     def get_state_buf_infos(self):
         return self.swa_kv_pool.get_contiguous_buf_infos()
