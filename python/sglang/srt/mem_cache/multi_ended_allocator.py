@@ -2237,6 +2237,36 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
     # -- physical page primitives (holes-first) --
 
+    def _extend_span_pages(self, need_more: int) -> Optional[int]:
+        """Grow the span by ``need_more`` fresh pages and return the LOWEST new
+        page id (the fresh range is always contiguous ascending), or None when
+        neither gap fits (state untouched). An empty span repositions to the
+        region midpoint so free gap remains on BOTH sides."""
+        lo, hi = self._region_bounds_pages()
+        if self._is_frontier_transparent():
+            # Reposition-on-alloc-from-empty: collapse to the midpoint so
+            # free gap remains on BOTH sides.
+            if need_more > hi - lo:
+                return None
+            start = lo + (hi - lo - need_more) // 2
+            self.low_wm_page = start
+            self.high_wm_page = start + need_more
+            return start
+        gap_low = self.low_wm_page - lo
+        gap_high = hi - self.high_wm_page
+        # Extend toward the roomier gap; fall back to the other side.
+        sides = ("high", "low") if gap_high >= gap_low else ("low", "high")
+        for side in sides:
+            if side == "high" and need_more <= gap_high:
+                start = self.high_wm_page
+                self.high_wm_page += need_more
+                return start
+            if side == "low" and need_more <= gap_low:
+                start = self.low_wm_page - need_more
+                self.low_wm_page = start
+                return start
+        return None  # neither side fits; state untouched
+
     def take_physical_pages(self, num_pages: int) -> Optional[torch.Tensor]:
         if num_pages <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
@@ -2245,37 +2275,13 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
 
         fresh: Optional[torch.Tensor] = None
         if need_more > 0:
-            lo, hi = self._region_bounds_pages()
-            if self._is_frontier_transparent():
-                # Reposition-on-alloc-from-empty: collapse to the midpoint so
-                # free gap remains on BOTH sides.
-                if need_more > hi - lo:
-                    return None
-                start = lo + (hi - lo - need_more) // 2
-                self.low_wm_page = start
-                self.high_wm_page = start + need_more
-                fresh = torch.arange(
-                    start, start + need_more, dtype=torch.int64, device=self.device
-                )
-            else:
-                gap_low = self.low_wm_page - lo
-                gap_high = hi - self.high_wm_page
-                # Extend toward the roomier gap; fall back to the other side.
-                sides = ("high", "low") if gap_high >= gap_low else ("low", "high")
-                for side in sides:
-                    if side == "high" and need_more <= gap_high:
-                        start = self.high_wm_page
-                        self.high_wm_page += need_more
-                        break
-                    if side == "low" and need_more <= gap_low:
-                        start = self.low_wm_page - need_more
-                        self.low_wm_page = start
-                        break
-                else:
-                    return None  # neither side fits; state untouched
-                fresh = torch.arange(
-                    start, start + need_more, dtype=torch.int64, device=self.device
-                )
+            # Extend first (state untouched on failure), then drain holes.
+            start = self._extend_span_pages(need_more)
+            if start is None:
+                return None
+            fresh = torch.arange(
+                start, start + need_more, dtype=torch.int64, device=self.device
+            )
 
         if n_drain > 0:
             drained = self._free_phys_pages[:n_drain].clone()
@@ -2301,10 +2307,22 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
     def _alloc_bind_fast_or_slow(
         self, v_pages: torch.Tensor, N: int
     ) -> Optional[torch.Tensor]:
-        # Holes-first always routes through take_physical_pages (no fused
-        # watermark fast path — float alloc cadence doesn't need it).
+        """Fused span-extend + bind in ONE Triton kernel when no holes need
+        draining (the fresh float range is contiguous ascending, exactly like
+        the end-pool fast path); hole-draining slow path otherwise. Under the
+        tri-pool composite this runs once per page-consuming decode alloc."""
         if N == 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
+        if self._hole_pages() == 0:
+            start = self._extend_span_pages(N)
+            if start is None:
+                return None
+            return alloc_bind_inplace(
+                v_pages,
+                self.virtual_to_physical,
+                self.physical_to_virtual,
+                start,
+            )
         phys_pages = self.take_physical_pages(N)
         if phys_pages is None:
             return None
