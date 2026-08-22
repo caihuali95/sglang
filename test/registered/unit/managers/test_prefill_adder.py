@@ -7,6 +7,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    TokenAdmissionBudget,
     estimate_prefill_extend_tile_metrics,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -70,6 +71,11 @@ class TestPrefillAdder(CustomTestCase):
         allocator.swa_available_size.return_value = swa_available_size
         allocator.available_size.return_value = available_size
         allocator.size_swa = size_swa
+        # Route the budget hook to the REAL default (a bare MagicMock would
+        # stand in for every gate and break the arithmetic under test).
+        allocator.make_admission_budget.side_effect = (
+            lambda *, adder: TokenAdmissionBudget(adder)
+        )
         return allocator
 
     def create_running_batch(self, reqs=None) -> MagicMock:

@@ -77,6 +77,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.evict_to_free_tokens(tree_cache, num_tokens)
         return self.available_size() >= num_tokens
 
+    def make_admission_budget(self, *, adder):
+        """Admission budget for one prefill pass: the `PrefillAdder` routes
+        every MEMORY admission gate and charge through the returned object
+        (see `schedule_policy.TokenAdmissionBudget` for the protocol). Default
+        = the token-denominated budget reproducing the historical arithmetic;
+        unified composites override with byte-denominated accounting in the
+        allocator's native currency.
+        """
+        from sglang.srt.managers.schedule_policy import TokenAdmissionBudget
+
+        return TokenAdmissionBudget(adder)
+
     def verify_byte_accounting(self) -> list:
         """Idle-time conservation diagnostic: recompute this allocator's
         byte/slot accounting and return human-readable violation strings
