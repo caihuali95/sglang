@@ -27,12 +27,14 @@ import logging
 import os
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
+import msgspec
 import torch
 from torch.profiler import record_function
 
 from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import FitVerdict
 from sglang.srt.mem_cache.allocator.paged import (
     alloc_decode_kernel,
     alloc_extend_kernel,
@@ -1839,6 +1841,297 @@ def _end_pair_chain(
     return sorted((a, b), key=lambda x: x.grow_direction != "up")
 
 
+def _joint_schedulable_free_bytes(
+    a: MultiEndedAllocator, b: MultiEndedAllocator
+) -> int:
+    """Joint free bytes of a two-ended shared buffer, realizable for new
+    allocations: the inter-end byte gap plus BOTH sides' drainable hole
+    bytes. A side's own holes are reused by `take_physical` without any
+    compaction, so the credit is unconditional (the per-side
+    `schedulable_available_size` gates only PEER-hole credit, which needs a
+    peer flush)."""
+    if a.grow_direction == "up":
+        gap = max(0, b._byte_low_frontier() - a._byte_high_frontier())
+    else:
+        gap = max(0, a._byte_low_frontier() - b._byte_high_frontier())
+    holes = (
+        int(a._free_phys_pages.numel()) * a.entry_bytes_per_page
+        + int(b._free_phys_pages.numel()) * b.entry_bytes_per_page
+    )
+    return gap + holes
+
+
+class BytePrefillCost(msgspec.Struct, frozen=True):
+    """Gate-time admission cost of one candidate in BYTES (the unified
+    composites' currency). ``swa_bytes`` is the sliding-window share of
+    ``lifetime_bytes`` — the `FitVerdict.swa_binding` re-check subtracts it
+    to decide whether the swa charge alone caused the rejection.
+    ``fresh_mamba_slots`` records the gate-time state decision so the charge
+    cannot drift from the gate."""
+
+    immediate_bytes: int
+    lifetime_bytes: int
+    swa_bytes: int = 0
+    fresh_mamba_slots: int = 0
+
+
+class ByteAdmissionBudget:
+    """Byte-denominated admission budget for the unified composites, returned
+    by `make_admission_budget` and consumed by the `PrefillAdder` through the
+    same protocol as the default token budget (`TokenAdmissionBudget`).
+
+    One instance per prefill pass. The ledger tracks two byte offsets
+    (immediate = this pass's allocations; lifetime = + estimated decode
+    output) against ONE availability view: `schedulable_free_bytes()` plus
+    evictable bytes. Free and evictable bytes are single-counted by
+    construction — every candidate's BOTH sides are priced into one cost and
+    gated against the one pool — which is what makes bypassing the
+    conserve-capped per-side views sound: two per-side gates over the same
+    shared gap would double-count it, and the static `swa_full_tokens_ratio`
+    split would keep walling runtime borrowing. The full-token-equivalent
+    mamba cross-charge (`mamba_slot_full_token_cost`, a ceil-rounded
+    converter) dies here: a fresh mamba state is priced as its own bytes.
+
+    The fresh-mamba-slot gate survives as a slot count INSIDE the budget: it
+    gates a distinct resource (full-evictable bytes cannot produce a mamba
+    slot at alloc time; only gap / hole / mamba-evictable bytes can).
+
+    The sliding-window SHAPE stays token math on the adder
+    (`_swa_budget_for_req`: window-bounded headroom); this budget prices
+    those token quantities at the swa entry cost. Chunk caps are priced at
+    the joint per-token cost (a chunk token transiently occupies both
+    sides) — conservative, which is the sound direction for a cap.
+
+    Index-space caps are deliberately ignored: under the unified pool every
+    sub-pool's index space spans the whole buffer, so byte feasibility
+    implies index feasibility; the alloc-time machinery (evict / retract /
+    fail-loud) backstops the planner as before.
+    """
+
+    def __init__(self, allocator, adder):
+        self.allocator = allocator
+        self.adder = adder
+        self.is_swa = isinstance(allocator, UnifiedSWATokenToKVPoolAllocator)
+        self._e_f = allocator.full_attn_allocator.entry_bytes
+        self._e_s = allocator.swa_attn_allocator.entry_bytes if self.is_swa else 0
+        self._mamba_epp = (
+            0 if self.is_swa else allocator.mamba_allocator.entry_bytes_per_page
+        )
+        self.lifetime_offset_bytes = 0
+        self.immediate_offset_bytes = 0
+        # Separate fresh-mamba-slot gate (None on the SWA composite); same
+        # sizing as the token budget's rem_mamba_slots.
+        self.rem_mamba_slots = None
+        if not self.is_swa:
+            self.rem_mamba_slots = (
+                allocator.mamba_allocator.schedulable_available_size()
+            )
+            if adder.is_hybrid_ssm_cache:
+                self.rem_mamba_slots += adder.tree_cache.mamba_evictable_size()
+        # Mixed-decode tokens allocated this pass alongside the prefill: they
+        # consume real buffer bytes — BOTH sides on the SWA composite (every
+        # composite token allocates both; the token budget under-counted
+        # this).
+        n_mixed = adder.num_mixed_decode_tokens
+        if n_mixed:
+            mixed_bytes = n_mixed * (self._e_f + self._e_s)
+            self.lifetime_offset_bytes += mixed_bytes
+            self.immediate_offset_bytes += mixed_bytes
+
+    # -- availability (ONE view) --
+
+    def _evictable_bytes(self) -> int:
+        tree = self.adder.tree_cache
+        ev = tree.full_evictable_size() * self._e_f
+        if self.is_swa:
+            # Evicting a joint node frees BOTH sides' bytes — physically
+            # exact under the shared buffer (the token budget could not
+            # credit the swa side).
+            ev += tree.swa_evictable_size() * self._e_s
+        return ev
+
+    def lifetime_remaining(self) -> int:
+        return (
+            self.allocator.schedulable_free_bytes()
+            + self._evictable_bytes()
+            - self.lifetime_offset_bytes
+        )
+
+    def immediate_remaining(self) -> int:
+        return (
+            self.allocator.schedulable_free_bytes()
+            + self._evictable_bytes()
+            - self.immediate_offset_bytes
+        )
+
+    # -- running-batch and preemption charges --
+
+    def _running_est_tokens(self, req) -> float:
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+
+        return (
+            min(
+                req.sampling_params.max_new_tokens - len(req.output_ids),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            * self.adder.new_token_ratio
+        )
+
+    def charge_running(self, reqs) -> None:
+        """A running request's future decode consumes both sides per token on
+        the SWA composite; the mamba composite's slots are already held."""
+        self.lifetime_offset_bytes += int(
+            sum(self._running_est_tokens(r) for r in reqs) * (self._e_f + self._e_s)
+        )
+
+    def preemption_demand(self, req, extend_len: int) -> int:
+        """Tokens preemption must free for `req` to fit — token-denominated
+        so it composes with `running_request_credit` (token estimates). The
+        byte remainder is floored at the full entry cost: under-crediting the
+        swa share preempts slightly more, the safe direction."""
+        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS
+
+        return (
+            extend_len
+            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            - self.total_tokens_floor()
+        )
+
+    def running_request_credit(self, req) -> int:
+        return int(self._running_est_tokens(req))
+
+    def uncharge_running(self, req) -> None:
+        self.lifetime_offset_bytes -= int(
+            self._running_est_tokens(req) * (self._e_f + self._e_s)
+        )
+
+    # -- per-candidate cost / gates / charge --
+
+    def new_mamba_state(self, req) -> bool:
+        """Whether admitting `req` allocates a fresh mamba state slot; False
+        on the SWA composite."""
+        return self.rem_mamba_slots is not None and req.mamba_pool_idx is None
+
+    def prefill_cost(
+        self,
+        *,
+        cand_extend_input_len: int,
+        swa_extend_input_len: int,
+        max_new_tokens: int,
+        swa_host_hit_length: int = 0,
+        new_mamba_state: bool = False,
+    ) -> BytePrefillCost:
+        adder = self.adder
+        extend_paged = adder.ceil_paged_tokens(cand_extend_input_len)
+        swa_bytes = 0
+        if self.is_swa:
+            swa_bytes = (
+                adder._swa_budget_for_req(
+                    swa_extend_input_len,
+                    max_new_tokens,
+                    swa_host_hit_length=swa_host_hit_length,
+                )
+                * self._e_s
+            )
+        fresh = 1 if new_mamba_state else 0
+        # alloc_extend reserves an extra page_size per request to make sure
+        # the budget doesn't over-commit.
+        immediate = (
+            (extend_paged + adder.page_size) * self._e_f
+            + swa_bytes
+            + fresh * self._mamba_epp
+        )
+        return BytePrefillCost(
+            immediate_bytes=immediate,
+            lifetime_bytes=immediate + max_new_tokens * self._e_f,
+            swa_bytes=swa_bytes,
+            fresh_mamba_slots=fresh,
+        )
+
+    def fits(self, cost: BytePrefillCost) -> FitVerdict:
+        remaining = self.lifetime_remaining()
+        if cost.lifetime_bytes < remaining:
+            return FitVerdict(ok=True)
+        swa_binding = (
+            cost.swa_bytes > 0 and (cost.lifetime_bytes - cost.swa_bytes) < remaining
+        )
+        return FitVerdict(ok=False, swa_binding=swa_binding)
+
+    def fits_immediate(self, cost: BytePrefillCost) -> FitVerdict:
+        remaining = min(self.immediate_remaining(), self.lifetime_remaining())
+        if cost.immediate_bytes <= remaining:
+            return FitVerdict(ok=True)
+        swa_binding = (
+            cost.swa_bytes > 0 and (cost.immediate_bytes - cost.swa_bytes) <= remaining
+        )
+        return FitVerdict(ok=False, swa_binding=swa_binding)
+
+    def charge_admitted(
+        self,
+        *,
+        extend_input_len: int,
+        max_new_tokens: int,
+        new_mamba_state: bool,
+    ) -> None:
+        """Charge the ADMITTED (possibly chunk-truncated, page-ceiled)
+        length, recomputing the length-dependent parts like the token
+        budget."""
+        adder = self.adder
+        imm = (extend_input_len + adder.page_size) * self._e_f
+        if self.is_swa:
+            imm += (
+                adder._swa_budget_for_req(extend_input_len, max_new_tokens) * self._e_s
+            )
+        fresh = 1 if new_mamba_state else 0
+        imm += fresh * self._mamba_epp
+        self.immediate_offset_bytes += imm
+        self.lifetime_offset_bytes += imm + max_new_tokens * self._e_f
+        if fresh and self.rem_mamba_slots is not None:
+            self.rem_mamba_slots -= 1
+
+    def exhausted(self) -> bool:
+        if self.lifetime_remaining() <= 0 or self.immediate_remaining() <= 0:
+            return True
+        if self.rem_mamba_slots is not None and self.rem_mamba_slots <= 0:
+            return True
+        return False
+
+    # -- chunked-prefill length derivation --
+
+    def _joint_token_cost(self) -> int:
+        return self._e_f + self._e_s
+
+    def chunk_admission_cap(self, chunk_tokens: int) -> int:
+        cap_by_bytes = (
+            self.lifetime_remaining() // self._joint_token_cost() - self.adder.page_size
+        )
+        return min(chunk_tokens, cap_by_bytes)
+
+    def swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
+        """Chunk-shrink escape hatch (see the token budget's docstring): the
+        largest page-aligned chunk whose joint byte cost fits after the
+        post-chunk decode-window reservation."""
+        adder = self.adder
+        reserved_bytes = (
+            adder._swa_reserved_tokens(0, max_new_tokens, swa_host_hit_length)
+            * self._e_s
+        )
+        cap = (self.lifetime_remaining() - reserved_bytes) // self._joint_token_cost()
+        if cap <= 0:
+            return 0
+        return int(cap) // adder.page_size * adder.page_size
+
+    # -- token-denominated floors for scheduler heuristics --
+
+    def solvency_cur_rem(self) -> int:
+        """Full-token-equivalents of the immediate budget — ONLY for the
+        ignore-eos solvency heuristic (a documented conservative floor)."""
+        return self.immediate_remaining() // self._e_f
+
+    def total_tokens_floor(self) -> int:
+        return self.lifetime_remaining() // self._e_f
+
+
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Composite allocator for the MHA (full-attn) + Mamba hybrid pair.
 
@@ -1956,6 +2249,19 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def full_available_size(self) -> int:
         return self.full_attn_allocator.schedulable_available_size()
+
+    def schedulable_free_bytes(self) -> int:
+        """Joint free bytes of the shared buffer, realizable for new
+        allocations (see `_joint_schedulable_free_bytes`)."""
+        return _joint_schedulable_free_bytes(
+            self.full_attn_allocator, self.mamba_allocator
+        )
+
+    def make_admission_budget(self, *, adder) -> ByteAdmissionBudget:
+        """Admission-budget hook (base hook): byte-denominated admission —
+        gates and charges run in the allocator's native currency, replacing
+        the full-token-equivalent conversions."""
+        return ByteAdmissionBudget(self, adder)
 
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents of shared-gap bytes ONE mamba state consumes.
@@ -2364,6 +2670,24 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         K_total = K1 + K2 + K3
         K_total = min(K_total, H_f + R_f, H_s + R_s)  # index-space caps
         return K_total * self.page_size
+
+    def schedulable_free_bytes(self) -> int:
+        """Joint free bytes of the shared buffer, realizable for new
+        allocations (see `_joint_schedulable_free_bytes`). Deliberately NOT
+        conserve-capped: the byte admission budget prices both sides of every
+        token against this one pool, which is what makes the static
+        `swa_full_tokens_ratio` split a boot label instead of a runtime
+        borrowing wall."""
+        return _joint_schedulable_free_bytes(
+            self.full_attn_allocator, self.swa_attn_allocator
+        )
+
+    def make_admission_budget(self, *, adder) -> ByteAdmissionBudget:
+        """Admission-budget hook (base hook): byte-denominated admission —
+        gates and charges run in the allocator's native currency, bypassing
+        the conserve-capped per-side views (which the leak invariant and the
+        alloc-time machinery still read)."""
+        return ByteAdmissionBudget(self, adder)
 
     # Slot-conservation views — the ONLY views the leak invariant should see
     # (returning the byte-coordinated value would flag spurious leaks).

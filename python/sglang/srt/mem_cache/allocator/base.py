@@ -18,7 +18,21 @@ from __future__ import annotations
 import abc
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
+
+
+class FitVerdict(msgspec.Struct, frozen=True):
+    """Result of an admission-budget gate. ``swa_binding`` distinguishes the
+    one rejection the `PrefillAdder` handles specially: the candidate fails
+    ONLY on its sliding-window charge, which is the trigger for the
+    chunk-shrink escape hatch (`swa_chunk_cap`). Lives here (the leaf module)
+    so both the token budget (schedule_policy) and the byte budgets
+    (allocator composites) can return it without an import cycle."""
+
+    ok: bool
+    swa_binding: bool = False
+
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache

@@ -44,6 +44,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     split_cached_prefix_by_tier,
 )
+from sglang.srt.mem_cache.allocator.base import FitVerdict
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -502,16 +503,6 @@ class AddReqResult(Enum):
     OTHER = auto()  # Other reasons to stop adding requests
 
 
-class FitVerdict(msgspec.Struct, frozen=True):
-    """Result of an admission gate. ``swa_binding`` distinguishes the one
-    rejection the adder handles specially: the candidate fails ONLY on its
-    sliding-window charge, which is the trigger for the chunk-shrink escape
-    hatch (`swa_chunk_cap`)."""
-
-    ok: bool
-    swa_binding: bool = False
-
-
 class TokenPrefillCost(msgspec.Struct, frozen=True):
     """Gate-time admission cost of one candidate, token-denominated (the
     default budget's currency). Quantities mirror the pre-extraction gates:
@@ -794,6 +785,9 @@ class PrefillAdder:
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
+        # Kept for the budgets: the byte budget charges the mixed-decode
+        # tokens allocated this pass in its own currency.
+        self.num_mixed_decode_tokens = num_mixed_decode_tokens
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
 
