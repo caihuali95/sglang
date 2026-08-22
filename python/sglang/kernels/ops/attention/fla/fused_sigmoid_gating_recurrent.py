@@ -154,16 +154,22 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 parent_step_idx = tl.sum(
                     tl.where(token_indices == step_idx, parent_idx_tokens, 0)
                 )
-                step_offset = parent_step_idx * HV * K * V
-                cache_ptr = (
-                    intermediate_states_buffer
-                    + cache_idx * cache_steps * HV * K * V
-                    + step_offset
-                    + i_hv * K * V
-                    + o_v[None, :] * K
-                    + o_k[:, None]
-                )
-                b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
+                # A corrupted draft tree (unset or garbage parent entries) can
+                # produce an out-of-range parent; unguarded, step_offset walks
+                # off the allocation — an illegal address when it lands outside,
+                # silent wrong-state reads when it lands inside. Keep the prior
+                # state instead, mirroring mamba_ssm's guarded walk.
+                if parent_step_idx >= 0 and parent_step_idx < T:
+                    step_offset = parent_step_idx * HV * K * V
+                    cache_ptr = (
+                        intermediate_states_buffer
+                        + cache_idx * cache_steps * HV * K * V
+                        + step_offset
+                        + i_hv * K * V
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    b_h = tl.load(cache_ptr, mask=mask_h, other=0).to(tl.float32)
 
         # Load inputs
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
