@@ -55,6 +55,7 @@ read table, into the same index table.
 
 from __future__ import annotations
 
+import functools
 import weakref
 from typing import Optional, Tuple
 
@@ -67,6 +68,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
 
 
 class KVIndexTable(msgspec.Struct, frozen=True):
@@ -104,14 +106,41 @@ class KVIndexTranslator:
         self.page_size = page_size
         self.device = device
 
-        self.is_translating = (
+        is_unified_target = (
             isinstance(
                 token_to_kv_pool_allocator,
                 (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
-        if self.is_translating:
+        # Fused draft KV: the draft runner reads/writes the DRAFT region fused
+        # into the target's pages — same v2p table, its own dense stride. The
+        # host_allocator identity replaces the target's get_kvcache() identity
+        # (the draft pool is deliberately NOT the allocator's kvcache).
+        # Private-pool drafts (DSPARK / DFLASH) match NEITHER branch and keep
+        # the strict passthrough — their virtual-indexed buffers must never be
+        # translated (see the class docstring).
+        is_fused_draft = (
+            isinstance(token_to_kv_pool, UnifiedDraftKVPool)
+            and token_to_kv_pool.host_allocator is token_to_kv_pool_allocator
+        )
+        self.is_translating = is_unified_target or is_fused_draft
+        if is_fused_draft:
+            alloc = token_to_kv_pool_allocator
+            draft_mult = token_to_kv_pool.draft_kernel_page_multiplier
+            self._full_v2p_table = alloc.full_v2p_page_table
+            self._full_page_multiplier = draft_mult
+            self._translate_full = functools.partial(
+                alloc.full_attn_allocator.translate_kv_loc_dense,
+                multiplier=draft_mult,
+            )
+            # The draft family is dense-only; it has no separate swa id
+            # space (window layers read and write the same fused slots).
+            self._full_p2v_table = None
+            self._swa_v2p_table = None
+            self._swa_page_multiplier = 1
+            self._swa_write_loc_from_full = None
+        elif self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._full_v2p_table = alloc.full_v2p_page_table
             self._full_p2v_table = alloc.full_p2v_page_table
