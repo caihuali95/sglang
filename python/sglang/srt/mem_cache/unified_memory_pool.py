@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import ClassVar, Dict, List, NamedTuple, Optional, Tuple
 
+import msgspec
 import torch
 import triton
 from torch.profiler import record_function
@@ -251,6 +252,132 @@ def _reserved_floor_bytes(sub_pool_specs: List[SubPoolSpec], page_size: int) -> 
     )
 
 
+# Chunk/base alignment for the spec-state scratch region: 256 B keeps every
+# torch dtype aligned and matches the allocation granularity CUDA caching
+# allocators use for small tensors.
+_SCRATCH_ALIGN = 256
+
+
+def _scratch_align_up(n: int) -> int:
+    return -(-n // _SCRATCH_ALIGN) * _SCRATCH_ALIGN
+
+
+class SpecStateScratchSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Byte layout of the speculative-verify scratch region inside ``_raw``.
+
+    Target-verify on a mamba-family model snapshots per-draft-token
+    intermediate state (SSM states + conv windows) so the accepted prefix can
+    be committed and the rest rolled back. The verify kernels index these
+    buffers POSITIONALLY by batch lane through a dedicated indices table
+    (``build_verify_intermediate_state_indices``): row r belongs to lane r of
+    the CURRENT verify forward and holds nothing across forwards. So the
+    scratch is a boot-sized STATIC region — ``(spec_state_size + 1)`` rows,
+    one per possible lane plus the shared padding row — carved below every
+    sub-pool's first allocatable slot, not a dynamically placed sub-pool.
+
+    Single source of truth for the region's bytes: the boot solve deducts
+    ``total_bytes()``, the pool factory reserves exactly the same, and
+    `UnifiedMambaPool` rebuilds the spec from the same inputs and asserts the
+    reserved region matches — the deduction and the buffers cannot drift.
+
+    Layout (each chunk 256-aligned; the region base itself is 256-aligned):
+
+        [ ssm: (L, S+1, D, *temporal_state_shape) @ temporal_dtype
+        | conv[0]: (L, S+1, D, *conv_state_shapes[0]) @ conv_dtype
+        | conv[1]: ... ]
+
+    where L = layer_num, S = spec_state_size, D = draft_tokens. Shapes and
+    dtypes mirror the raw ``torch.zeros`` allocations this region replaces
+    (`MambaPool.SpeculativeState`), so every consumer sees identical
+    contiguous tensors.
+    """
+
+    layer_num: int
+    spec_state_size: int
+    draft_tokens: int
+    conv_state_shapes: tuple
+    conv_dtype: torch.dtype
+    temporal_state_shape: tuple
+    temporal_dtype: torch.dtype
+
+    @classmethod
+    def from_mamba_spec(
+        cls,
+        mamba_spec: MambaSubPoolSpec,
+        *,
+        spec_state_size: int,
+        draft_tokens: int,
+    ) -> SpecStateScratchSpec:
+        return cls(
+            layer_num=mamba_spec.layer_num,
+            spec_state_size=spec_state_size,
+            draft_tokens=draft_tokens,
+            conv_state_shapes=tuple(tuple(s) for s in mamba_spec.conv_state_shapes),
+            conv_dtype=mamba_spec.conv_dtype,
+            temporal_state_shape=tuple(mamba_spec.temporal_state_shape),
+            temporal_dtype=mamba_spec.temporal_dtype,
+        )
+
+    def ssm_shape(self) -> Tuple[int, ...]:
+        return (
+            self.layer_num,
+            self.spec_state_size + 1,
+            self.draft_tokens,
+            *self.temporal_state_shape,
+        )
+
+    def conv_shape(self, idx: int) -> Tuple[int, ...]:
+        return (
+            self.layer_num,
+            self.spec_state_size + 1,
+            self.draft_tokens,
+            *self.conv_state_shapes[idx],
+        )
+
+    def _ssm_bytes(self) -> int:
+        return _prod(self.ssm_shape()) * self.temporal_dtype.itemsize
+
+    def _conv_bytes(self, idx: int) -> int:
+        return _prod(self.conv_shape(idx)) * self.conv_dtype.itemsize
+
+    def _chunk_offsets(self) -> List[int]:
+        """Region-relative start of the ssm chunk followed by each conv chunk."""
+        offsets = [0]
+        cursor = _scratch_align_up(self._ssm_bytes())
+        for i in range(len(self.conv_state_shapes)):
+            offsets.append(cursor)
+            cursor += _scratch_align_up(self._conv_bytes(i))
+        return offsets
+
+    def total_bytes(self) -> int:
+        return _scratch_align_up(self._ssm_bytes()) + sum(
+            _scratch_align_up(self._conv_bytes(i))
+            for i in range(len(self.conv_state_shapes))
+        )
+
+    def build_views(
+        self, region: torch.Tensor
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """(ssm, [conv...]) contiguous views over the uint8 ``region``."""
+        assert region.dtype == torch.uint8 and region.numel() == self.total_bytes(), (
+            f"SpecStateScratchSpec.build_views: region has {region.numel()} bytes, "
+            f"expected {self.total_bytes()}"
+        )
+        offsets = self._chunk_offsets()
+        ssm = (
+            region[offsets[0] : offsets[0] + self._ssm_bytes()]
+            .view(self.temporal_dtype)
+            .view(self.ssm_shape())
+        )
+        convs = [
+            region[offsets[1 + i] : offsets[1 + i] + self._conv_bytes(i)]
+            .view(self.conv_dtype)
+            .view(self.conv_shape(i))
+            for i in range(len(self.conv_state_shapes))
+        ]
+        return ssm, convs
+
+
 class UnifiedKVPool:
     """One physical `uint8` byte buffer shared by N sub-pools, each exposing
     strided per-layer views. Two END pools (one grow-up, one grow-down) own the
@@ -267,8 +394,10 @@ class UnifiedKVPool:
         enable_memory_saver: bool,
         page_size: int = 1,
         view_tail_pad_bytes: int = 0,
+        scratch_region_bytes: int = 0,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
+        assert scratch_region_bytes >= 0
         assert (
             len(sub_pool_specs) >= 2
         ), f"UnifiedKVPool needs >= 2 sub-pools; got {len(sub_pool_specs)}"
@@ -338,7 +467,18 @@ class UnifiedKVPool:
         # For a page-aware sub-pool the slot-0 write touches layer blocks spread
         # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
         # just one slot envelope — reserve the max of both.
-        reserved_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
+        sink_floor = _reserved_floor_bytes(self.sub_pool_specs, page_size)
+        # The spec-state scratch region sits directly above the sink, below
+        # every sub-pool's first allocatable slot: a static byte range no
+        # allocator can reach, so no watermark/float/compaction logic ever
+        # sees it (see SpecStateScratchSpec).
+        if scratch_region_bytes > 0:
+            self._scratch_region_start = _scratch_align_up(sink_floor)
+            reserved_floor = self._scratch_region_start + scratch_region_bytes
+        else:
+            self._scratch_region_start = None
+            reserved_floor = sink_floor
+        self.scratch_region_bytes = scratch_region_bytes
 
         for spec in self.sub_pool_specs:
             entry_bytes = spec.entry_bytes()
@@ -397,6 +537,19 @@ class UnifiedKVPool:
             )
 
     # -- introspection --
+
+    def scratch_region(self) -> torch.Tensor:
+        """uint8 view of the boot-reserved spec-state scratch region. Static
+        for the pool's lifetime; sits below every sub-pool's first allocatable
+        slot, so it never moves and no allocator accounting includes it."""
+        assert self._scratch_region_start is not None, (
+            "UnifiedKVPool.scratch_region: the pool was built without a "
+            "scratch region (scratch_region_bytes=0)"
+        )
+        return self._raw[
+            self._scratch_region_start : self._scratch_region_start
+            + self.scratch_region_bytes
+        ]
 
     def spec(self, name: str) -> SubPoolSpec:
         return self._specs_by_name[name]
