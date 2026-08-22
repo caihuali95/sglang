@@ -143,7 +143,11 @@ def translate_v2p_kernel(
     page = tl.where(is_padding, 0, page)  # keep the gather in bounds
     phys = tl.load(v2p_ptr + page, mask=mask, other=0).to(tl.int64)
     res = tl.where(is_padding, 0, phys * page_stride + offset)
-    tl.store(out_ptr + offs, tl.maximum(res, 0), mask=mask)
+    # Narrow to the destination width last (int32 for the SWA read path, whose
+    # kernels take int32 ids); page ids are bounded by the pool, so the
+    # post-clamp value always fits.
+    res = tl.maximum(res, 0).to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + offs, res, mask=mask)
 
 
 TRANSLATE_BLOCK = 256
@@ -156,11 +160,13 @@ def translate_v2p(
     page_size: int,
     page_stride: int,
     out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.int64,
 ) -> torch.Tensor:
     """Translate virtual TOKEN ids through `v2p`; see `translate_v2p_kernel`.
 
     ``out`` may alias ``virt_tokens``. Returns ``out`` when given, else a fresh
-    int64 tensor.
+    tensor of ``out_dtype`` (int64 for physical/dense ids, int32 for the SWA
+    read path).
     """
     # The kernel indexes both sides flatly, so a strided view would read/write
     # the wrong elements (silently). `out` is caller-owned — fail loud rather
@@ -169,9 +175,7 @@ def translate_v2p(
     if not virt_tokens.is_contiguous():
         virt_tokens = virt_tokens.contiguous()
     if out is None:
-        out = torch.empty(
-            virt_tokens.shape, dtype=torch.int64, device=virt_tokens.device
-        )
+        out = torch.empty(virt_tokens.shape, dtype=out_dtype, device=virt_tokens.device)
     N = int(virt_tokens.numel())
     if N == 0:
         return out
