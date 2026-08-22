@@ -15,7 +15,12 @@
 
 1. TARGET runner (allocator's own kvcache): enabled at the HOST multiplier.
 2. FUSED-DRAFT runner (`UnifiedDraftKVPool` bound to this allocator): enabled
-   at the DRAFT multiplier — same v2p table, draft-dense stride, no SWA rail.
+   at the DRAFT multiplier — same v2p table, draft-dense stride, and
+   SINGLE-SPACE swa semantics: a draft's window layers store into the same
+   fused slots as its full layers, so the window read table falls back to the
+   one dense table and the write rail aliases the rebound dense loc (a
+   separate-swa assumption here crashed the read side and tripped
+   `resolve_swa_write_loc`'s missing-rail assert).
 3. PRIVATE-POOL draft (DSPARK/DFLASH shape: target's allocator, own
    virtual-indexed buffer): strict passthrough — translating such a runner
    would address a slot-count buffer with dense ids (OOB both directions),
@@ -141,24 +146,61 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
         src = _source(allocator, draft_pool)
         self.assertTrue(src.enabled)
         self.assertEqual(src._full_mult, spec.draft_kernel_page_multiplier())
-        self.assertIsNone(src._translate_swa)  # draft family has no SWA rail
+        self.assertIsNone(src._translate_swa)  # single space: no swa translate
 
         # rebind_write_loc translates to DRAFT-dense ids: same v2p pages,
         # draft stride.
         v = allocator.alloc(2 * _PS)
         self.assertIsNotNone(v)
-        fb = SimpleNamespace(
-            out_cache_loc=v, swa_out_cache_loc=None, out_cache_loc_is_physical=False
-        )
+        fb = SimpleNamespace(out_cache_loc=v)
         src.rebind_write_loc(fb)
-        self.assertTrue(fb.out_cache_loc_is_physical)
+        self.assertIsNot(fb.out_cache_loc, v)
         fa = allocator.full_attn_allocator
         phys_pages = fa.virtual_to_physical[v // _PS]
         expected = torch.clamp_min(
             phys_pages * (_PS * spec.draft_kernel_page_multiplier()) + v % _PS, 0
         )
         torch.testing.assert_close(fb.out_cache_loc, expected, rtol=0, atol=0)
-        self.assertIsNone(fb.swa_out_cache_loc)
+        # Single space: the swa rail IS the rebound dense loc (window layers
+        # write the same fused slots).
+        self.assertIs(src.resolve_swa_write_loc(fb.out_cache_loc), fb.out_cache_loc)
+
+    def test_fused_draft_window_reads_use_the_dense_table(self):
+        """A fused draft's window layers read the SAME fused slots as its full
+        layers, so the window gather's source is the one dense table. Before
+        the single-space fallback, swa_read_table() returned None for every
+        kernel-facing view without a separate swa side — AttributeError at the
+        gather's src_table.stride(0)."""
+        _, allocator, kvcache, draft_pool = _build()
+        rpi = torch.tensor([0], dtype=torch.int64)
+        lens = torch.tensor([4], dtype=torch.int64)
+        draft_view = _source(allocator, draft_pool).batch_view(
+            req_pool_indices=rpi, seq_lens=lens, max_pages=2
+        )
+        self.assertIsNone(draft_view.swa_table)
+        self.assertIs(draft_view.swa_read_table(), draft_view.table)
+        # The hybrid-SWA TARGET keeps its separate swa canonical — the
+        # fallback must never paper over a real swa side.
+        target_view = _source(allocator, kvcache).batch_view(
+            req_pool_indices=rpi, seq_lens=lens, max_pages=2
+        )
+        self.assertIs(target_view.swa_read_table(), target_view.swa_table)
+        self.assertIsNot(target_view.swa_read_table(), target_view.table)
+
+    def test_fused_draft_resolves_the_swa_write_loc(self):
+        """`resolve_swa_write_loc` on a rebound fused-draft batch returns the
+        dense loc (red before the alias: its missing-rail assert fired for a
+        correctly rebound batch) — while the assert still catches a write loc
+        the source never prepared."""
+        _, allocator, _, draft_pool = _build()
+        src = _source(allocator, draft_pool)
+        v = allocator.alloc(_PS)
+        self.assertIsNotNone(v)
+        fb = SimpleNamespace(out_cache_loc=v)
+        src.rebind_write_loc(fb)
+        self.assertIs(src.resolve_swa_write_loc(fb.out_cache_loc), fb.out_cache_loc)
+        with self.assertRaises(AssertionError):
+            src.resolve_swa_write_loc(fb.out_cache_loc.clone())
 
     def test_private_pool_draft_stays_a_strict_passthrough(self):
         _, allocator, _, _ = _build()
@@ -166,11 +208,8 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
         src = _source(allocator, private_draft_pool)
         self.assertFalse(src.enabled)
         v = torch.arange(2 * _PS, dtype=torch.int64)
-        fb = SimpleNamespace(
-            out_cache_loc=v, swa_out_cache_loc=None, out_cache_loc_is_physical=False
-        )
+        fb = SimpleNamespace(out_cache_loc=v)
         src.rebind_write_loc(fb)
-        self.assertFalse(fb.out_cache_loc_is_physical)
         self.assertIs(fb.out_cache_loc, v)  # untouched, not even a copy
 
     def test_foreign_allocator_draft_pool_is_not_enabled(self):

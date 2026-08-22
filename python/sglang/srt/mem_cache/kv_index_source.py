@@ -66,11 +66,15 @@ class KVIndexBatchView(msgspec.Struct, frozen=True):
     full_to_swa_map: Optional[torch.Tensor]  # static SWA pools: legacy mapping
 
     def swa_read_table(self) -> torch.Tensor:
-        """The table a sliding-window gather reads: the swa canonical when the
-        view is kernel-facing (entries already swa-side ids), otherwise the same
-        table as a full read (full-token ids, which the caller then maps through
-        the pool's static full->swa)."""
-        return self.swa_table if self.kernel_facing else self.table
+        """The table a sliding-window gather reads: the swa canonical when a
+        kernel-facing pool keeps a separate swa id space; the one dense table
+        when it does not (fused draft KV: window layers store in the same
+        fused region, so a window read is a dense read the caller clamps to
+        the window); otherwise the same table as a full read (full-token ids,
+        which the caller then maps through the pool's static full->swa)."""
+        if not self.kernel_facing:
+            return self.table
+        return self.swa_table if self.swa_table is not None else self.table
 
 
 class KVIndexSource:
@@ -123,11 +127,15 @@ class KVIndexSource:
                 alloc.full_attn_allocator.translate_kv_loc_dense,
                 multiplier=draft_mult,
             )
-            # The draft family is dense-only; it has no SWA rail.
+            # The draft family is dense-only: window layers read and write the
+            # SAME fused slots as full layers, so there is no separate swa id
+            # space — the write rail aliases the dense loc instead
+            # (see rebind_write_loc).
             self._swa_v2p = None
             self._swa_mult = 1
             self._translate_swa = None
             self._static_full_to_swa = None
+            self._swa_is_full_alias = True
         elif self.enabled:
             alloc = token_to_kv_pool_allocator
             self._full_v2p = alloc.full_v2p_page_table
@@ -142,6 +150,7 @@ class KVIndexSource:
                 self._swa_mult = 1
                 self._translate_swa = None
             self._static_full_to_swa = None
+            self._swa_is_full_alias = False
         else:
             self._full_v2p = None
             self._full_mult = 1
@@ -154,6 +163,7 @@ class KVIndexSource:
                 if isinstance(token_to_kv_pool, SWAKVPool)
                 else None
             )
+            self._swa_is_full_alias = False
 
         # Lazily-grown arange for the unified view's `rows`; replaced by the
         # capture-sized buffer (stable pointer) once capture buffers exist.
@@ -371,6 +381,12 @@ class KVIndexSource:
             # int32 narrows where it fills its own buffer.
             self._swa_write_rail = self._translate_swa(forward_batch.out_cache_loc)
         forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
+        if self._swa_is_full_alias:
+            # Single id space (fused draft KV): window layers write the same
+            # fused slots, so the swa rail IS the rebound dense loc. The
+            # resolver's missing-rail assert stays armed for hybrid-target
+            # batches built without the rebind.
+            self._swa_write_rail = forward_batch.out_cache_loc
         self._prepared_write_loc = forward_batch.out_cache_loc
 
     def resolve_swa_write_loc(self, loc: torch.Tensor) -> torch.Tensor:
