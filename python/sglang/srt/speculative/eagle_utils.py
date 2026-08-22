@@ -29,7 +29,11 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import (
+    maybe_detect_nan,
+    maybe_detect_oob,
+    maybe_warn_nan,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import GrammarMask
@@ -114,21 +118,28 @@ def organize_draft_results(
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
     num_draft_token: int,
+    topk: int,
 ):
     # b, n, topk; n = 1 + (num_steps-1) * topk
     score_list = torch.cat(score_list, dim=1).flatten(1)
     # b, (topk + (num_steps-1) * topk)
     ss_token_list = torch.cat(token_list, dim=1)
+    # NaN draft scores (a numerically-overflowed or corrupted draft forward)
+    # must not reach topk: NaN is unordered, so topk would select tokens whose
+    # ancestors were NOT selected, handing build_tree_kernel_efficient an
+    # inconsistent tree — its device-side parent walk then reads out of bounds
+    # or spins forever (a GPU hang, not an error). Detect loudly, then rank
+    # NaN below every valid score (valid scores are cumulative
+    # probabilities, >= 0).
+    maybe_detect_nan(score_list, "organize_draft_results: draft tree scores")
+    if score_list.is_cuda and not torch.cuda.is_current_stream_capturing():
+        # The throttled warner stages its flag through pinned host memory,
+        # which cannot be enqueued during CUDA graph capture.
+        maybe_warn_nan(score_list, "organize_draft_results: draft tree scores")
+    torch.nan_to_num_(score_list, nan=-1.0)
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
-    maybe_detect_oob(
-        top_scores_index,
-        0,
-        ss_token_list.shape[1],
-        "organize_draft_results: top_scores_index OOB for gather on ss_token_list",
-    )
-    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)
@@ -137,6 +148,48 @@ def organize_draft_results(
         parent_list = torch.empty(
             batch_size, 0, dtype=torch.long, device=parents_list[0].device
         )
+
+    # Enforce build_tree_kernel_efficient's input contract: every selected
+    # token's ancestor chain must itself be selected (or terminate at the
+    # root). The kernel re-derives parenthood exactly as below and walks the
+    # chain per token; a selection violating closure sends that walk past the
+    # row end / into a spin. Repair any violator by pointing it at flat index
+    # 0 — a depth-0 candidate whose parent is the root, so the walk
+    # terminates — at the cost of one duplicated (wasted) verify slot. All
+    # ops are on-device and sync-free; the repair is unconditional because a
+    # single escaped violation wedges the whole scheduler.
+    if parent_list.shape[1] > 0:
+        parent_tb = top_scores_index // topk
+        maybe_detect_oob(
+            parent_tb,
+            0,
+            parent_list.shape[1],
+            "organize_draft_results: parent_tb OOB for gather on parent_list",
+        )
+        parent_tok = torch.gather(parent_list, index=parent_tb, dim=1)
+        needs_parent = parent_tb > 0
+        # matched[b, c, s]: candidate c's parent token equals selected entry s.
+        matched = parent_tok.unsqueeze(2) == top_scores_index.unsqueeze(1)
+        bad = needs_parent & ~matched.any(dim=2)
+        # A repaired parent no longer satisfies its children, so propagate
+        # along the parent links; depth (== number of draft steps) bounds the
+        # chain length. `bad` grows monotonically, reaching the fixpoint in at
+        # most len(parents_list) rounds — iterate without device syncs.
+        for _ in range(len(parents_list) - 1):
+            alive = matched & ~bad.unsqueeze(1)
+            bad = needs_parent & ~alive.any(dim=2)
+        top_scores_index = torch.where(
+            bad, torch.zeros_like(top_scores_index), top_scores_index
+        )
+        top_scores_index = torch.sort(top_scores_index).values
+
+    maybe_detect_oob(
+        top_scores_index,
+        0,
+        ss_token_list.shape[1],
+        "organize_draft_results: top_scores_index OOB for gather on ss_token_list",
+    )
+    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
     return parent_list, top_scores_index, draft_tokens
 

@@ -725,7 +725,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return parent_list, top_scores_index, draft_tokens, draft_probs
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            score_list,
+            token_list,
+            parents_list,
+            self.speculative_num_draft_tokens,
+            self.topk,
         )
 
         return parent_list, top_scores_index, draft_tokens, draft_probs
