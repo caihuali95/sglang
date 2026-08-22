@@ -228,12 +228,60 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK"), (
+    # Speculative decoding: DSPARK (chain draft) is supported on the
+    # unified pool (#33974), and EAGLE/EAGLE3 chain drafting is supported
+    # on hybrid-SWA targets, whose draft KV rides fused inside the full
+    # pool's page envelope (DenseDraftRegion in
+    # mem_cache/unified_memory_pool.py). Other algorithms are not yet
+    # audited for the virtual/dense loc translation. The id-space choke
+    # point plugs in the same way when they are: its canonical builder
+    # takes seq_lens as a tensor (target-verify's seq_lens + num_draft
+    # plugs in), write rails resolve through the source
+    # (rebind_write_loc / sliding_window_write_loc), and verify tables
+    # consume the same KVIndexTable.
+    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3"), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft); other speculative algorithms are not yet "
+        "DSPARK (chain draft) and EAGLE/EAGLE3 (fused draft KV on "
+        "hybrid-SWA targets); other speculative algorithms are not yet "
         "audited for the unified pool's virtual/dense loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
+        assert model_config_of(server_args).is_hybrid_swa, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires a hybrid-SWA "
+            "target: the draft's KV lives fused inside the full-attention "
+            "page envelope, which only the hybrid-SWA unified composite "
+            "provisions. Mamba-family targets additionally need per-step "
+            "verify state slots the unified pool does not provision yet; "
+            "run them without --enable-unified-memory."
+        )
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
+            "draft chain only (--speculative-eagle-topk in {None, 1}); "
+            "tree verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
+        # EXACT match, None included: an unset backend would default to
+        # fa3/flashinfer later in resolution, silently leaving the audited
+        # envelope.
+        eagle_backends = set(attention_backends_of(resolved_view(server_args)))
+        assert eagle_backends == {"triton"}, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the "
+            "spec-verify-audited attention backend: pass "
+            "--attention-backend triton (got "
+            f"{sorted(eagle_backends, key=str)}). flashinfer / fa3 do not "
+            "translate speculative verify indices to the unified pool's "
+            "dense space yet."
+        )
+        # The draft worker resolves its own backend: explicit flag first,
+        # else it inherits the target's (triton, per the assert above).
+        assert cfg.speculative_draft_attention_backend in (None, "triton"), (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
+            "worker on the triton backend too; got "
+            "--speculative-draft-attention-backend="
+            f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
+            "to inherit the target's."
+        )
     if cfg.speculative_algorithm == "DSPARK":
         assert cfg.speculative_eagle_topk in (None, 1), (
             "--enable-unified-memory + DSPARK supports a linear draft "
