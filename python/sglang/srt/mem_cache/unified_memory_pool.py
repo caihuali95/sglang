@@ -965,40 +965,29 @@ class UnifiedMambaPool(MambaPool):
             conv_views[0].shape[1] == self._max_size + 1
         ), f"conv_views slots={conv_views[0].shape[1]} vs expected {self._max_size + 1}"
 
-        # Per-draft-token intermediate buffers have a different outer size
-        # (spec_state_size+1), so they're NOT in the shared buffer; allocate locally.
-        temporal_state_shape = spec.temporal_state_shape
-        conv_state_shape = spec.conv_state_shapes
-        conv_dtype = spec.conv_dtype
-        ssm_dtype = spec.temporal_dtype
+        # Per-draft-token intermediate buffers live in the pool's boot-sized
+        # scratch region (below every sub-pool's first allocatable slot), so
+        # their bytes are part of the pool's own accounting. Rebuild the
+        # SpecStateScratchSpec from the same inputs the factory sized the
+        # region with and assert the bytes match — the loud drift tripwire
+        # between the factory's reservation and this consumer's expectation.
         if speculative_num_draft_tokens is not None:
-            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        self.num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device=unified_buffer.device,
-                )
-                intermediate_conv_window_cache = [
-                    torch.zeros(
-                        size=(
-                            self.num_mamba_layers,
-                            spec_state_size + 1,
-                            speculative_num_draft_tokens,
-                            cshape[0],
-                            cshape[1],
-                        ),
-                        dtype=conv_dtype,
-                        device=unified_buffer.device,
-                    )
-                    for cshape in conv_state_shape
-                ]
+            scratch_spec = SpecStateScratchSpec.from_mamba_spec(
+                spec,
+                spec_state_size=spec_state_size,
+                draft_tokens=speculative_num_draft_tokens,
+            )
+            assert scratch_spec.total_bytes() == unified_buffer.scratch_region_bytes, (
+                f"spec-state scratch drift: UnifiedMambaPool derives "
+                f"{scratch_spec.total_bytes()} bytes from (spec_state_size="
+                f"{spec_state_size}, draft_tokens={speculative_num_draft_tokens}), "
+                f"but the pool reserved {unified_buffer.scratch_region_bytes} — "
+                f"the factory and the pool must build the SAME "
+                f"SpecStateScratchSpec"
+            )
+            intermediate_ssm_state_cache, intermediate_conv_window_cache = (
+                scratch_spec.build_views(unified_buffer.scratch_region())
+            )
             self.mamba_cache = self.SpeculativeState(
                 conv=list(conv_views),
                 temporal=temporal_view,
@@ -1214,7 +1203,8 @@ class UnifiedHybridReqToTokenPool(HybridReqToTokenPool):
         # mamba_envelope_layout / speculative_eagle_topk / enable_linear_replayssm /
         # linear_replayssm_cache_len / enable_linear_replayssm_spec: accepted to match
         # the parent signature but NOT forwarded — the shared pool's conv/temporal
-        # state are fixed-shape views (replayssm/spec are gated off under unified).
+        # state are fixed-shape views (replayssm is gated off under unified; the
+        # spec-verify intermediates bind to the pool's scratch region instead).
         assert mamba_size == self._shared_mamba_size, (
             f"UnifiedHybridReqToTokenPool._init_mamba_pool: mamba_size={mamba_size} "
             f"!= unified_buffer.max_slots({self._mamba_sub_pool_name!r}) - 1 "
@@ -1398,6 +1388,17 @@ def init_unified_mamba_pools(
             max_total_num_tokens * full_spec.entry_bytes()
             + max_mamba_cache_size * mamba_spec.entry_bytes()
         )
+    # Spec-state scratch rides on top of the cache budget exactly like the
+    # state slots: the boot solve deducts these bytes, the pool reserves them
+    # as the scratch region, and UnifiedMambaPool re-derives + asserts them.
+    scratch_bytes = 0
+    if speculative_num_draft_tokens is not None:
+        scratch_bytes = SpecStateScratchSpec.from_mamba_spec(
+            mamba_spec,
+            spec_state_size=max_num_reqs,
+            draft_tokens=speculative_num_draft_tokens,
+        ).total_bytes()
+        total_bytes = total_bytes + scratch_bytes
     # bs=1 floor: full KV at max context + the state slots ONE running request
     # locks (1 active + 2 radix checkpoints — the checkpoint slots are a
     # per-request FLOOR, not headroom) + the reserved slot-0 sink page.
@@ -1407,6 +1408,7 @@ def init_unified_mamba_pools(
             ("full_ctx_kv", model_context_len * full_spec.entry_bytes()),
             ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
             ("sink", _reserved_floor_bytes([full_spec, mamba_spec], page_size)),
+            ("spec_scratch", scratch_bytes),
         ],
         factory="init_unified_mamba_pools",
     )
@@ -1420,6 +1422,7 @@ def init_unified_mamba_pools(
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
         view_tail_pad_bytes=view_tail_pad_bytes,
+        scratch_region_bytes=scratch_bytes,
     )
     req_to_token_pool = UnifiedHybridReqToTokenPool(
         unified_buffer=shared_pool,
@@ -2073,6 +2076,16 @@ def init_unified_mamba_swa_pools(
             + swa_max_total_num_tokens * swa_spec.entry_bytes()
             + max_mamba_cache_size * mamba_spec.entry_bytes()
         )
+    # Spec-state scratch rides on top of the cache budget exactly like the
+    # state slots (see init_unified_mamba_pools).
+    scratch_bytes = 0
+    if speculative_num_draft_tokens is not None:
+        scratch_bytes = SpecStateScratchSpec.from_mamba_spec(
+            mamba_spec,
+            spec_state_size=max_num_reqs,
+            draft_tokens=speculative_num_draft_tokens,
+        ).total_bytes()
+        total_bytes = total_bytes + scratch_bytes
     # bs=1 floor (the retract loop's terminal guarantee), tri form: full KV at
     # max context + ONE sliding window of swa KV (+ a page of slack, clamped
     # to the context) + the state slots ONE running request locks (1 active +
@@ -2093,6 +2106,7 @@ def init_unified_mamba_swa_pools(
                 "sink",
                 _reserved_floor_bytes([full_spec, swa_spec, mamba_spec], page_size),
             ),
+            ("spec_scratch", scratch_bytes),
         ],
         factory="init_unified_mamba_swa_pools",
     )
@@ -2102,6 +2116,7 @@ def init_unified_mamba_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        scratch_region_bytes=scratch_bytes,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,

@@ -165,6 +165,57 @@ class TestSpecStateScratchSpec(unittest.TestCase):
             s.build_views(torch.zeros(s.total_bytes() - 1, dtype=torch.uint8))
 
 
+class TestUnifiedMambaPoolBinding(unittest.TestCase):
+    def _mamba_pool(self, *, scratch_region_bytes, spec_state_size=5, draft_tokens=3):
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+
+        pool = _pool(scratch_region_bytes=scratch_region_bytes)
+        return pool, UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=spec_state_size,
+            mamba_layer_ids=[0, 1],
+            speculative_num_draft_tokens=draft_tokens,
+        )
+
+    def test_intermediates_bind_into_the_scratch_region(self):
+        """With spec on, the SpeculativeState intermediates are views INTO
+        _raw's scratch region (not private allocations), with the raw-era
+        shapes."""
+        s = _scratch()
+        pool, mamba_pool = self._mamba_pool(scratch_region_bytes=s.total_bytes())
+        cache = mamba_pool.mamba_cache
+        self.assertEqual(tuple(cache.intermediate_ssm.shape), (2, 6, 3, 2, 4, 4))
+        self.assertEqual(len(cache.intermediate_conv_window), 2)
+        raw_ptr = pool._raw.untyped_storage().data_ptr()
+        for t in [cache.intermediate_ssm] + list(cache.intermediate_conv_window):
+            self.assertEqual(t.untyped_storage().data_ptr(), raw_ptr)
+
+    def test_drift_tripwire_fires_on_a_mismatched_reservation(self):
+        """A factory that reserves the wrong byte count must fail LOUDLY at
+        pool construction, not read past the region at verify time."""
+        s = _scratch()
+        with self.assertRaises(AssertionError):
+            self._mamba_pool(scratch_region_bytes=s.total_bytes() + _SCRATCH_ALIGN)
+
+    def test_spec_off_keeps_the_two_field_state(self):
+        """Without spec decoding: plain State on a region-less pool — the
+        pre-scratch construction stays byte-identical."""
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedMambaPool
+
+        pool = _pool(scratch_region_bytes=0)
+        mamba_pool = UnifiedMambaPool(
+            unified_buffer=pool,
+            sub_pool_name="mamba",
+            spec_state_size=5,
+            mamba_layer_ids=[0, 1],
+            speculative_num_draft_tokens=None,
+        )
+        cache = mamba_pool.mamba_cache
+        self.assertNotIsInstance(cache, mamba_pool.SpeculativeState)
+        self.assertIsInstance(cache, mamba_pool.State)
+
+
 class TestUnifiedKVPoolScratchRegion(unittest.TestCase):
     def test_region_sits_below_every_first_allocatable_slot(self):
         """The carve raises every sub-pool's min_slot_index past the region:
