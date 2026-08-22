@@ -1,0 +1,121 @@
+"""KV pools a DRAFT runner binds over the draft slots fused into the target's
+unified pool: same pages, same slot ids, same v2p table as the target -- one
+allocation, one free, one relocation."""
+
+from typing import Any, Dict, List, Mapping, Optional
+
+import torch
+
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+
+
+class UnifiedDraftKVPool(MHATokenToKVPool):
+    """Dense draft KV over the draft parts of one host sub-pool's entries.
+
+    Per-layer `k_buffer` / `v_buffer` are views of the draft parts inside
+    every slot of the host sub-pool (`UnifiedKVPool.build_dense_draft_views`);
+    ``layer_slots`` maps each of this runner's layer ids to its region slot.
+    Locs arriving through the KVCache API are the target's PHYSICAL token ids,
+    produced by the allocator's translate (the id-space choke point binds it,
+    see KVIndexTranslator); the pool exposes `host_allocator` for that
+    binding. Relocation needs no method here: compaction moves whole page
+    envelopes on the HOST pool, which carries the draft bytes; `move_kv_cache`
+    raises so a stray per-slot move fails loudly instead of corrupting the
+    fused layout.
+    """
+
+    requires_translated_write_loc = True
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        host_sub_pool_name: str,
+        host_allocator,
+        layer_slots: Mapping[int, int],
+        page_size: int = 1,
+    ):
+        spec = unified_buffer.mha_spec(host_sub_pool_name)
+        region = spec.draft_region
+        assert region is not None, (
+            f"UnifiedDraftKVPool: host sub-pool {host_sub_pool_name!r} carries "
+            "no fused draft region"
+        )
+        layer_ids = sorted(layer_slots)
+        assert layer_ids, "UnifiedDraftKVPool binds at least one layer"
+        start_layer = layer_ids[0]
+        # The base pool indexes buffers by `layer_id - start_layer`.
+        assert layer_ids == list(range(start_layer, start_layer + len(layer_ids))), (
+            f"fused draft layer ids must be contiguous; got {layer_ids}"
+        )
+        slots = [layer_slots[layer_id] for layer_id in layer_ids]
+        assert len(set(slots)) == len(slots) and all(
+            0 <= s < region.layer_num for s in slots
+        ), f"draft slots {slots} must be distinct and within range({region.layer_num})"
+        k_views, v_views = unified_buffer.build_dense_draft_views(host_sub_pool_name)
+        max_slots = unified_buffer.max_slots(host_sub_pool_name)
+
+        self._unified_buffer = unified_buffer
+        self._host_sub_pool_name = host_sub_pool_name
+        # The id-space choke point (KVIndexTranslator) probes this: the draft
+        # translates through the HOST allocator, exactly as the target does.
+        self.host_allocator = host_allocator
+        self.layer_slots: Dict[int, int] = dict(layer_slots)
+        self._k_views: List[torch.Tensor] = [k_views[s] for s in slots]
+        self._v_views: List[torch.Tensor] = [v_views[s] for s in slots]
+        num_pages = max_slots // page_size
+
+        super().__init__(
+            size=num_pages * page_size - page_size,
+            page_size=page_size,
+            dtype=region.store_dtype,
+            head_num=region.head_num,
+            head_dim=region.head_dim,
+            layer_num=len(layer_ids),
+            device=unified_buffer.device,
+            enable_memory_saver=False,  # buffer owned by UnifiedKVPool
+            v_head_dim=region.resolved_v_head_dim(),
+            start_layer=start_layer,
+            end_layer=start_layer + len(layer_ids) - 1,
+            enable_kv_cache_copy=False,
+            # Same rationale as UnifiedMHATokenToKVPool: the env-driven layout
+            # selectors must not re-shape buffers this pool builds itself.
+            kv_cache_layout="page_major",
+        )
+
+    def _create_buffers(self):
+        self.k_buffer = self._k_views
+        self.v_buffer = self._v_views
+
+    def _clear_buffers(self):
+        pass  # lifetime owned by UnifiedKVPool
+
+    def get_kv_size_bytes(self):
+        return 0, 0  # fused into the host entries; UnifiedKVPool logs the total
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "fused draft KV relocates with the HOST pool's whole-page move; a "
+            "draft-side per-slot move would corrupt the fused layout"
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft KV has no per-layer contiguous regions; KV transfer / "
+            "disaggregation is unsupported."
+        )
+
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+
+def fused_draft_host_allocator(token_to_kv_pool: Any) -> Optional[Any]:
+    """The host allocator a fused draft pool translates through, or None for
+    any other pool."""
+    if isinstance(token_to_kv_pool, UnifiedDraftKVPool):
+        return token_to_kv_pool.host_allocator
+    return None

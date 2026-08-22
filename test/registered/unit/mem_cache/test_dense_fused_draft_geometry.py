@@ -26,10 +26,15 @@ from sglang.srt.mem_cache.layout.page_major import (
     align_entry_bytes,
     align_part_offset,
 )
-from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
+from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
 from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
+    UnifiedMHATokenToKVPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -58,6 +63,13 @@ def _draft_region():
     return DenseDraftRegion(
         layer_num=1, head_num=1, head_dim=24, v_head_dim=8, store_dtype=_DTYPE
     )
+
+
+def _placement(region, num_runners=1):
+    return FusedDraftPlacement.from_counts(
+        full_counts=[region.layer_num] * num_runners, full=region
+    )
+
 
 
 class TestFusedSpecMath(unittest.TestCase):
@@ -137,6 +149,7 @@ class TestFusedRegionConfinement(unittest.TestCase):
             device=_DEV,
             enable_memory_saver=False,
             page_size=self.PS,
+            fused_draft=_placement(spec.draft_region),
         )
         hk, hv = pool.mha_views_for("full")
         dk, dv = pool.build_dense_draft_views("full")
@@ -183,6 +196,89 @@ class TestFusedRegionConfinement(unittest.TestCase):
         with self.assertRaises(AssertionError):
             pool.build_dense_draft_views("swa")  # no fused region there
 
+
+class TestUnifiedDraftKVPool(unittest.TestCase):
+    PS = 2
+    PAGES = 8
+
+    def _pool(self):
+        spec = _host_spec(_draft_region())
+        swa = MHASubPoolSpec(
+            name="swa",
+            layer_num=1,
+            head_num=2,
+            head_dim=4,
+            store_dtype=torch.bfloat16,
+            grow_direction="up",
+        )
+        total = self.PAGES * self.PS * (spec.entry_bytes() + swa.entry_bytes())
+        return UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[spec, swa],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=_placement(spec.draft_region),
+        )
+
+    def _draft_pool(self, pool):
+        sentinel_allocator = object()
+        dp = UnifiedDraftKVPool(
+            unified_buffer=pool,
+            host_sub_pool_name="full",
+            host_allocator=sentinel_allocator,
+            layer_slots={0: 0},
+            page_size=self.PS,
+        )
+        return dp, sentinel_allocator
+
+    def test_probe_surface_and_view_binding(self):
+        pool = self._pool()
+        dp, alloc = self._draft_pool(pool)
+        spec = pool.mha_spec("full")
+        self.assertIs(dp.host_allocator, alloc)
+        self.assertTrue(dp.requires_translated_write_loc)
+        self.assertEqual(len(dp.k_buffer), 1)
+        self.assertEqual(dp.k_buffer[0].shape[1:], (1, 24))
+        self.assertEqual(dp.v_buffer[0].shape[1:], (1, 8))
+        # Same slot space as the host: one row per physical token, the slot
+        # stride being the whole fused entry.
+        n_rows = pool.max_slots("full") // self.PS * self.PS
+        self.assertEqual(dp.k_buffer[0].shape[0], n_rows)
+        self.assertEqual(dp.size, n_rows - self.PS)
+        self.assertEqual(
+            dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), spec.entry_bytes()
+        )
+
+    def test_host_page_move_carries_the_draft_bytes(self):
+        # THE fused-layout property: compaction relocates whole page envelopes
+        # on the HOST pool; a draft marker written in page A must arrive at
+        # page B after host.move_kv_cache(B, A), with zero draft-side moves.
+        pool = self._pool()
+        dp, _ = self._draft_pool(pool)
+        host = UnifiedMHATokenToKVPool(
+            unified_buffer=pool, sub_pool_name="full", page_size=self.PS
+        )
+        src_page, dst_page = 3, 5
+        src_t, dst_t = src_page * self.PS, dst_page * self.PS
+        dp.k_buffer[0][src_t] = 7.0
+        self.assertEqual(float(dp.k_buffer[0][dst_t].sum()), 0.0)
+
+        ps = self.PS
+        to_tokens = lambda p: torch.arange(p * ps, (p + 1) * ps, dtype=torch.int64)
+        host.move_kv_cache(to_tokens(dst_page), to_tokens(src_page))
+        self.assertEqual(float(dp.k_buffer[0][dst_t].sum()), 7.0 * 24)
+
+    def test_draft_side_moves_and_transfers_fail_loudly(self):
+        pool = self._pool()
+        dp, _ = self._draft_pool(pool)
+        one = torch.zeros(self.PS, dtype=torch.int64)
+        with self.assertRaises(NotImplementedError):
+            dp.move_kv_cache(one, one)
+        with self.assertRaises(NotImplementedError):
+            dp.get_contiguous_buf_infos()
+        with self.assertRaises(NotImplementedError):
+            dp.get_cpu_copy(one)
 
 if __name__ == "__main__":
     unittest.main()
