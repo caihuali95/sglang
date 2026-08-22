@@ -111,6 +111,22 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def _mirror_draft_nextn_layers(*, hf_config, hf_text_config, is_draft_model) -> None:
+    """Mirror a draft's num_nextn_predict_layers onto the text config.
+
+    The draft-arch overrides in `_config_draft_model` write `hf_config`, but
+    the reader takes `hf_text_config`. For wrapper configs (multimodal /
+    ConditionalGeneration models) the two are distinct objects, so without the
+    mirror the reader falls back to None and the MTP draft is sized at the
+    FULL model depth (an oversized draft KV pool and an under-charged target).
+    """
+    if not is_draft_model or hf_text_config is hf_config:
+        return
+    nextn = _hf_attr(hf_config, "num_nextn_predict_layers")
+    if nextn is not None:
+        hf_text_config.num_nextn_predict_layers = nextn
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -757,6 +773,12 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
             self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
+
+        _mirror_draft_nextn_layers(
+            hf_config=self.hf_config,
+            hf_text_config=self.hf_text_config,
+            is_draft_model=is_draft_model,
+        )
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
