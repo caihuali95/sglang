@@ -36,7 +36,10 @@ from torch.profiler import record_function
 from sglang.kernels.ops.kvcache.zero_pages import zero_pages
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.layout.fused_draft import DenseDraftRegion
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.layout.page_major import (
     DenseEntryLayout,
     DensePart,
@@ -349,6 +352,7 @@ class UnifiedKVPool:
         device: str,
         enable_memory_saver: bool,
         page_size: int = 1,
+        fused_draft: Optional[FusedDraftPlacement] = None,
     ):
         assert page_size >= 1, f"page_size must be >= 1; got {page_size}"
         assert len(sub_pool_specs) >= 2, (
@@ -382,6 +386,16 @@ class UnifiedKVPool:
         self._specs_by_name: Dict[str, SubPoolSpec] = {
             s.name: s for s in sub_pool_specs
         }
+        # The draft runners read their slots back from here; a spec carrying a
+        # region the placement does not know (or vice versa) would let the two
+        # sides disagree on the fused layout.
+        self.fused_draft = fused_draft
+        for spec in sub_pool_specs:
+            expected = None if fused_draft is None else fused_draft.region(spec.name)
+            assert spec.draft_region is expected, (
+                f"sub-pool {spec.name!r}: draft_region {spec.draft_region} does "
+                f"not match the fused draft placement's {expected}"
+            )
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -1738,8 +1752,15 @@ def init_unified_swa_pools(
     unified_total_bytes: Optional[int] = None,
     model_context_len: Optional[int] = None,
     sliding_window_size: Optional[int] = None,
+    fused_draft: Optional[FusedDraftPlacement] = None,
 ) -> UnifiedSWAPoolBundle:
-    """Build the SWA-hybrid unified-memory-pool stack."""
+    """Build the SWA-hybrid unified-memory-pool stack.
+
+    With ``fused_draft``, every entry of a sub-pool the placement names
+    carries the draft model's K/V parts after the host parts, and each draft
+    runner binds a `UnifiedDraftKVPool` over its own slots instead of
+    allocating a pool of its own.
+    """
     from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
         UnifiedSWATokenToKVPoolAllocator,
     )
@@ -1764,6 +1785,7 @@ def init_unified_swa_pools(
         v_head_dim=v_head_dim,
         store_dtype=store_dtype,
         grow_direction="down",
+        draft_region=None if fused_draft is None else fused_draft.region("full"),
     )
     swa_spec = MHASubPoolSpec(
         name="swa",
@@ -1773,6 +1795,7 @@ def init_unified_swa_pools(
         v_head_dim=swa_v_head_dim,
         store_dtype=store_dtype,
         grow_direction="up",
+        draft_region=None if fused_draft is None else fused_draft.region("swa"),
     )
     if unified_total_bytes is not None:
         # PROFILED byte budget, sized from directly: the re-sum's floor losses
@@ -1807,6 +1830,7 @@ def init_unified_swa_pools(
         device=device,
         enable_memory_saver=enable_memory_saver,
         page_size=page_size,
+        fused_draft=fused_draft,
     )
     token_to_kv_pool = UnifiedSWAKVPool(
         unified_buffer=shared_pool,
