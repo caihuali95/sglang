@@ -636,6 +636,52 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         kvcache.swa_kv_pool.buf[valid_swa] = -1
         allocator.free(v)
 
+    def test_decode_count_computed_once_and_passed_through(self):
+        """O1 regression pin: the composite computes `get_num_new_pages` for
+        its joint pre-check + virtual-page snapshot, then PASSES it to the
+        band. Pre-O1 the band recomputed it (2 calls/step); if the
+        pass-through is ever dropped in a refactor, the count silently doubles
+        again AND the snapshot-consistency guarantee (band consumes exactly
+        the slice the composite snapshotted) degrades back to coincidence."""
+        from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
+
+        pool, allocator, kvcache = self._build()
+        v = self._alloc(allocator, kvcache, 4)
+        self.assertIsNotNone(v)
+
+        seq_lens = torch.tensor([5], dtype=torch.int64, device=_DEV)
+        seq_lens_cpu = torch.tensor([5], dtype=torch.int64)
+        last_loc = v[-1:].clone()
+
+        class _NoOpKernelGrid:
+            def __getitem__(self, _grid):
+                return self
+
+            def __call__(self, *a, **kw):
+                pass
+
+        calls = 0
+        orig_count = mea_mod.get_num_new_pages
+        orig_kernel = mea_mod.alloc_decode_kernel
+
+        def _counting(**kw):
+            nonlocal calls
+            calls += 1
+            return orig_count(**kw)
+
+        mea_mod.get_num_new_pages = _counting
+        mea_mod.alloc_decode_kernel = _NoOpKernelGrid()
+        try:
+            out = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+        finally:
+            mea_mod.get_num_new_pages = orig_count
+            mea_mod.alloc_decode_kernel = orig_kernel
+
+        self.assertIsNotNone(out)
+        self.assertEqual(
+            calls, 1, "band must receive the composite's count, not recompute"
+        )
+
     def _check_sub_pool_invariants(self, sub, kv):
         """Per-sub-pool: v2p ∘ p2v identity on the live set, hole-free
         allocated band, data followed relocations."""

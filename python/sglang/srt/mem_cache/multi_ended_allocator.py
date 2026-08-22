@@ -1209,10 +1209,13 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
+        num_new_pages: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Allocate one new token per request (decode), preserving the
         tail-page-reuse contract. Runs in virtual space; binds each consumed
         virtual page on THIS sub-allocator (else v2p stays -1 → CUDA OOB).
+        `num_new_pages=` lets a composite pass its pre-computed count through
+        (same snapshot-before-kernel contract as `alloc_extend`).
         """
         with record_function("MultiEndedAlloc.alloc_decode"):
             assert (
@@ -1221,9 +1224,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             bs = len(seq_lens)
             # CPU-only count BEFORE the kernel, to snapshot the exact slice the
             # kernel will consume.
-            num_new_pages = get_num_new_pages(
-                seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
-            )
+            if num_new_pages is None:
+                num_new_pages = get_num_new_pages(
+                    seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
+                )
             if num_new_pages > len(self.free_virtual_ids):
                 return None
             # Lazy: physical-capacity pre-check; on shortfall flush PEER.
@@ -3428,7 +3432,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             fa = self.full_attn_allocator
             new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
 
-            out_indices = fa.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+            out_indices = fa.alloc_decode(
+                seq_lens, seq_lens_cpu, last_loc, num_new_pages=num_new_pages
+            )
             assert out_indices is not None, (
                 "UnifiedSWA.alloc_decode: full.alloc_decode returned None "
                 "after joint pre-check passed — internal-state inconsistency"
