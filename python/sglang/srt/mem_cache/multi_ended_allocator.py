@@ -2514,8 +2514,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
       (N slots cost N*(entry_full + entry_swa) shared-gap bytes).
     - `_conserve_*`: slot-conservation, for the LEAK invariant only.
     - `schedulable_*`: byte-coordinated, realizable-with-compaction.
-    - `full_available_size()` / `swa_available_size()`: per-side scheduler view
-      = min(conserve, schedulable).
+    - `full_available_size()` / `swa_available_size()`: pure slot-conservation
+      (stats + the leak identity; admission prices bytes via
+      `make_admission_budget` and never reads these).
     """
 
     # Parent's `size` property has no setter but base init does `self.size = size`;
@@ -2702,21 +2703,21 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self._swa_max_total_num_tokens - self.swa_attn_allocator.allocated_count()
         )
 
-    # PHYSICAL per-side views read by scheduling / eviction consumers. The
-    # `min(...)` is sound under dynamic borrowing: the static-conserve cap bounds
-    # the lending side, the byte-coordinated `schedulable_*` bounds the side that
-    # has grown into the shared gap; whichever is tighter wins.
+    # PHYSICAL per-side views. Admission no longer reads these (the byte
+    # budget prices both sides against `schedulable_free_bytes`), so the
+    # static-split `min(conserve, schedulable)` wall is gone: what remains
+    # are the stats / leak-identity consumers, and for THEM the pure
+    # slot-conservation value is the exact one — `available + evictable +
+    # protected + held == static total` balances arithmetically even when a
+    # side has byte-borrowed past its boot label (available simply goes
+    # negative by the borrowed amount), while a `min()` with the
+    # byte-coordinated view breaks the identity whenever bytes are tighter
+    # than slots. Realizability consumers use `schedulable_*`.
     def full_available_size(self) -> int:
-        return min(
-            self._conserve_full_available_size(),
-            self.schedulable_full_available_size(),
-        )
+        return self._conserve_full_available_size()
 
     def swa_available_size(self) -> int:
-        return min(
-            self._conserve_swa_available_size(),
-            self.schedulable_swa_available_size(),
-        )
+        return self._conserve_swa_available_size()
 
     # Byte-coordinated, realizable-with-compaction views (peer drainable holes
     # credited — see `MultiEndedAllocator.schedulable_available_size`).

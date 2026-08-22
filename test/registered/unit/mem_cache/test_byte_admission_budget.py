@@ -312,3 +312,25 @@ class TestByteAdmissionBudget(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerSideViewsArePureConserve(unittest.TestCase):
+    """The per-side availability views must NOT consult the byte-coordinated
+    value: the idle leak identity sums the conservation number, and folding a
+    tighter schedulable view back in (the old `min`) breaks the identity
+    whenever bytes are tighter than slots."""
+
+    def setUp(self):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+    def test_tighter_schedulable_view_does_not_leak_in(self):
+        from unittest.mock import patch
+
+        _, allocator = _swa_composite(n_full=32, n_swa=8)
+        conserve_full = allocator._conserve_full_available_size()
+        conserve_swa = allocator._conserve_swa_available_size()
+        with patch.object(
+            allocator, "schedulable_full_available_size", return_value=1
+        ), patch.object(allocator, "schedulable_swa_available_size", return_value=1):
+            self.assertEqual(allocator.full_available_size(), conserve_full)
+            self.assertEqual(allocator.swa_available_size(), conserve_swa)
