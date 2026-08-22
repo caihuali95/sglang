@@ -787,6 +787,22 @@ class KVCacheConfigurator:
             if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
+        # Resolve ONCE here (not inline below) so the boot log reports exactly
+        # the region the factory is handed: a silently-declined fusion and an
+        # engaged one otherwise look identical from outside.
+        draft_kv_geometry = self.fused_draft_kv_region()
+        if draft_kv_geometry is not None:
+            logger.info(
+                "[unified-memory-pool] fused draft region: %d layer(s) x %d kv "
+                "head(s) x %d head_dim @ %s = %d B/token, carried inside the "
+                "full-side page envelope",
+                draft_kv_geometry.layer_num,
+                draft_kv_geometry.head_num,
+                draft_kv_geometry.head_dim,
+                draft_kv_geometry.store_dtype,
+                draft_kv_geometry.entry_bytes(),
+            )
+
         bundle = init_unified_swa_pools(
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
@@ -810,7 +826,7 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
-            draft_kv_geometry=self.fused_draft_kv_region(),
+            draft_kv_geometry=draft_kv_geometry,
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
