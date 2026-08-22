@@ -771,6 +771,63 @@ class TestComputedShortSide(unittest.TestCase):
             alloc._ask_float_for_room(1)
 
 
+class TestSlotAllocGroupCursor(unittest.TestCase):
+    """O1 rewrote alloc_group's per-slot draws from iter(result.split(1)) to a
+    cursor over one batch tensor. The two rewrite-specific silent risks:
+
+      * the unused tail is now freed as a SLICE VIEW (was a fresh cat) — if
+        the slice bounds drift, end() double-frees drawn slots or leaks the
+        tail, both invisible until a later wrong-slot state write;
+      * cursor exhaustion must FALL THROUGH to the allocator (the iterator
+        version returned None from `next` and fell through) — a cursor
+        off-by-one would instead hand out an out-of-range view.
+    """
+
+    def _slot_alloc(self):
+        inst = TestUnifiedTriPool(
+            [m for m in dir(TestUnifiedTriPool) if m.startswith("test_")][0]
+        )
+        pool, allocator, _, _ = inst._build()
+        cap = pool.max_slots("mamba") - 1
+        return (
+            UnifiedMambaSlotAllocator(
+                allocator.mamba_allocator, max_size=cap, device=_DEV
+            ),
+            cap,
+        )
+
+    def test_partial_draw_frees_exactly_the_tail(self):
+        slot_alloc, cap = self._slot_alloc()
+        slot_alloc.alloc_group_begin(4)
+        drawn = [slot_alloc.alloc(1) for _ in range(2)]
+        slot_alloc.alloc_group_end()
+        # Tail (2 slots) returned; the 2 drawn stay allocated.
+        self.assertEqual(slot_alloc.available_size(), cap - 2)
+        # Draws are distinct live slots, still individually freeable.
+        self.assertNotEqual(int(drawn[0].item()), int(drawn[1].item()))
+        for s in drawn:
+            slot_alloc.free(s)
+        self.assertEqual(slot_alloc.available_size(), cap)
+
+    def test_exhausted_cursor_falls_through_to_the_allocator(self):
+        slot_alloc, cap = self._slot_alloc()
+        slot_alloc.alloc_group_begin(2)
+        seen = {int(slot_alloc.alloc(1).item()) for _ in range(2)}
+        extra = slot_alloc.alloc(1)  # past the batch -> direct allocator draw
+        self.assertIsNotNone(extra)
+        self.assertNotIn(int(extra.item()), seen)
+        slot_alloc.alloc_group_end()  # empty tail: nothing to return
+        self.assertEqual(slot_alloc.available_size(), cap - 3)
+
+    def test_unsatisfiable_group_degrades_to_per_slot_draws(self):
+        slot_alloc, cap = self._slot_alloc()
+        slot_alloc.alloc_group_begin(cap + 1)  # cannot prefetch: batch = None
+        one = slot_alloc.alloc(1)  # falls through, still succeeds
+        self.assertIsNotNone(one)
+        slot_alloc.alloc_group_end()
+        self.assertEqual(slot_alloc.available_size(), cap - 1)
+
+
 class TestFloatPolicyTotalTarget(unittest.TestCase):
     """`make_room`'s min_bytes is a TARGET for the whole band, not a delta.
 
