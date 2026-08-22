@@ -694,7 +694,7 @@ class KVCacheConfigurator:
             and not self.is_draft_worker
             and self.spec_algorithm.is_eagle()
             and aux.eagle_draft_num_layers
-            and aux.eagle_draft_kv_head_num
+            and aux.eagle_draft_total_kv_heads
         ):
             return None
         if aux.eagle_draft_head_dim != aux.eagle_draft_v_head_dim:
@@ -705,9 +705,17 @@ class KVCacheConfigurator:
                 aux.eagle_draft_v_head_dim,
             )
             return None
+        # Per-GPU kv heads, mirroring the target's own division above. The
+        # resolver stores the UNDIVIDED count (it runs before the attn-TP
+        # group exists), so apply attn_tp here — dcp is deliberately absent:
+        # `ModelConfig.get_num_kv_heads` documents that drafts never join the
+        # DCP group, and the unified gate pins dcp_size == 1 regardless.
+        draft_kv_heads = max(
+            1, int(aux.eagle_draft_total_kv_heads) // get_parallel().attn_tp_size
+        )
         return DenseDraftRegion(
             layer_num=int(aux.eagle_draft_num_layers),
-            head_num=int(aux.eagle_draft_kv_head_num),
+            head_num=draft_kv_heads,
             head_dim=int(aux.eagle_draft_head_dim),
             # Drafts store KV in the same server kv dtype as the target.
             store_dtype=_store_dtype_for(self.kv_cache_dtype),

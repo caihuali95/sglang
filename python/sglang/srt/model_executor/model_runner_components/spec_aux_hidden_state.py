@@ -39,11 +39,13 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     # Draft layers whose KV cache uses the target SWA pool capacity.
     eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
-    # EAGLE draft KV head geometry (kv heads are attn-TP-divided, like the
-    # target pool's), recorded so the unified fused-draft-KV path can build
-    # the draft region and price the fused entry at TARGET boot — before the
-    # draft worker exists. None when no EAGLE draft config was loaded.
-    eagle_draft_kv_head_num: Optional[int] = None
+    # EAGLE draft KV head geometry, recorded so the unified fused-draft-KV
+    # path can build the draft region and price the fused entry at TARGET boot
+    # — before the draft worker exists. `total_kv_heads` is the UNDIVIDED
+    # count: this config resolves before the attention-TP group is
+    # initialized, so consumers apply attn_tp themselves. None when no EAGLE
+    # draft config was loaded.
+    eagle_draft_total_kv_heads: Optional[int] = None
     eagle_draft_head_dim: Optional[int] = None
     eagle_draft_v_head_dim: Optional[int] = None
     dflash_use_aux_hidden_state: bool = False
@@ -106,10 +108,13 @@ def _resolve_eagle_aux_hidden_state(
                     draft_model_config.num_attention_layers,
                 )
             )
-        from sglang.srt.runtime_context import get_parallel
-
-        config.eagle_draft_kv_head_num = draft_model_config.get_num_kv_heads(
-            get_parallel().attn_tp_size
+        # TOTAL kv heads, NOT the per-GPU count: this resolver runs before
+        # `init_torch_distributed`, so the attention-TP group does not exist
+        # yet and any `get_parallel()` read asserts. Consumers divide by
+        # attn_tp themselves, at pool-build time (see
+        # KVCacheConfigurator.fused_draft_kv_region).
+        config.eagle_draft_total_kv_heads = int(
+            draft_model_config.get_total_num_kv_heads()
         )
         config.eagle_draft_head_dim = int(draft_model_config.head_dim)
         config.eagle_draft_v_head_dim = int(draft_model_config.v_head_dim)
