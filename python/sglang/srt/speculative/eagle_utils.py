@@ -78,10 +78,15 @@ def per_step_draft_out_cache_loc(
         f"out_cache_loc.shape[0]={out_cache_loc.shape[0]} != "
         f"batch_size * topk * num_steps = {batch_size}*{topk}*{num_steps}={expected}"
     )
+    # The permute+reshape yields a VIEW whose rows have stride num_steps, and
+    # consumers read rows with raw pointer arithmetic (the DSv4 metadata kernel
+    # loads raw_out_loc_ptr + batch_id) — a strided row silently interleaves
+    # steps there. Materialize so every row is contiguous.
     return (
         out_cache_loc.view(batch_size, topk, num_steps)
         .permute(2, 0, 1)
         .reshape(num_steps, -1)
+        .contiguous()
     )
 
 
