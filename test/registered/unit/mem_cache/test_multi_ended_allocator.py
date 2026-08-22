@@ -637,12 +637,15 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         allocator.free(v)
 
     def test_decode_count_computed_once_and_passed_through(self):
-        """O1 regression pin: the composite computes `get_num_new_pages` for
-        its joint pre-check + virtual-page snapshot, then PASSES it to the
-        band. Pre-O1 the band recomputed it (2 calls/step); if the
-        pass-through is ever dropped in a refactor, the count silently doubles
-        again AND the snapshot-consistency guarantee (band consumes exactly
-        the slice the composite snapshotted) degrades back to coincidence."""
+        """The composite computes `get_num_new_pages` exactly ONCE per decode
+        step. Historically the band recomputed the composite's count (2
+        calls/step) until the pass-through landed; the fused dual-bind path
+        then absorbed the band call entirely. Either regression — dropping
+        the pass-through on the band surface, or the fused path growing a
+        second count — doubles the CPU-side count math per step AND lets the
+        snapshot the kernel consumes drift from the count the joint gate
+        approved. The kernel stub keeps a regressed band call failing CLEAN
+        on CPU rather than launching Triton."""
         from sglang.srt.mem_cache import multi_ended_allocator as mea_mod
 
         pool, allocator, kvcache = self._build()

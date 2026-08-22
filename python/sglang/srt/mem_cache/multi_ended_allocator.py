@@ -41,7 +41,11 @@ import msgspec
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.virtual_slot import alloc_bind_inplace, translate_v2p
+from sglang.kernels.ops.memory.virtual_slot import (
+    alloc_bind_inplace,
+    alloc_decode_dual_bind,
+    translate_v2p,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import (
@@ -880,7 +884,6 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 device=self.device,
             )
         return torch.cat([plan.drained, extended_t])
-
 
     def _extend_watermark(self, num_pages: int) -> bool:
         """Advance the watermark by `num_pages` (lazy-path helper). Returns False
@@ -3477,32 +3480,59 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """Paged decode. One new token per request (a page is consumed iff the
-        decode wraps). Same one-kernel-in-virtual-space discipline as ``alloc_extend``.
+        """Paged decode, fully fused: ONE kernel computes the per-request token
+        slots AND binds each consumed virtual page in BOTH physical spaces.
+
+        The Python side only plans: the joint capacity gate, then a per-side
+        `_reserve_phys_pages` (watermark/span/hole state — epoch-bumping ints),
+        then the single `alloc_decode_dual_bind` launch reads straight from the
+        two reservations. Replaces the historical chain of alloc_decode kernel
+        + two snapshot clones + two `alloc_bind_inplace` launches per step.
         """
         with record_function("UnifiedSWAAlloc.alloc_decode"):
+            fa, sa = self.full_attn_allocator, self.swa_attn_allocator
+            bs = len(seq_lens)
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
             )
+            if num_new_pages > len(fa.free_virtual_ids):
+                return None
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
                 if not _relieve_for_alloc(self, need_tokens):
                     return None
+            if fa.need_sort and bs > len(fa.free_virtual_ids):
+                fa.merge_and_sort_free()
 
-            fa = self.full_attn_allocator
-            new_virtual_pages = fa.free_virtual_ids[:num_new_pages].clone()
-
-            out_indices = fa.alloc_decode(
-                seq_lens, seq_lens_cpu, last_loc, num_new_pages=num_new_pages
+            plan_f = fa._reserve_phys_pages(num_new_pages)
+            assert plan_f is not None, (
+                "UnifiedSWA.alloc_decode: full-side reservation failed after "
+                "joint pre-check passed — internal-state inconsistency"
             )
-            assert out_indices is not None, (
-                "UnifiedSWA.alloc_decode: full.alloc_decode returned None "
-                "after joint pre-check passed — internal-state inconsistency"
+            plan_s = sa._reserve_phys_pages(num_new_pages)
+            assert plan_s is not None, (
+                "UnifiedSWA.alloc_decode: swa-side reservation failed after "
+                "joint pre-check passed — internal-state inconsistency"
             )
 
-            if new_virtual_pages.numel() > 0:
-                self.swa_attn_allocator.alloc_with_virtual(new_virtual_pages)
-
+            out_indices = alloc_decode_dual_bind(
+                seq_lens=seq_lens,
+                last_loc=last_loc,
+                free_virtual_pages=fa.free_virtual_ids,
+                num_new_pages=num_new_pages,
+                page_size=self.page_size,
+                v2p_a=fa.virtual_to_physical,
+                p2v_a=fa.physical_to_virtual,
+                holes_a=plan_f.drained,
+                nd_a=plan_f.n_drained,
+                start_a=plan_f.start_phys,
+                v2p_b=sa.virtual_to_physical,
+                p2v_b=sa.physical_to_virtual,
+                holes_b=plan_s.drained,
+                nd_b=plan_s.n_drained,
+                start_b=plan_s.start_phys,
+            )
+            fa.free_virtual_ids = fa.free_virtual_ids[num_new_pages:]
             return out_indices  # virtual TOKEN ids
 
     def is_slot_allocated(self, slot: int) -> bool:

@@ -198,3 +198,197 @@ def translate_v2p(
         BLOCK=TRANSLATE_BLOCK,
     )
     return out
+
+
+# Fused decode-step allocation for the unified SWA/tri composite: the upstream
+# `alloc_decode_kernel` token-slot computation PLUS the dual virtual->physical
+# binding (full end + swa side bind the SAME virtual pages into their own
+# physical spaces). One launch replaces alloc_decode_kernel + two
+# alloc_bind_inplace launches + two free-list clone snapshots per step.
+#
+# The physical side of each bind comes from a RESERVATION the caller planned in
+# Python (`_reserve_phys_pages`): `phys(i) = holes[i] for i < n_drained, else
+# start_phys + (i - n_drained)` — one formula covering the watermark/span fast
+# path (no drain), the hole-recycling slow path, and the mixed case. Holes
+# drain from the slice FRONT on every band type (matching `take_physical`).
+
+
+# `free_page_ptr` and the two hole slices are all RE-SLICED after every
+# allocation, so their `data_ptr()` flips between 16-byte-aligned and unaligned
+# across calls. Triton bakes pointer alignment into the cache key, so each flip
+# compiles another kernel variant and pays its JIT (~100ms) on the scheduler
+# thread mid-serving — see the same rationale for `alloc_extend_kernel` in
+# `ops/memory/allocator.py`. Skipping the specialization costs nothing here:
+# every load through these three pointers is SCALAR, so the alignment hint
+# enables no vectorization. `translate_v2p_kernel` is deliberately different:
+# its loads ARE block-wide contiguous, so alignment genuinely matters there,
+# and its pointers are [:n] slices off fixed buffers whose base never moves.
+@triton.jit(
+    do_not_specialize=[
+        "free_page_ptr",
+        "holes_a_ptr",
+        "holes_b_ptr",
+        "num_new_pages",
+        "nd_a",
+        "start_a",
+        "nd_b",
+        "start_b",
+    ]
+)
+def alloc_decode_dual_bind_kernel(
+    seq_lens_ptr,
+    last_loc_ptr,
+    free_page_ptr,  # in: virtual page free-list (front num_new_pages consumed)
+    out_indices,  # out: [bs] virtual TOKEN ids
+    v2p_a_ptr,  # in/out: side-A virtual_to_physical
+    p2v_a_ptr,  # in/out: side-A physical_to_virtual
+    holes_a_ptr,  # in: side-A drained hole slice (unread when nd_a == 0)
+    v2p_b_ptr,  # in/out: side-B virtual_to_physical
+    p2v_b_ptr,  # in/out: side-B physical_to_virtual
+    holes_b_ptr,  # in: side-B drained hole slice (unread when nd_b == 0)
+    num_new_pages,  # runtime: N pages consumed this step
+    nd_a,  # runtime: side-A drained count
+    start_a,  # runtime: side-A first extended physical page
+    nd_b,  # runtime: side-B drained count
+    start_b,  # runtime: side-B first extended physical page
+    bs_upper: tl.constexpr,
+    page_size: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    # --- token slot: byte-identical to `alloc_decode_kernel` ---
+    load_offset = tl.arange(0, bs_upper)
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
+    pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
+
+    seq_len = tl.load(seq_lens_ptr + pid)
+    pre_len = seq_len - 1
+
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (pre_lens + page_size - 1) // page_size
+    num_new_per_req = num_pages_after - num_pages_before
+
+    num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
+        pre_len + page_size - 1
+    ) // page_size
+    sum_num_new_pages = tl.sum(num_new_per_req)
+    new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
+
+    if num_page_start_loc_self == 0:
+        last_loc = tl.load(last_loc_ptr + pid)
+        tl.store(out_indices + pid, last_loc + 1)
+    else:
+        page = tl.load(free_page_ptr + new_page_start_loc)
+        tl.store(out_indices + pid, page * page_size)
+
+    # --- dual bind: program pid binds new page #pid in BOTH spaces ---
+    if pid < num_new_pages:
+        v = tl.load(free_page_ptr + pid).to(tl.int64)
+        if pid < nd_a:
+            pa = tl.load(holes_a_ptr + pid).to(tl.int64)
+        else:
+            pa = (start_a + (pid - nd_a)).to(tl.int64)
+        tl.store(v2p_a_ptr + v, pa)
+        tl.store(p2v_a_ptr + pa, v)
+        if pid < nd_b:
+            pb = tl.load(holes_b_ptr + pid).to(tl.int64)
+        else:
+            pb = (start_b + (pid - nd_b)).to(tl.int64)
+        tl.store(v2p_b_ptr + v, pb)
+        tl.store(p2v_b_ptr + pb, v)
+
+
+def _reserved_phys_ids(
+    n: int, holes, n_drained: int, start_phys: int, device
+) -> torch.Tensor:
+    """CPU reference for the per-side phys formula (page ordinals 0..n-1)."""
+    out = torch.empty(n, dtype=torch.int64, device=device)
+    if n_drained > 0:
+        out[:n_drained] = holes[:n_drained]
+    if n > n_drained:
+        out[n_drained:] = start_phys + torch.arange(
+            n - n_drained, dtype=torch.int64, device=device
+        )
+    return out
+
+
+def alloc_decode_dual_bind(
+    *,
+    seq_lens: torch.Tensor,
+    last_loc: torch.Tensor,
+    free_virtual_pages: torch.Tensor,
+    num_new_pages: int,
+    page_size: int,
+    v2p_a: torch.Tensor,
+    p2v_a: torch.Tensor,
+    holes_a,  # Optional[torch.Tensor]
+    nd_a: int,
+    start_a: int,
+    v2p_b: torch.Tensor,
+    p2v_b: torch.Tensor,
+    holes_b,  # Optional[torch.Tensor]
+    nd_b: int,
+    start_b: int,
+) -> torch.Tensor:
+    """One-launch decode alloc + dual bind; see the kernel docstring.
+
+    `holes_*` may be None when `nd_* == 0` (never read). The caller owns all
+    Python-side state updates (watermarks, hole-slice rebinds, free-list slice).
+    """
+    bs = int(seq_lens.shape[0])
+    device = seq_lens.device
+    out_indices = torch.empty((bs,), dtype=torch.int64, device=device)
+    N = num_new_pages
+    # Program `pid` binds new page #pid, so the grid (one program per request)
+    # must cover every page. Decode consumes at most one page per request
+    # (`get_num_new_pages(decode=True)` counts wrapping requests), so this holds
+    # by construction — assert rather than trust it: an uncovered page would
+    # stay v2p=-1 and route reads/writes to the slot-0 sink SILENTLY.
+    assert N <= bs, (
+        f"alloc_decode_dual_bind: num_new_pages ({N}) exceeds the program grid "
+        f"({bs}); pages [{bs}, {N}) would never be bound"
+    )
+    if not seq_lens.is_cuda:
+        # Pure-torch CPU reference for the CUDA-only kernel.
+        pre = seq_lens - 1
+        pages_after = (seq_lens + page_size - 1) // page_size
+        pages_before = (pre + page_size - 1) // page_size
+        need = (pages_after - pages_before).to(torch.int64)
+        ordinal = torch.cumsum(need, 0) - need  # exclusive prefix count
+        out_indices.copy_(last_loc + 1)
+        wraps = need > 0
+        if int(wraps.sum()) > 0:
+            pages = free_virtual_pages[ordinal[wraps]]
+            out_indices[wraps] = pages * page_size
+        if N > 0:
+            v = free_virtual_pages[:N].to(torch.int64)
+            pa = _reserved_phys_ids(N, holes_a, nd_a, start_a, device)
+            v2p_a[v] = pa
+            p2v_a[pa] = v
+            pb = _reserved_phys_ids(N, holes_b, nd_b, start_b, device)
+            v2p_b[v] = pb
+            p2v_b[pb] = v
+        return out_indices
+    # Dummy device pointers for unread hole slices (guarded by nd_* == 0).
+    holes_a_t = holes_a if holes_a is not None else out_indices
+    holes_b_t = holes_b if holes_b is not None else out_indices
+    alloc_decode_dual_bind_kernel[(bs,)](
+        seq_lens,
+        last_loc,
+        free_virtual_pages,
+        out_indices,
+        v2p_a,
+        p2v_a,
+        holes_a_t,
+        v2p_b,
+        p2v_b,
+        holes_b_t,
+        N,
+        nd_a,
+        start_a,
+        nd_b,
+        start_b,
+        bs_upper=triton.next_power_of_2(bs),
+        page_size=page_size,
+    )
+    return out_indices
