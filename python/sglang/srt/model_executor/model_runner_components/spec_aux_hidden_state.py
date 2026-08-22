@@ -39,6 +39,13 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     # Draft layers whose KV cache uses the target SWA pool capacity.
     eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
+    # EAGLE draft KV head geometry (kv heads are attn-TP-divided, like the
+    # target pool's), recorded so the unified fused-draft-KV path can build
+    # the draft region and price the fused entry at TARGET boot — before the
+    # draft worker exists. None when no EAGLE draft config was loaded.
+    eagle_draft_kv_head_num: Optional[int] = None
+    eagle_draft_head_dim: Optional[int] = None
+    eagle_draft_v_head_dim: Optional[int] = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
@@ -99,6 +106,13 @@ def _resolve_eagle_aux_hidden_state(
                     draft_model_config.num_attention_layers,
                 )
             )
+        from sglang.srt.runtime_context import get_parallel
+
+        config.eagle_draft_kv_head_num = draft_model_config.get_num_kv_heads(
+            get_parallel().attn_tp_size
+        )
+        config.eagle_draft_head_dim = int(draft_model_config.head_dim)
+        config.eagle_draft_v_head_dim = int(draft_model_config.v_head_dim)
 
         if (
             draft_model_config.is_hybrid_swa

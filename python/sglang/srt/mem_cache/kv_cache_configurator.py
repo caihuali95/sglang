@@ -643,6 +643,73 @@ class KVCacheConfigurator:
         )
         return bundle
 
+    def fused_draft_kv_region(self):
+        """The EAGLE draft's KV geometry when it fuses into the target's pages.
+
+        Fusion engages only for: unified memory ON, a hybrid-SWA target (the
+        draft is dense per token, so it fuses into the FULL sub-pool), an
+        EAGLE-family algorithm whose draft config was loaded at target boot,
+        and a uniform-row draft (dense views need equal K/V widths). None
+        otherwise; callers keep their non-fused arrangement.
+        """
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            DenseDraftRegion,
+            _store_dtype_for,
+        )
+
+        aux = self.spec_aux_config
+        if not (
+            get_memory().enable_unified_memory
+            and self.is_hybrid_swa
+            and not self.is_draft_worker
+            and self.spec_algorithm.is_eagle()
+            and aux.eagle_draft_num_layers
+            and aux.eagle_draft_kv_head_num
+        ):
+            return None
+        if aux.eagle_draft_head_dim != aux.eagle_draft_v_head_dim:
+            logger.warning(
+                "fused draft KV disabled: the draft's K/V rows are asymmetric "
+                "(head_dim=%s, v_head_dim=%s) and cannot form dense views.",
+                aux.eagle_draft_head_dim,
+                aux.eagle_draft_v_head_dim,
+            )
+            return None
+        return DenseDraftRegion(
+            layer_num=int(aux.eagle_draft_num_layers),
+            head_num=int(aux.eagle_draft_kv_head_num),
+            head_dim=int(aux.eagle_draft_head_dim),
+            # Drafts store KV in the same server kv dtype as the target.
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+        )
+
+    def fused_full_entry_bytes(self) -> Optional[int]:
+        """Per-token bytes of the FUSED full-side entry (host + draft + pad),
+        for the boot solve's cell model. Single source of truth: assembled
+        through the same `MHASubPoolSpec` the pool factory builds, so the
+        priced entry and the allocated entry cannot drift. None when fusion
+        is off."""
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            _store_dtype_for,
+        )
+
+        region = self.fused_draft_kv_region()
+        if region is None:
+            return None
+        spec = MHASubPoolSpec(
+            name="full",
+            layer_num=len(self.model_config.full_attention_layer_ids),
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+            grow_direction="down",
+            draft_region=region,
+        )
+        return spec.entry_bytes()
+
     def _init_unified_swa_pools(
         self,
         *,
@@ -731,6 +798,7 @@ class KVCacheConfigurator:
             forward_stream=self.forward_stream,
             # Lazy compaction: default ON, with env var escape hatch for rollback / A/B.
             lazy_compaction=_should_enable_lazy_compaction(),
+            draft_kv_geometry=self.fused_draft_kv_region(),
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,
