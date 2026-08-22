@@ -223,6 +223,31 @@ class MambaSubPoolSpec(SubPoolSpec):
         return self.conv_dtype  # representative state dtype; matches MambaPool.dtype
 
 
+def mamba_sub_pool_spec_from_cache_params(
+    cache_params,
+    *,
+    layer_num: int,
+    grow_direction: str,
+    name: str = "mamba",
+    conv_slice_axis: int = 0,
+) -> MambaSubPoolSpec:
+    """The ONE mapping from Mamba2-style cache params to a `MambaSubPoolSpec`.
+
+    Shared by the pool factories and the boot solve's spec-scratch pricing so
+    the shapes/dtypes they derive cannot diverge."""
+    cp = cache_params
+    return MambaSubPoolSpec(
+        name=name,
+        layer_num=layer_num,
+        conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
+        conv_dtype=cp.dtype.conv,
+        temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+        temporal_dtype=cp.dtype.temporal,
+        conv_slice_axis=conv_slice_axis,
+        grow_direction=grow_direction,
+    )
+
+
 # ---------------------------------------------------------------------------
 # UnifiedKVPool — the byte buffer + the strided per-sub-pool views
 # ---------------------------------------------------------------------------
@@ -1366,15 +1391,11 @@ def init_unified_mamba_pools(
             grow_direction="down",
         )
     cp = mamba2_cache_params
-    mamba_spec = MambaSubPoolSpec(
-        name="mamba",
+    mamba_spec = mamba_sub_pool_spec_from_cache_params(
+        cp,
         layer_num=len(mamba_layer_ids),
-        conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
-        conv_dtype=cp.dtype.conv,
-        temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
-        temporal_dtype=cp.dtype.temporal,
-        conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
+        conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
     )
     if unified_total_bytes is not None:
         # PROFILED byte budget for the token side (captured pre-ratio-floor);
@@ -2054,13 +2075,9 @@ def init_unified_mamba_swa_pools(
         grow_direction="float",
     )
     cp = mamba2_cache_params
-    mamba_spec = MambaSubPoolSpec(
-        name="mamba",
+    mamba_spec = mamba_sub_pool_spec_from_cache_params(
+        cp,
         layer_num=len(mamba_layer_ids),
-        conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
-        conv_dtype=cp.dtype.conv,
-        temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
-        temporal_dtype=cp.dtype.temporal,
         grow_direction="up",
     )
     if unified_total_bytes is not None:
