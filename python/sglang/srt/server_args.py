@@ -8241,12 +8241,39 @@ class ServerArgs:
                 "ships host/C4 rows straight from the allocator, bypassing the "
                 "virtual->physical translation the unified pool needs."
             )
-        assert self.speculative_algorithm in (None, "DSPARK"), (
+        assert self.speculative_algorithm in (None, "DSPARK", "NGRAM"), (
             "--enable-unified-memory only supports --speculative-algorithm "
-            "DSPARK (chain draft); other speculative algorithms are not yet "
+            "DSPARK (chain draft) and NGRAM (target-only verify on "
+            "mamba-family targets); other speculative algorithms are not yet "
             "audited for the unified pool's virtual/dense loc translation. Got "
             f"--speculative-algorithm={self.speculative_algorithm!r}."
         )
+        if self.speculative_algorithm == "NGRAM":
+            from sglang.srt.configs.hybrid_arch import mambaish_config
+
+            # Mamba-family targets only: the family whose target-verify needs
+            # the pool's spec-state scratch region, and the family this
+            # enablement is audited on. NGRAM has no draft worker or draft
+            # KV; its verify rides the TARGET_VERIFY rails DSPARK exercises.
+            assert mambaish_config(self.get_model_config()) is not None, (
+                "--enable-unified-memory + NGRAM is audited for mamba-family "
+                "(linear-attention hybrid) targets only; run this model "
+                "without --enable-unified-memory or without NGRAM."
+            )
+            # EXPLICIT resolved backends, None included: an unset backend
+            # would default to fa3/flashinfer later in resolution, silently
+            # leaving the audited envelope. Same verify-audited set as the
+            # DSPARK arm below.
+            ngram_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+            ngram_backends = set(self._resolved_attention_backends())
+            assert ngram_backends <= ngram_allowed, (
+                "--enable-unified-memory + NGRAM requires spec-verify-audited "
+                f"attention backends {sorted(ngram_allowed)}, set explicitly, "
+                f"for both prefill and decode; got "
+                f"{sorted(ngram_backends, key=str)}. flashinfer / fa3 do not "
+                "translate speculative verify indices to the unified pool's "
+                "dense space yet."
+            )
         if self.speculative_algorithm == "DSPARK":
             assert self.speculative_eagle_topk in (None, 1), (
                 "--enable-unified-memory + DSPARK supports a linear draft "
