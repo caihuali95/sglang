@@ -1244,8 +1244,6 @@ def init_unified_mamba_pools(
     # `_mamba_translate` feeds the HiCache offload path, GATED OFF here — wired but inert.
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
-    if use_mla_backend:
-        token_to_kv_pool._full_translate = allocator.translate_kv_loc_dense
 
     logger.info(
         "[unified-memory-pool] ============================================================"

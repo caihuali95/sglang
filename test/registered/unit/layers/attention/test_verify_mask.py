@@ -148,6 +148,9 @@ def _make_hybrid_backend(speculative_attention_mode, prefill_mask, decode_mask):
         kv_cache_dtype=None,
         token_to_kv_pool=object(),
         req_to_token_pool=object(),
+        # The real runner builds its KVIndexTranslator before the backends
+        # (_init_post_memory_pool_components), and the wrapper forwards it.
+        kv_index_translator=None,
         server_args=SimpleNamespace(
             speculative_attention_mode=speculative_attention_mode
         ),
