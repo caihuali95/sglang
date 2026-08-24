@@ -470,13 +470,21 @@ class TestCaptureContract(unittest.TestCase):
 
 
 class _FakeForwardBatch:
-    """Weakref-able stand-in (SimpleNamespace is not) carrying the three
-    fields `view_for_forward_batch` reads."""
+    """Weakref-able stand-in (SimpleNamespace is not) carrying the fields
+    `view_for_forward_batch` and `rebind_write_loc` read."""
 
-    def __init__(self, *, req_pool_indices, seq_lens, seq_lens_cpu):
+    def __init__(
+        self,
+        *,
+        req_pool_indices=None,
+        seq_lens=None,
+        seq_lens_cpu=None,
+        out_cache_loc=None,
+    ):
         self.req_pool_indices = req_pool_indices
         self.seq_lens = seq_lens
         self.seq_lens_cpu = seq_lens_cpu
+        self.out_cache_loc = out_cache_loc
 
 
 class TestViewMemo(unittest.TestCase):
@@ -536,6 +544,124 @@ class TestViewMemo(unittest.TestCase):
         v2 = src.view_for_forward_batch(fb2)
         self.assertIsNot(v2, v1)
         self.assertEqual(v2.table.shape[0], 1)
+
+
+class TestWriteRail(unittest.TestCase):
+    """rebind_write_loc / resolve_swa_write_loc / note_write_loc_replaced — the
+    write half of the id-space contract, held on the source (never on the
+    batch)."""
+
+    def _rebound(self, ps=1, n=4):
+        allocator = _build_composite(ps, full_mult=2 * _FULL_L, swa_mult=2 * _SWA_L)
+        src = _make_source(allocator, torch.zeros((2, 8 * ps), dtype=torch.int64), ps)
+        virt = allocator.alloc(-(-n // ps) * ps)[:n]
+        want_full = allocator.translate_kv_loc_dense(virt)
+        want_swa = allocator.translate_loc_from_full_to_swa(virt)
+        fb = _FakeForwardBatch(out_cache_loc=virt)
+        src.rebind_write_loc(fb)
+        return src, fb, virt, want_full, want_swa
+
+    def test_rebind_translates_full_and_derives_swa_from_virtual(self):
+        for ps in (1, 4):
+            src, fb, virt, want_full, want_swa = self._rebound(ps=ps, n=3 * ps)
+            keep = virt.clone()
+            # Full side: rebound to a FRESH kernel-facing tensor; the
+            # ScheduleBatch's aliased virtual tensor is untouched.
+            self.assertIsNot(fb.out_cache_loc, virt)
+            self.assertTrue(torch.equal(fb.out_cache_loc, want_full))
+            self.assertTrue(torch.equal(virt, keep))
+            # Swa side: derived from the still-VIRTUAL loc (deriving it after
+            # the full-side rebind would push dense full ids through the
+            # virtual->swa map and land on wrong slots).
+            got = src.resolve_swa_write_loc(fb.out_cache_loc)
+            self.assertTrue(torch.equal(got, want_swa))
+
+    def test_resolver_identity_and_view_slice(self):
+        src, fb, _, _, want_swa = self._rebound(n=4)
+        rail = src.resolve_swa_write_loc(fb.out_cache_loc)
+        # A torch view of the prepared rail resolves to the ALIGNED slice.
+        sub = fb.out_cache_loc[1:3]
+        got = src.resolve_swa_write_loc(sub)
+        self.assertTrue(torch.equal(got, want_swa[1:3]))
+        self.assertEqual(got.data_ptr(), rail.data_ptr() + got.element_size())
+
+    def test_resolver_rejects_foreign_and_unprepared(self):
+        src, fb, _, _, _ = self._rebound(n=4)
+        # Value-equal but foreign storage still raises: the resolver keys on
+        # the tensor's memory, not its contents.
+        with self.assertRaises(AssertionError):
+            src.resolve_swa_write_loc(fb.out_cache_loc.clone())
+        # A source that never saw a rebind has nothing to resolve against.
+        allocator = _build_composite(1)
+        fresh = _make_source(allocator, torch.zeros((2, 8), dtype=torch.int64), 1)
+        with self.assertRaises(AssertionError):
+            fresh.resolve_swa_write_loc(torch.tensor([1], dtype=torch.int64))
+
+    def test_replace_notify_adopts_padded_rail(self):
+        src, fb, _, _, want_swa = self._rebound(n=3)
+        padded = torch.cat([fb.out_cache_loc, fb.out_cache_loc.new_zeros(2)], dim=0)
+        src.note_write_loc_replaced(padded, 3)
+        got = src.resolve_swa_write_loc(padded)
+        self.assertTrue(torch.equal(got[:3], want_swa))
+        self.assertTrue(bool((got[3:] == 0).all()), "pad lanes must sink to 0")
+        # Children slice the PADDED tensor; the pre-pad tensor is retired.
+        got_tail = src.resolve_swa_write_loc(padded[3:5])
+        self.assertTrue(bool((got_tail == 0).all()))
+        with self.assertRaises(AssertionError):
+            src.resolve_swa_write_loc(fb.out_cache_loc)
+
+    def test_replace_notify_adopts_equal_length_copy(self):
+        """The eager input registry rebuilds every eager batch into its static
+        buffers: an equal-length copy of the rebound loc must be adopted as
+        the prepared rail (the copy resolves, the retired tensor refuses) and
+        the swa rail must carry over WITHOUT a rebuild."""
+        src, fb, _, _, want_swa = self._rebound(n=3)
+        rail_before = src.resolve_swa_write_loc(fb.out_cache_loc)
+        copied = fb.out_cache_loc.clone()
+        src.note_write_loc_replaced(copied, 3)
+        got = src.resolve_swa_write_loc(copied)
+        self.assertIs(got, rail_before, "equal-length adoption must not copy the rail")
+        self.assertTrue(torch.equal(got, want_swa))
+        with self.assertRaises(AssertionError):
+            src.resolve_swa_write_loc(fb.out_cache_loc)
+
+    def test_disabled_source_routes_static_translate_and_skips_rebind(self):
+        loc = torch.tensor([5, 6], dtype=torch.int64)
+        src = KVIndexSource(
+            req_to_token=torch.zeros((2, 4), dtype=torch.int64),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            token_to_kv_pool=SimpleNamespace(
+                translate_loc_from_full_to_swa=lambda t: t + 100
+            ),
+            page_size=1,
+            device=_DEV,
+        )
+        fb = _FakeForwardBatch(out_cache_loc=loc)
+        src.rebind_write_loc(fb)
+        self.assertIs(fb.out_cache_loc, loc, "disabled rebind must be a no-op")
+        self.assertTrue(
+            torch.equal(src.resolve_swa_write_loc(loc), loc + 100),
+            "disabled resolve must route the pool's legacy translate",
+        )
+
+    def test_none_loc_clears_state(self):
+        src, fb, _, _, _ = self._rebound(n=2)
+        src.rebind_write_loc(_FakeForwardBatch(out_cache_loc=None))
+        with self.assertRaises(AssertionError):
+            src.resolve_swa_write_loc(fb.out_cache_loc)
+
+    def test_rebind_retires_the_view_memo(self):
+        ps = 1
+        allocator = _build_composite(ps)
+        req_to_token, rows, seq_lens = _alloc_and_fill(allocator, ps, lens=[3, 2])
+        src = _make_source(allocator, req_to_token, ps)
+        fb = _FakeForwardBatch(
+            req_pool_indices=rows, seq_lens=seq_lens, seq_lens_cpu=seq_lens
+        )
+        v1 = src.view_for_forward_batch(fb)
+        src.rebind_write_loc(_FakeForwardBatch(out_cache_loc=None))
+        v2 = src.view_for_forward_batch(fb)
+        self.assertIsNot(v2, v1, "rebind starts the next forward: stale views die")
 
 
 if __name__ == "__main__":

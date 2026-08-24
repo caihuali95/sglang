@@ -87,6 +87,9 @@ class KVIndexSource:
         self.req_to_token = req_to_token
         self.page_size = page_size
         self.device = device
+        # The pool this runner reads and writes; `resolve_swa_write_loc` routes
+        # static SWA pools through its legacy full->swa translate.
+        self._token_to_kv_pool = token_to_kv_pool
 
         # Capability probe, by TYPE, once: only the unified composites carry a
         # kernel-facing id surface, and only for the runner whose pool IS the
@@ -131,6 +134,11 @@ class KVIndexSource:
         # Single-slot eager-view memo, keyed by ForwardBatch identity; see
         # `view_for_forward_batch`.
         self._view_memo: Optional[Tuple[weakref.ref, KVIndexBatchView]] = None
+        # Per-forward WRITE-rail state, replaced wholesale by every
+        # `rebind_write_loc` (fresh tensors: batch N's kernels may still read
+        # the previous rail while batch N+1 is being built).
+        self._prepared_write_loc: Optional[torch.Tensor] = None
+        self._swa_write_rail: Optional[torch.Tensor] = None
 
     # -- capture-stable buffers ------------------------------------------------
 
@@ -309,6 +317,86 @@ class KVIndexSource:
                 max(bs, 64), dtype=torch.int64, device=self.device
             )
         return self._rows[:bs]
+
+    # -- write rail ------------------------------------------------------------
+
+    def rebind_write_loc(self, forward_batch) -> None:
+        """The WRITE half of the id-space contract: translate the batch's
+        write loc to KERNEL-FACING ids exactly once, at ForwardBatch
+        construction. REBIND, never mutate: the translate returns a FRESH
+        tensor, so the ScheduleBatch's aliased tensor stays VIRTUAL
+        (radix/accept/inflight machinery reads it). ORDER-CRITICAL for hybrid
+        SWA: one virtual id maps to TWO kernel-facing ids — the swa rail is
+        computed from the still-VIRTUAL loc BEFORE the full-side rebind
+        replaces it. The swa rail and the rebound tensor's identity stay on
+        this source (never on the batch); backends fetch the swa side through
+        `resolve_swa_write_loc`. No-op (byte-identical) on non-unified pools.
+        """
+        self._prepared_write_loc = None
+        self._swa_write_rail = None
+        self._view_memo = None
+        if not self.enabled or forward_batch.out_cache_loc is None:
+            return
+        if self._translate_swa is not None:
+            # int64, like every id the allocator emits; a backend that needs
+            # int32 narrows where it fills its own buffer.
+            self._swa_write_rail = self._translate_swa(forward_batch.out_cache_loc)
+        forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
+        self._prepared_write_loc = forward_batch.out_cache_loc
+
+    def resolve_swa_write_loc(self, loc: torch.Tensor) -> torch.Tensor:
+        """The swa-side write loc for ``loc``.
+
+        Static SWA pool: the pool's legacy full->swa translate, exactly what
+        backends run today. Unified: ``loc`` must be the prepared full rail or
+        a torch VIEW into it (TBO children slice the parent's rail; the DP
+        sync path pads it and then children slice the padded tensor) — the
+        aligned slice of the stored swa rail is resolved by address-range
+        containment plus offset arithmetic. Anything else raises: an
+        unrecognized write loc means the batch skipped `rebind_write_loc`,
+        and storing through it would corrupt the pool silently.
+        """
+        if not self.enabled:
+            return self._token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+        prepared = self._prepared_write_loc
+        assert prepared is not None and self._swa_write_rail is not None, (
+            "KVIndexSource.resolve_swa_write_loc: no prepared write rail — "
+            "the ForwardBatch was built without rebind_write_loc"
+        )
+        if loc is prepared:
+            return self._swa_write_rail
+        es = prepared.element_size()
+        base, end = prepared.data_ptr(), prepared.data_ptr() + prepared.numel() * es
+        lo, hi = loc.data_ptr(), loc.data_ptr() + loc.numel() * es
+        assert (
+            loc.dtype == prepared.dtype
+            and loc.dim() == 1
+            and loc.is_contiguous()
+            and base <= lo
+            and hi <= end
+        ), (
+            "KVIndexSource.resolve_swa_write_loc: loc is not the prepared "
+            "write rail or a view into it — the ForwardBatch was built "
+            "without rebind_write_loc"
+        )
+        off = (lo - base) // es
+        return self._swa_write_rail[off : off + loc.numel()]
+
+    def note_write_loc_replaced(self, new_loc: torch.Tensor, num_live: int) -> None:
+        """A batch transform REPLACED the rebound ``out_cache_loc`` with an
+        equal-prefix copy — the eager input registry rebuilds every eager
+        batch into its static buffers, and the DP sync pad appends sink
+        lanes. Adopt the new tensor as the prepared rail; lanes past
+        ``num_live`` pad the swa rail with zero (the slot-0 sink in every id
+        space, so padded lanes store harmlessly). No-op when disabled or no
+        rail is prepared."""
+        if not self.enabled or self._prepared_write_loc is None:
+            return
+        self._prepared_write_loc = new_loc
+        if self._swa_write_rail is not None and new_loc.numel() != num_live:
+            rail = self._swa_write_rail[:num_live]
+            pad = new_loc.numel() - rail.numel()
+            self._swa_write_rail = torch.cat([rail, rail.new_zeros(pad)], dim=0)
 
     # -- token-level translate surface (the mixin / local-attn consumers) ------
 
