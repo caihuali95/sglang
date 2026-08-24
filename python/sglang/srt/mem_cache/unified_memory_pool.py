@@ -1312,9 +1312,10 @@ def init_unified_mamba_pools(
     req_to_token_pool.mamba_allocator = mamba_slot_allocator
     token_to_kv_pool._mamba_translate = mamba_slot_allocator.translate
     if use_mla_backend:
-        # Model-level MLA entry points (`set_mla_kv_buffer` / `get_mla_kv_buffer`)
-        # receive VIRTUAL locs and translate to the dense space internally
-        # (eager-prefill-only paths; never captured in a cuda graph).
+        # READ door only: `get_mla_kv_buffer` receives req_to_token-produced
+        # (VIRTUAL) indices and translates internally. The WRITE door takes
+        # the ForwardBatch's out_cache_loc, kernel-facing since the
+        # construction-time rebind (rebind_write_loc), and never translates.
         token_to_kv_pool._full_translate = allocator.translate_kv_loc_dense
 
     logger.info(

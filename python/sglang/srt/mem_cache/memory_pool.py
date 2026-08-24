@@ -1552,21 +1552,22 @@ class KVWriteLoc:
     """Write target(s) for ``KVCache.set_kv_buffer``.
 
     All location info lives here (in the attention metadata), NOT in the pool:
-    - ``loc``: the generic per-token write location (the allocated
-      ``out_cache_loc``). VIRTUAL under the unified memory pool (it indexes the
-      virtual slot space); already physical for a non-unified memory pool.
-    - ``swa_loc``: the pre-translated SWA-sub-pool PHYSICAL location for hybrid
-      SWA pools (``None`` otherwise).
-    - ``full_loc``: the pre-translated full-attention-sub-pool PHYSICAL location
-      for the unified memory pool (``None`` otherwise), computed once per forward in
-      attention metadata (``ForwardMetadata.out_cache_loc_full_physical``). The
-      shared full pool writes it directly; the pool never translates (replacing
-      the former per-layer v2p gather / ``set_full_loc`` pin).
+    - ``loc``: the generic per-token write location (``out_cache_loc``).
+      KERNEL-FACING on every pool: physical by allocation on non-unified
+      pools, rebound at ForwardBatch construction (``rebind_write_loc``) on
+      the unified pool.
+    - ``swa_loc``: the pre-resolved SWA-sub-pool location for hybrid SWA pools
+      (``None`` otherwise).
+    - ``full_loc``: the full-attention-sub-pool location for the unified
+      memory pool (``None`` otherwise), carried in attention metadata
+      (``ForwardMetadata.out_cache_loc_full_physical``). Since the
+      construction-time rebind it is the SAME id space as ``loc``; the shared
+      full pool writes it directly and never translates.
 
     ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
-    PHYSICAL loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
-    ``loc`` is the generic, possibly-virtual fallback. Bundling them lets a
-    backend issue one ``set_kv_buffer`` call regardless of pool type.
+    loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
+    ``loc`` is the generic fallback. Bundling them lets a backend issue one
+    ``set_kv_buffer`` call regardless of pool type.
     """
 
     loc: torch.Tensor
@@ -3691,9 +3692,11 @@ class HybridLinearKVPool(KVCache):
         # virtual->physical mamba-slot translate for the HiCache offload path;
         # identity for a static pool, the allocator's `translate` for the unified pool.
         self._mamba_translate = lambda ids: ids
-        # virtual->dense full-KV translate for the model-level MLA entry points
-        # (`set_mla_kv_buffer` / `get_mla_kv_buffer` receive VIRTUAL locs);
-        # identity for a static pool, `translate_kv_loc_dense` for the unified pool.
+        # virtual->dense full-KV translate for the MLA READ door only
+        # (`get_mla_kv_buffer` receives req_to_token-produced indices); the
+        # write door takes the already-rebound out_cache_loc and never
+        # translates. Identity for a static pool, `translate_kv_loc_dense`
+        # for the unified pool.
         self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
@@ -3980,17 +3983,12 @@ class HybridLinearKVPool(KVCache):
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
-        loc_is_dense: bool = False,
     ):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
-        # Model-level MLA entry point: `loc` is a VIRTUAL loc under the unified
-        # pool, so translate to the dense id space here.
-        #
-        # `loc_is_dense`: the caller already translated `loc` (the unified-pool
-        # cuda-graph decode precomputes it out-of-graph into a capture-stable
-        # buffer, so the in-graph write does not capture a translate allocation).
-        if not loc_is_dense:
-            loc = self._full_translate(loc)
+        # Write door: `loc` is `forward_batch.out_cache_loc`, KERNEL-FACING on
+        # every pool — non-unified pools allocate physical ids, and the unified
+        # pool rebinds the ForwardBatch at construction (rebind_write_loc).
+        # The pool never translates a write loc.
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
@@ -4001,6 +3999,9 @@ class HybridLinearKVPool(KVCache):
         dst_dtype: Optional[torch.dtype] = None,
     ):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
+        # Read door: `loc` is produced from req_to_token (VIRTUAL under the
+        # unified pool), so the read side still translates here until the
+        # read-index producers translate at production.
         loc = self._full_translate(loc)
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)

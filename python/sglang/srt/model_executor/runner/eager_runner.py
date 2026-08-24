@@ -195,11 +195,19 @@ class EagerRunner(BaseRunner):
             padded_num_tokens=raw_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
-        return registry.extract_buffer(
+        loaded = registry.extract_buffer(
             padded_bs=raw_bs,
             padded_num_tokens=raw_num_tokens,
             forward_batch_template=forward_batch,
         )
+        if loaded.out_cache_loc is not None:
+            # The registry rebuild REPLACES out_cache_loc with a static-buffer
+            # copy; hand it to the choke point so the swa write rail resolves
+            # for the rebuilt batch. No-op on non-unified pools.
+            self.model_runner.kv_index_source.note_write_loc_replaced(
+                loaded.out_cache_loc, raw_num_tokens
+            )
+        return loaded
 
     def execute(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs

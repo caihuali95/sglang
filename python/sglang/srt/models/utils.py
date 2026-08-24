@@ -293,8 +293,9 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """
     pool = get_token_to_kv_pool()
     # Unified pool: SWA-hybrid composites fail the SWAKVPool isinstance below
-    # (UnifiedSWAKVPool subclasses it) and no mamba-hybrid model calls this, so
-    # a unified pool never reaches the fused store's raw out_cache_loc path.
+    # (UnifiedSWAKVPool subclasses it) and no mamba-hybrid model calls this.
+    # Were one to fuse, the loc it hands the kernel is already kernel-facing
+    # (out_cache_loc is rebound at ForwardBatch construction).
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16

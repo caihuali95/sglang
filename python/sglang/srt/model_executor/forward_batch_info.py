@@ -813,6 +813,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         device = model_runner.device
 
+        # Unified memory pool: rebind out_cache_loc to kernel-facing ids (a
+        # fresh tensor — the ScheduleBatch tensor stays VIRTUAL). Runs BEFORE
+        # the idle early-return below so idle batches also clear the source's
+        # per-forward write-rail state. No-op on non-unified pools.
+        model_runner.kv_index_source.rebind_write_loc(ret)
+
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
                 rids=[req.rid for req in batch.reqs],
@@ -1513,6 +1519,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        # The pad REPLACES the rebound write-loc tensor; hand the padded tensor
+        # to the choke point so its swa rail pads alongside (sink 0) and later
+        # slices of the padded tensor still resolve. No-op on non-unified pools.
+        model_runner.kv_index_source.note_write_loc_replaced(
+            self.out_cache_loc, self._original_num_tokens
+        )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
