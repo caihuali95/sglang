@@ -71,6 +71,12 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
 
 
+def _same_loc(loc: torch.Tensor) -> torch.Tensor:
+    """Single id space: window layers write the SAME slots as full layers, so
+    the sliding-window write loc IS the full one (the fused draft region)."""
+    return loc
+
+
 class KVIndexTable(msgspec.Struct, frozen=True):
     """Collection of what one batch gathers from."""
 
@@ -86,8 +92,14 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     def sliding_window_read_ids(self) -> torch.Tensor:
         """Which array a sliding-window gather reads: the parallel swa array
         when translated, else the full-attention array, which the caller maps
-        through the pool's own full->swa map."""
-        return self.sliding_window_ids if self.is_translated else self.ids
+        through the pool's own full->swa map. A fused draft region keeps no
+        separate swa id space, so its window reads come from the one array
+        too."""
+        if not self.is_translated:
+            return self.ids
+        return (
+            self.sliding_window_ids if self.sliding_window_ids is not None else self.ids
+        )
 
 
 class KVIndexTranslator:
@@ -134,12 +146,14 @@ class KVIndexTranslator:
                 alloc.full_attn_allocator.translate_kv_loc_dense,
                 multiplier=draft_mult,
             )
-            # The draft family is dense-only; it has no separate swa id
-            # space (window layers read and write the same fused slots).
+            # The draft family is dense-only: window layers read and write
+            # the SAME fused slots as full layers, so there is no separate swa
+            # id space — the sliding-window write loc aliases the dense loc at
+            # the per-batch build instead.
             self._full_p2v_table = None
             self._swa_v2p_table = None
             self._swa_page_multiplier = 1
-            self._swa_write_loc_from_full = None
+            self._swa_write_loc_from_full = _same_loc
         elif self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._full_v2p_table = alloc.full_v2p_page_table
