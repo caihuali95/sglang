@@ -206,7 +206,7 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
     --speculative-attention-mode."""
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
-    allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+    allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla"}
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (

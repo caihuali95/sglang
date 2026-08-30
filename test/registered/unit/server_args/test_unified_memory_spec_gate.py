@@ -16,7 +16,8 @@
 Three audited arms (see `handle_unified_memory_pool`), each with its own
 constraints because each rides a different draft-KV story:
   * DSPARK: chain draft with a private draft pool; verify runs on the MLA
-    backend family (`triton` / `trtllm_mla` / `cutedsl_mla` / `tokenspeed_mla`)
+    backend family (`triton` / `trtllm_mla` / `cutedsl_mla` / `tokenspeed_mla`
+    / `flashmla`)
     and the draft chain must be linear (`--speculative-eagle-topk` in
     {None, 1}).
   * NGRAM: no draft model and no draft KV -- target-verify rails only, on the
@@ -100,7 +101,13 @@ def _accepts(
 
 class TestUnifiedMemorySpecGate(unittest.TestCase):
     # Verify-audited backends for the DSPARK (MLA-family) arm.
-    DSPARK_BACKENDS = ("triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla")
+    DSPARK_BACKENDS = (
+        "triton",
+        "trtllm_mla",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+        "flashmla",
+    )
     # Algorithms with no audited unified-pool verify rails.
     # "NEXTN" is deliberately absent: the CLI alias collapses it to
     # "EAGLE" in handle_speculative_decoding BEFORE this gate runs
