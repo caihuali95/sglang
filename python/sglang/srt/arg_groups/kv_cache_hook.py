@@ -199,6 +199,25 @@ def handle_cache_compatibility(server_args: Any) -> None:
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
 
+def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+    """Refuse spec backends whose verify id rails are not translation-audited.
+
+    Both roles: verify routes to either backend depending on
+    --speculative-attention-mode."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
+    backends = set(attention_backends_of(resolved_view(server_args)))
+    backends.discard(None)
+    assert backends <= allowed, (
+        f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
+        f"attention backends {sorted(allowed)} for both prefill "
+        f"and decode; got {sorted(backends)}. flashinfer / fa3 do "
+        "not translate speculative verify indices to the unified "
+        "pool's dense space yet."
+    )
+
+
 def handle_unified_memory_pool(server_args: Any) -> None:
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
@@ -228,22 +247,24 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    # Speculative decoding: DSPARK (chain draft) is supported on the
-    # unified pool (#33974), and EAGLE/EAGLE3 chain drafting is supported
-    # on hybrid-SWA targets, whose draft KV rides fused inside the full
-    # pool's page envelope (DenseDraftRegion in
-    # mem_cache/unified_memory_pool.py). Other algorithms are not yet
-    # audited for the virtual/dense loc translation. The id-space choke
-    # point plugs in the same way when they are: its canonical builder
-    # takes seq_lens as a tensor (target-verify's seq_lens + num_draft
-    # plugs in), write rails resolve through the source
-    # (rebind_write_loc / sliding_window_write_loc), and verify tables
-    # consume the same KVIndexTable.
-    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3"), (
+    # Speculative decoding: DSPARK (chain draft, #33974) and NGRAM
+    # (draft-model-less target verify) are supported on the unified pool,
+    # and EAGLE/EAGLE3 chain drafting is supported on hybrid-SWA targets,
+    # whose draft KV rides fused inside the full pool's page envelope
+    # (DenseDraftRegion in mem_cache/unified_memory_pool.py). Other
+    # algorithms are not yet audited for the virtual/dense loc
+    # translation. The id-space choke point plugs in the same way when
+    # they are: its canonical builder takes seq_lens as a tensor
+    # (target-verify's seq_lens + num_draft plugs in), write rails
+    # resolve through the source (rebind_write_loc /
+    # sliding_window_write_loc), and verify tables consume the same
+    # KVIndexTable.
+    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3", "NGRAM"), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft) and EAGLE/EAGLE3 (fused draft KV on "
-        "hybrid-SWA targets); other speculative algorithms are not yet "
-        "audited for the unified pool's virtual/dense loc translation. Got "
+        "DSPARK (chain draft), NGRAM (target verify only), and "
+        "EAGLE/EAGLE3 (fused draft KV on hybrid-SWA targets); other "
+        "speculative algorithms are not yet audited for the unified "
+        "pool's virtual/dense loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
@@ -289,18 +310,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "verify is not audited for the unified pool. Got "
             f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
         )
-        # Both roles: verify routes to either backend depending on
-        # --speculative-attention-mode.
-        spec_allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla"}
-        spec_backends = set(attention_backends_of(resolved_view(server_args)))
-        spec_backends.discard(None)
-        assert spec_backends <= spec_allowed, (
-            "--enable-unified-memory + DSPARK requires spec-verify-audited "
-            f"attention backends {sorted(spec_allowed)} for both prefill "
-            f"and decode; got {sorted(spec_backends)}. flashinfer / fa3 do "
-            "not translate speculative verify indices to the unified "
-            "pool's dense space yet."
-        )
+        _assert_spec_verify_backends(server_args, algorithm="DSPARK")
+    if cfg.speculative_algorithm == "NGRAM":
+        # No draft KV and no chain-shape constraint: any
+        # --speculative-ngram-max-bfs-breadth is admitted because the KV
+        # placement is chain-identical (one contiguous window of draft
+        # slots per request); the tree lives in the verify custom mask.
+        _assert_spec_verify_backends(server_args, algorithm="NGRAM")
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "

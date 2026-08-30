@@ -13,12 +13,16 @@
 # ==============================================================================
 """`--enable-unified-memory` speculative-decoding allow-list.
 
-Two audited arms (see `handle_unified_memory_pool`), each with its own
+Three audited arms (see `handle_unified_memory_pool`), each with its own
 constraints because each rides a different draft-KV story:
   * DSPARK: chain draft with a private draft pool; verify runs on the MLA
     backend family (`triton` / `trtllm_mla` / `cutedsl_mla` / `tokenspeed_mla`)
     and the draft chain must be linear (`--speculative-eagle-topk` in
     {None, 1}).
+  * NGRAM: no draft model and no draft KV -- target-verify rails only, on the
+    same audited backend set as DSPARK. No chain-shape constraint: the KV
+    placement is chain-identical at any bfs breadth (the tree lives in the
+    verify custom mask).
   * EAGLE/EAGLE3: hybrid-SWA targets ONLY -- the draft's KV lives fused inside
     the full pool's page envelope (`DenseDraftRegion`), which only the
     hybrid-SWA unified composite provisions; mamba-family targets additionally
@@ -30,7 +34,7 @@ constraints because each rides a different draft-KV story:
     leak into this arm, and fa3/flashinfer do not translate speculative
     verify indices to the dense id space.
 
-Everything else (NGRAM / DFLASH / STANDALONE / registered customs)
+Everything else (DFLASH / STANDALONE / registered customs)
 stays refused until its verify id rails are audited. Pinned so no arm silently
 widens to an unaudited algorithm, family, tree shape, or backend -- and so the
 EAGLE arm's addition never perturbs the DSPARK arm.
@@ -103,7 +107,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     # (arg_groups/pipeline.py orders the hooks), so the raw string can
     # never reach the gate -- a case on it would test an impossible
     # input. The aliased spelling is covered by the EAGLE cases.
-    UNAUDITED_ALGORITHMS = ("NGRAM", "DFLASH", "STANDALONE")
+    UNAUDITED_ALGORITHMS = ("DFLASH", "STANDALONE")
 
     def test_eagle_family_admitted_on_hybrid_swa(self):
         """EAGLE/EAGLE3 chain on a hybrid-SWA target with triton verify is the
@@ -159,6 +163,20 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             )
         self.assertFalse(_accepts("DSPARK", backend="fa3"))
         self.assertFalse(_accepts("DSPARK", topk=4))
+
+    def test_ngram_admitted_on_the_verify_audited_backends(self):
+        """NGRAM is target-verify only: the DSPARK backend set passes,
+        unaudited backends refuse, and the chain-shape constraint does NOT
+        apply (any bfs breadth -- the tree lives in the verify mask, KV
+        placement is chain-identical)."""
+        for backend in self.DSPARK_BACKENDS:
+            self.assertTrue(
+                _accepts("NGRAM", backend=backend),
+                f"NGRAM should pass on verify-audited backend {backend}",
+            )
+        self.assertFalse(_accepts("NGRAM", backend="fa3"))
+        self.assertFalse(_accepts("NGRAM", backend="flashinfer"))
+        self.assertTrue(_accepts("NGRAM", topk=4))
 
     def test_spec_off_admitted(self):
         """The gate constrains only speculative configurations; spec-off must
