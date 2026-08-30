@@ -437,6 +437,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(self.decode_wrapper)
         elif forward_batch.forward_mode.is_target_verify():
+            if self.kv_index_translator.is_translating:
+                # Whole-sequence verify reads [prefix + drafts] back from the
+                # pool; the memoized table's live prefix is seq_lens-only.
+                index_table = self.kv_index_translator.widened_index_table(
+                    forward_batch,
+                    seq_len_delta=forward_batch.spec_info.draft_token_num,
+                )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,

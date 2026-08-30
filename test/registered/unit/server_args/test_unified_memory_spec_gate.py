@@ -17,7 +17,7 @@ Three audited arms (see `handle_unified_memory_pool`), each with its own
 constraints because each rides a different draft-KV story:
   * DSPARK: chain draft with a private draft pool; verify runs on the MLA
     backend family (`triton` / `trtllm_mla` / `cutedsl_mla` / `tokenspeed_mla`
-    / `flashmla`)
+    / `flashmla` / `flashinfer`)
     and the draft chain must be linear (`--speculative-eagle-topk` in
     {None, 1}).
   * NGRAM: no draft model and no draft KV -- target-verify rails only, on the
@@ -28,12 +28,12 @@ constraints because each rides a different draft-KV story:
     the full pool's page envelope (`DenseDraftRegion`), which only the
     hybrid-SWA unified composite provisions; mamba-family targets additionally
     need per-step verify state slots the pool does not provision yet. Chain
-    only, and verify is audited on `triton` alone -- demanded EXPLICITLY (an
-    unset backend would default to fa3/flashinfer later in resolution), for
-    the draft worker too (its backend resolves separately: explicit flag
+    only, and verify is audited on `triton` / `flashinfer` -- demanded
+    EXPLICITLY (an unset backend would default to fa3 later in resolution),
+    for the draft worker too (its backend resolves separately: explicit flag
     first, else it inherits the target's). The MLA verify backends must not
-    leak into this arm, and fa3/flashinfer do not translate speculative
-    verify indices to the dense id space.
+    leak into this arm, and fa3 does not translate speculative verify
+    indices to the dense id space.
 
 Everything else (DFLASH / STANDALONE / registered customs)
 stays refused until its verify id rails are audited. Pinned so no arm silently
@@ -107,7 +107,10 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         "cutedsl_mla",
         "tokenspeed_mla",
         "flashmla",
+        "flashinfer",
     )
+    # Verify-audited backends for the EAGLE (fused-draft) arm.
+    EAGLE_BACKENDS = ("triton", "flashinfer")
     # Algorithms with no audited unified-pool verify rails.
     # "NEXTN" is deliberately absent: the CLI alias collapses it to
     # "EAGLE" in handle_speculative_decoding BEFORE this gate runs
@@ -117,15 +120,17 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     UNAUDITED_ALGORITHMS = ("DFLASH", "STANDALONE")
 
     def test_eagle_family_admitted_on_hybrid_swa(self):
-        """EAGLE/EAGLE3 chain on a hybrid-SWA target with triton verify is the
-        fused-draft-KV configuration -- both spellings, resolved or unset
-        topk."""
+        """EAGLE/EAGLE3 chain on a hybrid-SWA target with audited verify
+        backends is the fused-draft-KV configuration -- both spellings,
+        resolved or unset topk, every audited backend."""
         for algorithm in ("EAGLE", "EAGLE3"):
             for topk in (None, 1):
-                self.assertTrue(
-                    _accepts(algorithm, topk=topk),
-                    f"{algorithm} topk={topk} should pass on a hybrid-SWA target",
-                )
+                for backend in self.EAGLE_BACKENDS:
+                    self.assertTrue(
+                        _accepts(algorithm, topk=topk, backend=backend),
+                        f"{algorithm} topk={topk} backend={backend} should "
+                        "pass on a hybrid-SWA target",
+                    )
 
     def test_eagle_refused_off_hybrid_swa(self):
         """No fused draft region outside the hybrid-SWA composite: a
@@ -140,10 +145,10 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             self.assertFalse(_accepts("EAGLE", topk=topk))
 
     def test_eagle_refused_unaudited_backends(self):
-        """fa3/flashinfer do not translate speculative verify indices, and the
+        """fa3 does not translate speculative verify indices, and the
         MLA verify set from the DSPARK arm must not leak into the EAGLE arm."""
-        for backend in ("fa3", "fa4", "flashinfer", "trtllm_mha") + tuple(
-            b for b in self.DSPARK_BACKENDS if b != "triton"
+        for backend in ("fa3", "fa4", "trtllm_mha") + tuple(
+            b for b in self.DSPARK_BACKENDS if b not in self.EAGLE_BACKENDS
         ):
             self.assertFalse(_accepts("EAGLE", backend=backend))
 
@@ -156,8 +161,9 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         """The draft worker resolves its own backend: unset inherits the
         target's triton, explicit triton passes, anything else refuses."""
         self.assertTrue(_accepts("EAGLE", draft_backend=None))
-        self.assertTrue(_accepts("EAGLE", draft_backend="triton"))
-        for draft_backend in ("fa3", "flashinfer", "trtllm_mha"):
+        for draft_backend in self.EAGLE_BACKENDS:
+            self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
+        for draft_backend in ("fa3", "trtllm_mha"):
             self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
 
     def test_dspark_arm_unchanged(self):
@@ -182,7 +188,6 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                 f"NGRAM should pass on verify-audited backend {backend}",
             )
         self.assertFalse(_accepts("NGRAM", backend="fa3"))
-        self.assertFalse(_accepts("NGRAM", backend="flashinfer"))
         self.assertTrue(_accepts("NGRAM", topk=4))
 
     def test_spec_off_admitted(self):

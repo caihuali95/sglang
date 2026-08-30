@@ -34,7 +34,10 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv_index_translator import (
+    KVIndexTable,
+    KVIndexTranslator,
+)
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
@@ -289,6 +292,77 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
         # The delta genuinely widened: entries exist past the unwidened prefix.
         plain_pages = -(-3 // _PS)
         self.assertTrue(bool((widened.ids[0, plain_pages:] > 0).any()))
+
+    def test_widened_index_table_matches_widened_lens(self):
+        """`widened_index_table` (the verify entry point) must equal the
+        widened-lens build over the SAME batch: derive max_pages from the
+        widened max and forward the delta. Deriving max_pages from the
+        un-widened lens silently truncates the verify tail's pages."""
+        _, allocator, kvcache, _ = _build()
+        v = allocator.alloc(6 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 16), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        src = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        )
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([3], dtype=torch.int64)
+        delta = 2 * _PS + 1
+        fb = SimpleNamespace(
+            req_pool_indices=rpi,
+            seq_lens=seq,
+            seq_lens_cpu=seq.cpu(),
+            out_cache_loc=None,
+        )
+        widened = src.widened_index_table(fb, seq_len_delta=delta)
+        max_pages = -(-(3 + delta) // _PS)
+        by_lens = src.build_index_table(
+            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
+        )
+        self.assertEqual(widened.ids.shape, by_lens.ids.shape)
+        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
+
+    def test_swa_view_per_disposition(self):
+        """`swa_view()` re-aims a table at the window gather source: the
+        target's separate swa array when one exists, the SAME table under the
+        fused draft's single-space swa, and the SAME table when untranslated
+        (the caller's full->swa rewrite still applies). Handing a window
+        kernel the full-side ids under translation reads the wrong pool."""
+        pool, allocator, kvcache, draft_pool = _build()
+        v = allocator.alloc(2 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 8), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([2], dtype=torch.int64)
+
+        target = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        ).build_index_table(req_pool_indices=rpi, seq_lens=seq, max_pages=2)
+        self.assertIsNotNone(target.sliding_window_ids)
+        self.assertIs(target.swa_view().ids, target.sliding_window_ids)
+
+        fused = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=draft_pool,
+            page_size=_PS,
+            device=_DEV,
+        ).build_index_table(req_pool_indices=rpi, seq_lens=seq, max_pages=2)
+        self.assertIsNone(fused.sliding_window_ids)
+        self.assertIs(fused.swa_view(), fused)
+
+        raw = KVIndexTable.passthrough(req_to_token=rt, req_pool_indices=rpi)
+        self.assertIs(raw.swa_view(), raw)
 
     def test_full_flat_translate_args_per_disposition(self):
         """The flat-translate accessor must hand a kernel exactly what

@@ -206,13 +206,20 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
     --speculative-attention-mode."""
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
-    allowed = {"triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "flashmla"}
+    allowed = {
+        "triton",
+        "trtllm_mla",
+        "cutedsl_mla",
+        "tokenspeed_mla",
+        "flashmla",
+        "flashinfer",
+    }
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (
         f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
         f"attention backends {sorted(allowed)} for both prefill "
-        f"and decode; got {sorted(backends)}. flashinfer / fa3 do "
+        f"and decode; got {sorted(backends)}. fa3 does "
         "not translate speculative verify indices to the unified "
         "pool's dense space yet."
     )
@@ -282,24 +289,33 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "tree verify is not audited for the unified pool. Got "
             f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
         )
-        # EXACT match, None included: an unset backend would default to
+        # None refuses EXPLICITLY: an unset backend would default to
         # fa3/flashinfer later in resolution, silently leaving the audited
         # envelope.
+        eagle_allowed = {"triton", "flashinfer"}
         eagle_backends = set(attention_backends_of(resolved_view(server_args)))
-        assert eagle_backends == {"triton"}, (
+        assert (
+            None not in eagle_backends
+            and eagle_backends
+            and eagle_backends <= eagle_allowed
+        ), (
             "--enable-unified-memory + EAGLE/EAGLE3 requires the "
-            "spec-verify-audited attention backend: pass "
-            "--attention-backend triton (got "
-            f"{sorted(eagle_backends, key=str)}). flashinfer / fa3 do not "
+            "spec-verify-audited attention backends "
+            f"{sorted(eagle_allowed)}, set explicitly (got "
+            f"{sorted(eagle_backends, key=str)}). fa3 does not "
             "translate speculative verify indices to the unified pool's "
             "dense space yet."
         )
         # The draft worker resolves its own backend: explicit flag first,
-        # else it inherits the target's (triton, per the assert above).
-        assert cfg.speculative_draft_attention_backend in (None, "triton"), (
+        # else it inherits the target's (audited, per the assert above).
+        assert cfg.speculative_draft_attention_backend in (
+            None,
+            "triton",
+            "flashinfer",
+        ), (
             "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
-            "worker on the triton backend too; got "
-            "--speculative-draft-attention-backend="
+            "worker on a spec-verify-audited backend (triton/flashinfer); "
+            "got --speculative-draft-attention-backend="
             f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
             "to inherit the target's."
         )

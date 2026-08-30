@@ -116,6 +116,15 @@ class KVIndexTable(msgspec.Struct, frozen=True):
             sliding_window_ids=None,
         )
 
+    def swa_view(self) -> KVIndexTable:
+        """This table re-aimed at the sliding-window gather source — for a
+        consumer whose kernel reads the window sub-pool. Untranslated tables
+        keep the full ids (the caller's full->swa rewrite still applies)."""
+        ids = self.sliding_window_read_ids()
+        if ids is self.ids:
+            return self
+        return msgspec.structs.replace(self, ids=ids)
+
 
 class KVIndexTranslator:
     """Built once per ModelRunner."""
@@ -385,6 +394,28 @@ class KVIndexTranslator:
         )
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
+
+    def widened_index_table(self, forward_batch, *, seq_len_delta: int) -> KVIndexTable:
+        """Whole-sequence-verify view: every row's live prefix widened by
+        `seq_len_delta` columns (the drafts are read back from the pool).
+        Not memoized — verify is one consumer, and the batch's memoized
+        prefix table stays valid for the others."""
+        max_pages = None
+        if self.is_translating:
+            slc = forward_batch.seq_lens_cpu
+            if slc is not None and slc.numel() > 0:
+                max_seq = int(slc.max()) + seq_len_delta
+            else:
+                # gpu_only batches carry no CPU mirror; bound by the table.
+                max_seq = self.req_to_token.shape[1]
+            max_pages = max(-(-max_seq // self.page_size), 1)
+        return self.build_index_table(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            max_pages=max_pages,
+            out_cache_loc=forward_batch.out_cache_loc,
+            seq_len_delta=seq_len_delta,
+        )
 
     def assert_backends_carry_translator(self, backends) -> None:
         """Boot guard: under the unified pool every backend a forward can reach
