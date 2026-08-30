@@ -214,14 +214,17 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 )
 
 
-def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+def _assert_spec_verify_backends(
+    server_args: Any, *, algorithm: str, allowed: frozenset = None
+) -> None:
     """Refuse spec backends whose verify id rails are not translation-audited.
 
     Both roles: verify routes to either backend depending on
     --speculative-attention-mode."""
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
-    allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    if allowed is None:
+        allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (
@@ -274,10 +277,17 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     # resolve through the source (rebind_write_loc /
     # sliding_window_write_loc), and verify tables consume the same
     # KVIndexTable.
-    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3", "NGRAM"), (
+    assert cfg.speculative_algorithm in (
+        None,
+        "DSPARK",
+        "EAGLE",
+        "EAGLE3",
+        "NGRAM",
+        "DFLASH",
+    ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft), NGRAM (target verify only), and "
-        "EAGLE/EAGLE3 (fused draft KV on hybrid-SWA targets); other "
+        "DSPARK (chain draft), NGRAM (target verify only), DFLASH (fused "
+        "block draft), and EAGLE/EAGLE3 (fused draft KV); other "
         "speculative algorithms are not yet audited for the unified "
         "pool's virtual/dense loc translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
@@ -338,6 +348,17 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
         )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
+    if cfg.speculative_algorithm == "DFLASH":
+        # DFLASH targets are MHA-family; verify (target and the draft's own
+        # block forward) runs on the translated MHA rails. Draft KV fuses
+        # into the target's pages when the geometry resolves, with the
+        # private-pool arm as the automatic fallback; the compact-window
+        # mode narrows reads over the same fused mapping.
+        _assert_spec_verify_backends(
+            server_args,
+            algorithm="DFLASH",
+            allowed=frozenset({"triton", "fa3", "flashinfer"}),
+        )
     if cfg.speculative_algorithm == "NGRAM":
         # No draft KV and no chain-shape constraint: any
         # --speculative-ngram-max-bfs-breadth is admitted because the KV

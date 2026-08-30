@@ -35,7 +35,7 @@ constraints because each rides a different draft-KV story:
     explicit flag first, else it inherits the target's). The MLA verify
     backends must not leak into this arm.
 
-Everything else (DFLASH / STANDALONE / registered customs)
+Everything else (STANDALONE / registered customs)
 stays refused until its verify id rails are audited. Pinned so no arm silently
 widens to an unaudited algorithm, family, tree shape, or backend -- and so the
 EAGLE arm's addition never perturbs the DSPARK arm.
@@ -130,7 +130,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     # (arg_groups/pipeline.py orders the hooks), so the raw string can
     # never reach the gate -- a case on it would test an impossible
     # input. The aliased spelling is covered by the EAGLE cases.
-    UNAUDITED_ALGORITHMS = ("DFLASH", "STANDALONE")
+    UNAUDITED_ALGORITHMS = ("STANDALONE",)
 
     def test_eagle_family_admitted_on_hybrid_swa(self):
         """EAGLE/EAGLE3 chain on a hybrid-SWA target with audited verify
@@ -242,6 +242,17 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             )
         self.assertFalse(_accepts("NGRAM", backend="fa4"))
         self.assertTrue(_accepts("NGRAM", topk=4))
+
+    def test_dflash_admitted_on_the_mha_rails(self):
+        """DFLASH (fused block draft) verifies on the translated MHA rails;
+        the MLA-only backends and unaudited ones refuse."""
+        for backend in ("triton", "fa3", "flashinfer"):
+            self.assertTrue(
+                _accepts("DFLASH", backend=backend),
+                f"DFLASH should pass on {backend}",
+            )
+        for backend in ("fa4", "trtllm_mha", "flashmla", "trtllm_mla"):
+            self.assertFalse(_accepts("DFLASH", backend=backend))
 
     def test_spec_off_admitted(self):
         """The gate constrains only speculative configurations; spec-off must
