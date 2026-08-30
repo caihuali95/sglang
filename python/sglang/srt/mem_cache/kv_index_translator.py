@@ -101,6 +101,21 @@ class KVIndexTable(msgspec.Struct, frozen=True):
             self.sliding_window_ids if self.sliding_window_ids is not None else self.ids
         )
 
+    @classmethod
+    def passthrough(
+        cls, *, req_to_token: torch.Tensor, req_pool_indices: torch.Tensor
+    ) -> KVIndexTable:
+        """The raw (req_to_token, req_pool_indices) table — for a caller on a
+        plain pool with no translator in reach (the aiter updaters)."""
+        return cls(
+            ids=req_to_token,
+            row_ids=req_pool_indices,
+            row_stride=req_to_token.stride(0),
+            entry_page_size=1,
+            is_translated=False,
+            sliding_window_ids=None,
+        )
+
 
 class KVIndexTranslator:
     """Built once per ModelRunner."""
