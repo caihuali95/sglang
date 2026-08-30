@@ -255,6 +255,41 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
         src = _source(allocator, other_draft)
         self.assertFalse(src.is_translating)
 
+    def test_seq_len_delta_matches_widened_lens(self):
+        """``seq_len_delta=k`` must be byte-identical to building with
+        ``seq_lens + k`` — the two spellings of the whole-sequence verify
+        widening. A kernel applying the delta to the page count but not the
+        loads (or vice versa) silently truncates the verify tail."""
+        _, allocator, kvcache, _ = _build()
+        v = allocator.alloc(6 * _PS)
+        self.assertIsNotNone(v)
+        rt = torch.zeros((2, 16), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        src = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        )
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([3], dtype=torch.int64)
+        delta = 2 * _PS + 1
+        max_pages = -(-(3 + delta) // _PS)
+        widened = src.build_index_table(
+            req_pool_indices=rpi,
+            seq_lens=seq,
+            max_pages=max_pages,
+            seq_len_delta=delta,
+        )
+        by_lens = src.build_index_table(
+            req_pool_indices=rpi, seq_lens=seq + delta, max_pages=max_pages
+        )
+        torch.testing.assert_close(widened.ids, by_lens.ids, rtol=0, atol=0)
+        # The delta genuinely widened: entries exist past the unwidened prefix.
+        plain_pages = -(-3 // _PS)
+        self.assertTrue(bool((widened.ids[0, plain_pages:] > 0).any()))
+
     def test_full_flat_translate_args_per_disposition(self):
         """The flat-translate accessor must hand a kernel exactly what
         `translate_kv_loc_dense` would use: the runner's OWN multiplier over

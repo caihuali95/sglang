@@ -225,6 +225,7 @@ class KVIndexTranslator:
         max_pages: Optional[int] = None,
         captured: bool = False,
         out_cache_loc: Optional[torch.Tensor] = None,
+        seq_len_delta: int = 0,
     ) -> KVIndexTable:
         """The one per-batch entry point.
 
@@ -235,6 +236,10 @@ class KVIndexTranslator:
 
         ``out_cache_loc`` is the batch's already-kernel-facing write loc; the
         index table returns the matching ``sliding_window_write_loc``.
+
+        ``seq_len_delta`` widens every row's live prefix — the whole-sequence
+        verify contract (draft KV read back from the pool). An eager caller's
+        ``max_pages`` must already cover the delta.
         """
         if not self.is_translating:
             return KVIndexTable(
@@ -278,6 +283,7 @@ class KVIndexTranslator:
             page_size=self.page_size,
             max_pages=width,
             out=out_full,
+            seq_len_delta=seq_len_delta,
         )
         if out_swa is not None:
             build_kv_read_table(
@@ -289,6 +295,7 @@ class KVIndexTranslator:
                 page_size=self.page_size,
                 max_pages=width,
                 out=out_swa,
+                seq_len_delta=seq_len_delta,
             )
         return KVIndexTable(
             ids=out_full,
@@ -306,6 +313,7 @@ class KVIndexTranslator:
         out: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        seq_len_delta: int = 0,
     ) -> torch.Tensor:
         """Fill a backend-owned padded 2-D block table's live prefix with
         full-attention entries (trtllm_mla / flashmla consume such tables
@@ -333,6 +341,7 @@ class KVIndexTranslator:
             page_size=self.page_size,
             max_pages=max_pages,
             out=out,
+            seq_len_delta=seq_len_delta,
         )
 
     def index_table_for_batch(self, forward_batch) -> KVIndexTable:
