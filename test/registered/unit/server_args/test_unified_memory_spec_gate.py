@@ -30,7 +30,7 @@ constraints because each rides a different draft-KV story:
     leak into this arm, and fa3/flashinfer do not translate speculative
     verify indices to the dense id space.
 
-Everything else (NGRAM / DFLASH / STANDALONE / NEXTN / registered customs)
+Everything else (NGRAM / DFLASH / STANDALONE / registered customs)
 stays refused until its verify id rails are audited. Pinned so no arm silently
 widens to an unaudited algorithm, family, tree shape, or backend -- and so the
 EAGLE arm's addition never perturbs the DSPARK arm.
@@ -98,7 +98,12 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     # Verify-audited backends for the DSPARK (MLA-family) arm.
     DSPARK_BACKENDS = ("triton", "trtllm_mla", "cutedsl_mla", "tokenspeed_mla")
     # Algorithms with no audited unified-pool verify rails.
-    UNAUDITED_ALGORITHMS = ("NGRAM", "DFLASH", "STANDALONE", "NEXTN")
+    # "NEXTN" is deliberately absent: the CLI alias collapses it to
+    # "EAGLE" in handle_speculative_decoding BEFORE this gate runs
+    # (arg_groups/pipeline.py orders the hooks), so the raw string can
+    # never reach the gate -- a case on it would test an impossible
+    # input. The aliased spelling is covered by the EAGLE cases.
+    UNAUDITED_ALGORITHMS = ("NGRAM", "DFLASH", "STANDALONE")
 
     def test_eagle_family_admitted_on_hybrid_swa(self):
         """EAGLE/EAGLE3 chain on a hybrid-SWA target with triton verify is the
