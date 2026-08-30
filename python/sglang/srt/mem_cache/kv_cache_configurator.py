@@ -616,7 +616,9 @@ class KVCacheConfigurator:
         of its own). Fallback is automatic: target boot declines a region for
         legitimate geometry (asymmetric draft rows), and the private arm is
         the rollback lever."""
-        if not (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash()):
+        if not (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
+        ):
             return None
         spec = alloc.unified_buffer.spec("full")
         if spec.draft_region is None:
@@ -729,9 +731,10 @@ class KVCacheConfigurator:
         Fusion engages only for: unified memory ON, a unified target
         (hybrid-SWA or mamba hybrid, either full-pool kind — the draft is
         dense per token, so it fuses into the full sub-pool's pages), an
-        EAGLE-family or DFLASH algorithm whose draft config was loaded at
-        target boot, and a uniform-row draft (dense views need equal K/V
-        widths). None otherwise; callers fall back to the private draft pool.
+        EAGLE-family or DFLASH/DSPARK algorithm whose draft config was
+        loaded at target boot, and a uniform-row draft (dense views need
+        equal K/V widths). None otherwise; callers fall back to the private
+        draft pool.
         """
         from sglang.srt.mem_cache.unified_memory_pool import (
             DenseDraftRegion,
@@ -744,7 +747,7 @@ class KVCacheConfigurator:
         )
         if self.spec_algorithm.is_eagle():
             draft_num_layers = aux.eagle_draft_num_layers
-        elif self.spec_algorithm.is_dflash():
+        elif self.spec_algorithm.is_dflash_family():
             draft_num_layers = aux.dflash_draft_num_layers
         else:
             draft_num_layers = None

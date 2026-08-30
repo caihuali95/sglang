@@ -279,6 +279,20 @@ class TestDraftBindingDispatch(CustomTestCase):
         self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
         self.assertIs(pools.token_to_kv_pool_allocator, alloc)
 
+    def test_dspark_draft_with_a_region_binds_the_fused_pool(self):
+        """DSPARK's draft KV fuses when the target resolved a region (its
+        block rows are indexed by the same token->page identity); the
+        region-less private arm above remains the automatic fallback."""
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedDraftKVPool
+
+        alloc = self._swa_allocator(with_draft_region=True)
+        pools = self._run(
+            algorithm=SpeculativeAlgorithm.DSPARK,
+            alloc=alloc,
+            max_total_num_tokens=alloc.size_full,
+        )
+        self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+
     def test_compact_dflash_draft_fuses_with_a_private_req_table(self):
         """Compact-window DFLASH passes req_to_token_pool=None (it keeps a
         private table narrowing WHICH pages the draft reads) while the KV
