@@ -24,10 +24,11 @@ constraints because each rides a different draft-KV story:
     same audited backend set as DSPARK. No chain-shape constraint: the KV
     placement is chain-identical at any bfs breadth (the tree lives in the
     verify custom mask).
-  * EAGLE/EAGLE3: targets whose FULL sub-pool is MHA-shaped (hybrid-SWA, or
-    a mamba hybrid off the MLA backend) -- the draft's KV lives fused inside
-    the full pool's page envelope (`DenseDraftRegion`); MLA hosts do not
-    carry a fused draft region yet. Chain
+  * EAGLE/EAGLE3: unified targets (hybrid-SWA or mamba hybrids, either
+    full-pool kind) -- the draft's KV lives fused inside the full pool's
+    page envelope (`DenseDraftRegion`), with an automatic private-pool
+    fallback when no region resolves. MLA hosts verify on the MLA backend
+    family; MHA hosts on the translated MHA rails. Chain
     only, and verify is audited on `triton` / `flashinfer` / `fa3` --
     demanded EXPLICITLY (an unset backend could resolve to an unaudited
     default), for the draft worker too (its backend resolves separately:
@@ -158,15 +159,35 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             for algorithm in ("EAGLE", "EAGLE3"):
                 self.assertTrue(_accepts(algorithm, is_hybrid_swa=False))
 
-    def test_eagle_refused_on_mla_mamba(self):
-        """MLA hosts do not carry a fused draft region yet: an MLA mamba
-        hybrid (Kimi) must refuse at the gate, not fail at boot."""
+    def test_eagle_on_mla_mamba_verifies_on_the_mla_family(self):
+        """An MLA mamba hybrid (Kimi) verifies on the MLA backend family;
+        the MHA-only rails (and unset/unaudited backends) still refuse.
+        Boot falls back to the private draft pool when no region resolves."""
         with patch.object(hybrid_arch, "mambaish_config", return_value=object()):
+            for backend in self.DSPARK_BACKENDS:
+                self.assertTrue(
+                    _accepts(
+                        "EAGLE",
+                        is_hybrid_swa=False,
+                        attention_arch=AttentionArch.MLA,
+                        backend=backend,
+                    ),
+                    f"EAGLE on an MLA host should pass on {backend}",
+                )
             self.assertFalse(
                 _accepts(
                     "EAGLE",
                     is_hybrid_swa=False,
                     attention_arch=AttentionArch.MLA,
+                    backend=None,
+                )
+            )
+            self.assertFalse(
+                _accepts(
+                    "EAGLE",
+                    is_hybrid_swa=False,
+                    attention_arch=AttentionArch.MLA,
+                    backend="fa4",
                 )
             )
 

@@ -199,14 +199,10 @@ def handle_cache_compatibility(server_args: Any) -> None:
         raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
 
-def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
-    """Refuse spec backends whose verify id rails are not translation-audited.
-
-    Both roles: verify routes to either backend depending on
-    --speculative-attention-mode."""
-    from sglang.srt.arg_groups.overrides import attention_backends_of
-
-    allowed = {
+# Backends whose speculative verify id rails are translation-audited for the
+# unified pool (the MLA verify family + the translated MHA rails).
+_SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
+    {
         "triton",
         "trtllm_mla",
         "cutedsl_mla",
@@ -215,6 +211,17 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
         "flashinfer",
         "fa3",
     }
+)
+
+
+def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+    """Refuse spec backends whose verify id rails are not translation-audited.
+
+    Both roles: verify routes to either backend depending on
+    --speculative-attention-mode."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (
@@ -279,14 +286,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         from sglang.srt.configs.hybrid_arch import mambaish_config
 
         _mc = model_config_of(server_args)
-        assert _mc.is_hybrid_swa or (
-            mambaish_config(_mc) is not None and not use_mla_backend(server_args)
-        ), (
-            "--enable-unified-memory + EAGLE/EAGLE3 requires a target whose "
-            "full-attention sub-pool is MHA-shaped (hybrid-SWA, or a mamba "
-            "hybrid off the MLA backend): the draft's KV lives fused inside "
-            "the full-attention page envelope. MLA hosts do not carry a "
-            "fused draft region yet; run them without --enable-unified-memory."
+        assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
+            "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
+            "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
+            "fused inside the full-attention page envelope (or falls back "
+            "to a private pool over the unified virtual id space)."
         )
         assert cfg.speculative_eagle_topk in (None, 1), (
             "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
@@ -296,8 +300,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         )
         # None refuses EXPLICITLY: an unset backend would default to
         # fa3/flashinfer later in resolution, silently leaving the audited
-        # envelope.
-        eagle_allowed = {"triton", "flashinfer", "fa3"}
+        # envelope. MLA hosts verify on the MLA family; MHA hosts on the
+        # translated MHA rails.
+        eagle_allowed = (
+            _SPEC_VERIFY_AUDITED_BACKENDS
+            if use_mla_backend(server_args)
+            else {"triton", "flashinfer", "fa3"}
+        )
         eagle_backends = set(attention_backends_of(resolved_view(server_args)))
         assert (
             None not in eagle_backends
@@ -313,15 +322,10 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         )
         # The draft worker resolves its own backend: explicit flag first,
         # else it inherits the target's (audited, per the assert above).
-        assert cfg.speculative_draft_attention_backend in (
-            None,
-            "triton",
-            "flashinfer",
-            "fa3",
-        ), (
+        draft_allowed = (None,) + tuple(sorted(eagle_allowed))
+        assert cfg.speculative_draft_attention_backend in draft_allowed, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
-            "worker on a spec-verify-audited backend "
-            "(triton/flashinfer/fa3); "
+            f"worker on a spec-verify-audited backend {sorted(eagle_allowed)}; "
             "got --speculative-draft-attention-backend="
             f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
             "to inherit the target's."
