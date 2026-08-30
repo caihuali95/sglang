@@ -1050,7 +1050,6 @@ class FlashInferMLAIndicesUpdaterPrefill:
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
-
         if spec_info is None:
             assert len(seq_lens) == len(req_pool_indices)
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
@@ -1073,10 +1072,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
         elif fast_verify_plan_kwargs is not None:
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.attn_backend.kv_index_translator,
                     kv_indices_buf=fast_verify_plan_kwargs["kv_indices_buf"],
                 )
             )
@@ -1085,10 +1084,10 @@ class FlashInferMLAIndicesUpdaterPrefill:
             # TODO: Support topk > 1 with custom mask
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
-                    req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
-                    self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    paged_kernel_lens=paged_kernel_lens,
+                    paged_kernel_lens_sum=paged_kernel_lens_sum,
+                    translator=self.attn_backend.kv_index_translator,
                 )
             )
 
