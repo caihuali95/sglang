@@ -66,6 +66,7 @@ def resolve_spec_aux_hidden_state_config(
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
+        model_config=model_config,
         spec_algorithm=spec_algorithm,
         is_draft_worker=is_draft_worker,
     )
@@ -83,9 +84,25 @@ def _resolve_eagle_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
     server_args: ServerArgs,
+    model_config: ModelConfig,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
+    if (spec_algorithm.is_eagle() or spec_algorithm.is_standalone()) and (
+        not is_draft_worker
+        and not get_spec().speculative_draft_model_path
+        and model_config.num_nextn_predict_layers
+    ):
+        # Path-less NEXTN: the MTP head ships inside the TARGET checkpoint,
+        # so the draft's KV geometry IS the target's attention geometry
+        # (the MTP block is a full transformer layer).
+        config.eagle_draft_num_layers = int(model_config.num_nextn_predict_layers)
+        # TOTAL kv heads, same pre-distributed-init contract as the
+        # draft-path arm below.
+        config.eagle_draft_total_kv_heads = int(model_config.get_total_num_kv_heads())
+        config.eagle_draft_head_dim = int(model_config.head_dim)
+        config.eagle_draft_v_head_dim = int(model_config.v_head_dim)
+        return
     if (
         (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
         and not is_draft_worker
