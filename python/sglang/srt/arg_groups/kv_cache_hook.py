@@ -213,13 +213,14 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
         "tokenspeed_mla",
         "flashmla",
         "flashinfer",
+        "fa3",
     }
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (
         f"--enable-unified-memory + {algorithm} requires spec-verify-audited "
         f"attention backends {sorted(allowed)} for both prefill "
-        f"and decode; got {sorted(backends)}. fa3 does "
+        f"and decode; got {sorted(backends)}. Other backends do "
         "not translate speculative verify indices to the unified "
         "pool's dense space yet."
     )
@@ -292,7 +293,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         # None refuses EXPLICITLY: an unset backend would default to
         # fa3/flashinfer later in resolution, silently leaving the audited
         # envelope.
-        eagle_allowed = {"triton", "flashinfer"}
+        eagle_allowed = {"triton", "flashinfer", "fa3"}
         eagle_backends = set(attention_backends_of(resolved_view(server_args)))
         assert (
             None not in eagle_backends
@@ -302,7 +303,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory + EAGLE/EAGLE3 requires the "
             "spec-verify-audited attention backends "
             f"{sorted(eagle_allowed)}, set explicitly (got "
-            f"{sorted(eagle_backends, key=str)}). fa3 does not "
+            f"{sorted(eagle_backends, key=str)}). Other backends do not "
             "translate speculative verify indices to the unified pool's "
             "dense space yet."
         )
@@ -312,9 +313,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             None,
             "triton",
             "flashinfer",
+            "fa3",
         ), (
             "--enable-unified-memory + EAGLE/EAGLE3 requires the draft "
-            "worker on a spec-verify-audited backend (triton/flashinfer); "
+            "worker on a spec-verify-audited backend "
+            "(triton/flashinfer/fa3); "
             "got --speculative-draft-attention-backend="
             f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
             "to inherit the target's."

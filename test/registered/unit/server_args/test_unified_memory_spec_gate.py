@@ -17,7 +17,7 @@ Three audited arms (see `handle_unified_memory_pool`), each with its own
 constraints because each rides a different draft-KV story:
   * DSPARK: chain draft with a private draft pool; verify runs on the MLA
     backend family (`triton` / `trtllm_mla` / `cutedsl_mla` / `tokenspeed_mla`
-    / `flashmla` / `flashinfer`)
+    / `flashmla` / `flashinfer` / `fa3`)
     and the draft chain must be linear (`--speculative-eagle-topk` in
     {None, 1}).
   * NGRAM: no draft model and no draft KV -- target-verify rails only, on the
@@ -28,12 +28,11 @@ constraints because each rides a different draft-KV story:
     the full pool's page envelope (`DenseDraftRegion`), which only the
     hybrid-SWA unified composite provisions; mamba-family targets additionally
     need per-step verify state slots the pool does not provision yet. Chain
-    only, and verify is audited on `triton` / `flashinfer` -- demanded
-    EXPLICITLY (an unset backend would default to fa3 later in resolution),
-    for the draft worker too (its backend resolves separately: explicit flag
-    first, else it inherits the target's). The MLA verify backends must not
-    leak into this arm, and fa3 does not translate speculative verify
-    indices to the dense id space.
+    only, and verify is audited on `triton` / `flashinfer` / `fa3` --
+    demanded EXPLICITLY (an unset backend could resolve to an unaudited
+    default), for the draft worker too (its backend resolves separately:
+    explicit flag first, else it inherits the target's). The MLA verify
+    backends must not leak into this arm.
 
 Everything else (DFLASH / STANDALONE / registered customs)
 stays refused until its verify id rails are audited. Pinned so no arm silently
@@ -108,9 +107,10 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         "tokenspeed_mla",
         "flashmla",
         "flashinfer",
+        "fa3",
     )
     # Verify-audited backends for the EAGLE (fused-draft) arm.
-    EAGLE_BACKENDS = ("triton", "flashinfer")
+    EAGLE_BACKENDS = ("triton", "flashinfer", "fa3")
     # Algorithms with no audited unified-pool verify rails.
     # "NEXTN" is deliberately absent: the CLI alias collapses it to
     # "EAGLE" in handle_speculative_decoding BEFORE this gate runs
@@ -145,9 +145,9 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             self.assertFalse(_accepts("EAGLE", topk=topk))
 
     def test_eagle_refused_unaudited_backends(self):
-        """fa3 does not translate speculative verify indices, and the
-        MLA verify set from the DSPARK arm must not leak into the EAGLE arm."""
-        for backend in ("fa3", "fa4", "trtllm_mha") + tuple(
+        """Unaudited backends stay out, and the MLA verify set from the
+        DSPARK arm must not leak into the EAGLE arm."""
+        for backend in ("fa4", "trtllm_mha") + tuple(
             b for b in self.DSPARK_BACKENDS if b not in self.EAGLE_BACKENDS
         ):
             self.assertFalse(_accepts("EAGLE", backend=backend))
@@ -163,7 +163,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         self.assertTrue(_accepts("EAGLE", draft_backend=None))
         for draft_backend in self.EAGLE_BACKENDS:
             self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
-        for draft_backend in ("fa3", "trtllm_mha"):
+        for draft_backend in ("fa4", "trtllm_mha"):
             self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
 
     def test_dspark_arm_unchanged(self):
@@ -174,7 +174,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                 _accepts("DSPARK", backend=backend),
                 f"DSPARK should pass on verify-audited backend {backend}",
             )
-        self.assertFalse(_accepts("DSPARK", backend="fa3"))
+        self.assertFalse(_accepts("DSPARK", backend="fa4"))
         self.assertFalse(_accepts("DSPARK", topk=4))
 
     def test_ngram_admitted_on_the_verify_audited_backends(self):
@@ -187,7 +187,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
                 _accepts("NGRAM", backend=backend),
                 f"NGRAM should pass on verify-audited backend {backend}",
             )
-        self.assertFalse(_accepts("NGRAM", backend="fa3"))
+        self.assertFalse(_accepts("NGRAM", backend="fa4"))
         self.assertTrue(_accepts("NGRAM", topk=4))
 
     def test_spec_off_admitted(self):
