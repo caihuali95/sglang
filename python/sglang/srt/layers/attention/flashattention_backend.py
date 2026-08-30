@@ -687,21 +687,25 @@ class FlashAttentionBackend(AttentionBackend):
             m.max_seq_len_k = self.max_context_len
         self.forward_metadata = m
 
-    def _eager_read_seq_len_delta(self, forward_batch: ForwardBatch) -> int:
+    def _spec_read_seq_len_delta(
+        self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
+    ) -> int:
         """Columns past ``seq_lens`` this mode's whole-sequence read covers —
-        the translated table's fill must reach ``cache_seqlens``.
+        the translated table's fill must reach ``cache_seqlens``. Shared by
+        the eager build and the captured-source build, so eager and replay
+        widen identically.
 
         Zero for the prefix-only shapes: normal decode/extend, the topk>1
-        split (drafts read via the expand metadata), and draft-extend's idle
-        batch. The ragged verify layout's per-row lens are bounded by the
-        draft window, so its upper bound rides the same delta."""
-        if forward_batch.spec_info is None:
+        split (drafts read via the expand metadata), draft-extend whose lens
+        already include the window, and draft-extend's idle batch. The ragged
+        verify layout's per-row lens are bounded by the draft window, so its
+        upper bound rides the same delta."""
+        if spec_info is None:
             return 0
-        mode = forward_batch.forward_mode
-        if mode.is_target_verify() and self.topk <= 1:
+        if forward_mode.is_target_verify() and self.topk <= 1:
             return self.speculative_num_draft_tokens
         if (
-            mode.is_decode_or_idle()
+            forward_mode.is_decode_or_idle()
             and self.topk <= 1
             and self.speculative_num_steps > 0
         ):
@@ -1115,7 +1119,9 @@ class FlashAttentionBackend(AttentionBackend):
         if _unified_read:
             # Whole-sequence spec reads (cache_seqlens = seq_lens + delta)
             # need the fill widened past the memoized table's prefix.
-            delta = self._eager_read_seq_len_delta(forward_batch)
+            delta = self._spec_read_seq_len_delta(
+                forward_batch.forward_mode, forward_batch.spec_info
+            )
             if delta:
                 index_table = self.kv_index_translator.widened_index_table(
                     forward_batch, seq_len_delta=delta
@@ -2759,11 +2765,15 @@ class FlashAttentionBackend(AttentionBackend):
         metadata = None
         metadata_expand = None
 
+        # Whole-sequence spec replays read cache_seqlens = seq_lens + delta;
+        # the captured source build must fill that far (buffers are sized to
+        # max context, so the widened prefix always fits).
         index_table = self.kv_index_translator.build_index_table(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             captured=True,
             out_cache_loc=out_cache_loc,
+            seq_len_delta=self._spec_read_seq_len_delta(forward_mode, spec_info),
         )
 
         # Refill the SWA write-target buffer (bound as a metadata view in
