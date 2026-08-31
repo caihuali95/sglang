@@ -42,6 +42,11 @@ one page-granular table serves both kinds of consumer: a block-table backend
 uses its rows as-is, and one that wants flat per-token ids rebuilds them as
 
     token_id = entry * entry_page_size + pos % entry_page_size
+
+WRITES, IN TWO PHASES. The full-side write loc is rebound to kernel-facing
+ids at ForwardBatch construction - the earliest consumer can snapshot it
+right after. The sliding-window write loc is derived at the same moment as
+read table, into the same index table.
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 
 class KVReadTables(msgspec.Struct, frozen=True):
@@ -113,20 +119,29 @@ class KVIndexTranslator:
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._full_v2p_table = alloc.full_v2p_page_table
+            self._full_p2v_table = alloc.full_p2v_page_table
             self._full_page_multiplier = alloc.kernel_page_multiplier
             self._translate_full = alloc.translate_kv_loc_for_kernel
             if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_page_multiplier = alloc.swa_kernel_page_multiplier
+                self._swa_write_loc_from_full = self._swa_write_loc_unified
             else:
                 self._swa_v2p_table = None
                 self._swa_page_multiplier = 1
+                self._swa_write_loc_from_full = None
         else:
             self._full_v2p_table = None
+            self._full_p2v_table = None
             self._full_page_multiplier = 1
             self._translate_full = None
             self._swa_v2p_table = None
             self._swa_page_multiplier = 1
+            self._swa_write_loc_from_full = (
+                token_to_kv_pool.translate_loc_from_full_to_swa
+                if isinstance(token_to_kv_pool, SWAKVPool)
+                else None
+            )
 
         self._rows: Optional[torch.Tensor] = (
             torch.arange(req_to_token.shape[0], dtype=torch.int64, device=device)
@@ -292,6 +307,43 @@ class KVIndexTranslator:
         )
         self._index_table_memo = (weakref.ref(forward_batch), view)
         return view
+
+    # -- write loc (phase 1; phase 2 lives in build_index_table) ----------------
+
+    def rebind_write_loc(self, forward_batch) -> None:
+        """Phase 1 of the WRITE contract: translate the batch's write loc to
+        FULL-side kernel-facing ids exactly once, at ForwardBatch
+        construction. No-op on non-unified pools.
+
+        REBIND, never mutate: the translate returns a FRESH tensor, so the
+        ScheduleBatch's aliased tensor stays VIRTUAL for the radix / accept /
+        in-flight machinery that reads it.
+        """
+        self._index_table_memo = None
+        if not self.is_translating or forward_batch.out_cache_loc is None:
+            return
+        forward_batch.out_cache_loc = self._translate_full(forward_batch.out_cache_loc)
+
+    def sliding_window_write_loc_for(
+        self, out_cache_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """This batch's sliding-window write loc, or None when there is no loc
+        this forward or the pool has no sliding-window id space."""
+        if out_cache_loc is None or self._swa_write_loc_from_full is None:
+            return None
+        return self._swa_write_loc_from_full(out_cache_loc)
+
+    def _swa_write_loc_unified(self, kernel_loc: torch.Tensor) -> torch.Tensor:
+        """Sliding-window write loc, derived pointwise from FULL-side
+        kernel-facing values (phase 2 of the write contract).
+        """
+        full_stride = self.page_size * self._full_page_multiplier
+        offset = kernel_loc % full_stride  # == virtual_token % page_size
+        # An unmapped physical page reads back as -1; clamp it rather than let
+        # the gather wrap onto the v2p table's last element.
+        virt_page = self._full_p2v_table[kernel_loc // full_stride].clamp_(min=0)
+        swa_stride = self.page_size * self._swa_page_multiplier
+        return (self._swa_v2p_table[virt_page] * swa_stride + offset).clamp_(min=0)
 
     # -- token-level translate surface (the mixin / local-attn consumers) ------
 
