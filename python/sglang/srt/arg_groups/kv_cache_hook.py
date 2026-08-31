@@ -282,16 +282,26 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "DSPARK",
         "EAGLE",
         "EAGLE3",
-        "NGRAM",
         "DFLASH",
     ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft), NGRAM (target verify only), DFLASH (fused "
-        "block draft), and EAGLE/EAGLE3 (fused draft KV); other "
-        "speculative algorithms are not yet audited for the unified "
-        "pool's virtual/dense loc translation. Got "
+        "DSPARK (chain draft), DFLASH (fused block draft), and "
+        "EAGLE/EAGLE3 (fused draft KV); other speculative algorithms are "
+        "not yet audited for the unified pool's virtual/dense loc "
+        "translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
+    # NGRAM is deliberately absent, and for the SAME reason tree verify is:
+    # a tree-shaped drafter finalizes a batch by calling
+    # `move_accept_tokens_to_target_kvcache`, which relocates INDIVIDUAL
+    # accepted tokens inside the target pool. The unified pool's
+    # `move_kv_cache` is compaction-only -- it moves whole page envelopes
+    # (that is what carries a fused draft region for free) -- so a per-token
+    # relocation either reshapes past the end (`view(-1, page_size)` on a
+    # handful of tokens) or hits the SWA composite's explicit refusal.
+    # EAGLE chain never reaches it: its only caller is the topk>1 tree path.
+    # Re-admitting NGRAM needs a per-token move primitive on the unified
+    # pools -- the same prerequisite as tree verify.
     if cfg.speculative_algorithm in ("EAGLE", "EAGLE3"):
         from sglang.srt.configs.hybrid_arch import mambaish_config
 
@@ -359,12 +369,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             algorithm="DFLASH",
             allowed=frozenset({"triton", "fa3", "flashinfer"}),
         )
-    if cfg.speculative_algorithm == "NGRAM":
-        # No draft KV and no chain-shape constraint: any
-        # --speculative-ngram-max-bfs-breadth is admitted because the KV
-        # placement is chain-identical (one contiguous window of draft
-        # slots per request); the tree lives in the verify custom mask.
-        _assert_spec_verify_backends(server_args, algorithm="NGRAM")
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
