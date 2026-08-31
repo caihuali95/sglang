@@ -36,6 +36,10 @@ class HybridAttnBackend(AttentionBackend):
         self.data_type = model_runner.kv_cache_dtype
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
+        # Travels with the pool: a producer that reads the translator off the
+        # live backend sees the base class's None default otherwise, and skips
+        # translation instead of failing.
+        self.kv_index_translator = model_runner.kv_index_translator
         self.spec_attn_is_decode = get_spec().speculative_attention_mode == "decode"
         self.spec_attn_is_prefill = get_spec().speculative_attention_mode == "prefill"
         # Gates the FutureMap's per-step seq_lens D2H (decide_needs_cpu_seq_lens

@@ -991,6 +991,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
+        # Forward the translator: `AttentionBackend.kv_index_translator` defaults
+        # to None, so a wrapper that does not re-expose the full-attention
+        # backend's copy reads as "this backend needs no translation". Producers
+        # that fetch it off `get_attn_backend()` -- the MLA chunked-prefix-cache
+        # path is one -- then SKIP translation silently and hand a kernel raw
+        # VIRTUAL ids. Nothing raises; the model just reads the wrong KV.
+        self.kv_index_translator = full_attn_backend.kv_index_translator
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens
