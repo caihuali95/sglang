@@ -7,7 +7,7 @@ allocation, one free, one whole-page relocation carry both. A region is not a
 geometry the host entry lays out at its `draft_offset_in_entry()`.
 """
 
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -134,3 +134,136 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
             start += count
         return cls(runners=tuple(runners), full=full)
 
+
+
+class DraftKVGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-GPU K/V row geometry of one kind of draft attention layer."""
+
+    head_num: int
+    head_dim: int
+    v_head_dim: int
+
+
+class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
+    """What the draft checkpoint asks of the host sub-pools.
+
+    ``num_depths`` > 1 marks a per-depth head (one transformer block per MTP
+    depth, served by one runner each under multi-layer EAGLE); otherwise
+    every runner serves all ``num_layers`` layers.
+    """
+
+    num_layers: int
+    full: DraftKVGeometry
+    swa_layer_ids: Tuple[int, ...] = ()
+    num_depths: int = 1
+    num_state_layers: int = 0
+
+
+def draft_kv_profile(
+    draft_model_config, *, num_layers: int, attn_tp_size: int
+) -> DraftKVProfile:
+    """The profile of a draft `ModelConfig`, heads divided by attn_tp the way
+    the target divides its own (drafts never join the DCP group)."""
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    mc = draft_model_config
+    swa_layer_ids: Tuple[int, ...] = ()
+    if mc.is_hybrid_swa and not mc.is_deepseek_v4_arch:
+        swa_layer_ids = tuple(int(i) for i in mc.swa_attention_layer_ids)
+    num_depths = mc.num_nextn_predict_layers
+    mambaish = mambaish_config(mc)
+    return DraftKVProfile(
+        num_layers=int(num_layers),
+        full=DraftKVGeometry(
+            head_num=int(mc.get_num_kv_heads(attn_tp_size)),
+            head_dim=int(mc.head_dim),
+            v_head_dim=int(mc.v_head_dim),
+        ),
+        swa_layer_ids=swa_layer_ids,
+        num_depths=1 if num_depths is None else int(num_depths),
+        num_state_layers=(
+            0 if mambaish is None else len(mambaish.mamba2_cache_params.layers)
+        ),
+    )
+
+
+class FusedDraftDecision(msgspec.Struct, frozen=True, kw_only=True):
+    """`place_fused_draft`'s answer: the placement, or why the draft keeps a
+    private pool. Neither means fusion simply does not apply."""
+
+    placement: Optional[FusedDraftPlacement] = None
+    declined: Optional[str] = None
+
+
+def _runner_layer_counts(
+    profile: DraftKVProfile, num_runners: int
+) -> Tuple[Optional[List[Tuple[int, int]]], Optional[str]]:
+    """Per runner, its (full, swa) layer counts; or why no runner layout exists."""
+    if profile.num_depths <= 1:
+        num_swa = len(profile.swa_layer_ids)
+        return [(profile.num_layers - num_swa, num_swa)] * num_runners, None
+    if num_runners == 1:
+        return None, (
+            f"a per-depth draft head ({profile.num_depths} depths) needs one "
+            "runner per depth (multi-layer EAGLE)"
+        )
+    if num_runners > profile.num_depths:
+        return None, (
+            f"{num_runners} draft runners exceed the head's "
+            f"{profile.num_depths} depths"
+        )
+    swa = set(profile.swa_layer_ids)
+    return [(0, 1) if r in swa else (1, 0) for r in range(num_runners)], None
+
+
+def place_fused_draft(
+    *,
+    profile: DraftKVProfile,
+    num_runners: int,
+    host_names: Sequence[str],
+    store_dtype: torch.dtype,
+) -> FusedDraftDecision:
+    """Assign every draft layer of every runner to the host sub-pool whose
+    lifetime covers what the layer reads: a full-attention layer rides in
+    ``"full"``. A layer kind no host arm serves declines the whole draft to
+    its private pool."""
+    counts, reason = _runner_layer_counts(profile, num_runners)
+    if counts is None:
+        return FusedDraftDecision(declined=reason)
+    if profile.num_state_layers:
+        return FusedDraftDecision(
+            declined=(
+                f"the draft has {profile.num_state_layers} recurrent-state "
+                "layer(s) of its own, which no host state pool carries"
+            )
+        )
+    num_swa = sum(swa for _, swa in counts)
+    if num_swa:
+        return FusedDraftDecision(
+            declined=(
+                f"the draft has {num_swa} SWA layer(s) of its own, which the "
+                "fused dense pool cannot serve"
+            )
+        )
+    geometry = profile.full
+    if geometry.head_dim != geometry.v_head_dim:
+        return FusedDraftDecision(
+            declined=(
+                "the draft's K/V rows are asymmetric "
+                f"(head_dim={geometry.head_dim}, v_head_dim={geometry.v_head_dim}), "
+                "which is not admitted yet"
+            )
+        )
+    assert "full" in host_names, host_names
+    full = DenseDraftRegion(
+        layer_num=sum(full for full, _ in counts),
+        head_num=geometry.head_num,
+        head_dim=geometry.head_dim,
+        v_head_dim=geometry.v_head_dim,
+        store_dtype=store_dtype,
+    )
+    return FusedDraftDecision(
+        placement=FusedDraftPlacement.from_counts(
+            full_counts=[full for full, _ in counts], full=full
+        )
+    )

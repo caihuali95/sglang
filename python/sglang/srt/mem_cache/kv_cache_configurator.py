@@ -836,6 +836,115 @@ class KVCacheConfigurator:
             sliding_window_size=self.model_config.sliding_window_size,
         )
 
+    def _num_draft_runners(self) -> int:
+        """Draft runners the spec worker builds: one per step under multi-layer
+        EAGLE, else one."""
+        if self.model_config.is_multi_layer_eagle:
+            return int(get_spec().speculative_num_steps)
+        return 1
+
+    def _fused_draft_decision(self):
+        """Whether, and where, the EAGLE draft's layers fuse into the target's
+        sub-pools. Fusion applies only for: unified memory ON, a hybrid-SWA
+        target, an EAGLE-family algorithm whose draft config was loaded at
+        target boot; `place_fused_draft` then admits or declines the draft's
+        layer kinds."""
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            FusedDraftDecision,
+            draft_kv_profile,
+            place_fused_draft,
+        )
+        from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
+
+        aux = self.spec_aux_config
+        if not (
+            get_memory().enable_unified_memory
+            and self.is_hybrid_swa
+            and not self.is_draft_worker
+            and self.spec_algorithm.is_eagle()
+            and aux.eagle_draft_num_layers
+            and aux.draft_model_config is not None
+        ):
+            return FusedDraftDecision()
+        profile = draft_kv_profile(
+            aux.draft_model_config,
+            num_layers=int(aux.eagle_draft_num_layers),
+            attn_tp_size=get_parallel().attn_tp_size,
+        )
+        return place_fused_draft(
+            profile=profile,
+            num_runners=self._num_draft_runners(),
+            host_names=("full", "swa"),
+            # Drafts store KV in the same server kv dtype as the target.
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+        )
+
+    def fused_draft_placement(self):
+        """The fused draft placement, or None when the draft keeps a private pool."""
+        return self._fused_draft_decision().placement
+
+    def _resolve_fused_draft_placement(self):
+        """Resolve ONCE per factory call (not inline) so the boot log reports
+        exactly the placement the factory is handed: a declined fusion and an
+        engaged one otherwise look identical from outside."""
+        decision = self._fused_draft_decision()
+        if decision.placement is None:
+            if decision.declined is not None:
+                logger.warning("fused draft KV disabled: %s", decision.declined)
+            return None
+        placement = decision.placement
+        for host in placement.hosts():
+            region = placement.region(host)
+            logger.info(
+                "[unified-memory-pool] fused draft region in %r: %d slot(s) x %d "
+                "kv head(s) x %d/%d k/v head_dim @ %s = %d B/token; runner slots %s",
+                host,
+                region.layer_num,
+                region.head_num,
+                region.head_dim,
+                region.resolved_v_head_dim(),
+                region.store_dtype,
+                region.entry_bytes(),
+                [
+                    tuple(placement.slots_for(r, host))
+                    for r in range(len(placement.runners))
+                ],
+            )
+        return placement
+
+    def fused_entry_bytes(self, sub_pool_name: str) -> Optional[int]:
+        """Per-token bytes of ``sub_pool_name``'s FUSED entry (host + draft +
+        pad) for the boot solve's cell model. Single source of truth: assembled
+        through the same spec the pool factory builds, so the priced entry and
+        the allocated entry cannot drift. None when the draft does not fuse
+        into that sub-pool."""
+        placement = self.fused_draft_placement()
+        if placement is None:
+            return None
+        region = placement.region(sub_pool_name)
+        if region is None:
+            return None
+        return self._fused_host_spec(sub_pool_name, region).entry_bytes()
+
+    def _fused_host_spec(self, sub_pool_name: str, region):
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            MHASubPoolSpec,
+            _store_dtype_for,
+        )
+
+        assert sub_pool_name == "full", sub_pool_name
+        return MHASubPoolSpec(
+            name="full",
+            layer_num=len(self.model_config.full_attention_layer_ids),
+            head_num=self.model_config.get_num_kv_heads(
+                get_parallel().attn_tp_size, get_parallel().attn_dcp_size
+            ),
+            head_dim=self.model_config.head_dim,
+            store_dtype=_store_dtype_for(self.kv_cache_dtype),
+            grow_direction="down",
+            draft_region=region,
+        )
+
     def _init_unified_swa_pools(
         self,
         *,
@@ -933,6 +1042,7 @@ class KVCacheConfigurator:
             # charged, see `_check_bs1_feasibility_floor`.
             model_context_len=self.model_config.context_len,
             sliding_window_size=self.model_config.sliding_window_size,
+            fused_draft=self._resolve_fused_draft_placement(),
         )
         return UnifiedPoolBundle(
             unified_memory_pool=bundle.unified_memory_pool,

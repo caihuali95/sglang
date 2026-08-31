@@ -606,8 +606,31 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
+        # Fused draft KV: a placed draft rides inside the host entries, so a
+        # fused sub-pool's term is the EXACT fused entry (host + draft + pad,
+        # priced through the same spec the pool factory builds) and no
+        # separate draft-pool term may remain, or the draft is charged twice.
+        self._fused_full_entry = kvc.fused_entry_bytes("full")
+        self._fused_swa_entry = kvc.fused_entry_bytes("swa")
+        if self._fused_full_entry is not None or self._fused_swa_entry is not None:
+            self._draft_full_layers_num = 0
+            self._draft_swa_layers_num = 0
+            self._draft_swa_full_layers_num = 0
+            self._draft_cell_size = 0
 
         self._recompute_cell_size()
+
+    def _full_cell_bytes(self) -> int:
+        """Bytes per full-side token: the fused entry when the draft is placed
+        there, else the target's rows plus the private draft's full rows."""
+        if self._fused_full_entry is not None:
+            return self._fused_full_entry
+        return self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+
+    def _swa_cell_bytes(self) -> int:
+        if self._fused_swa_entry is not None:
+            return self._fused_swa_entry
+        return self._swa_per_token * (self._swa_layers_num + self._draft_swa_layers_num)
 
     def _recompute_cell_size(self) -> None:
         # Bytes per token of max_total_num_tokens.
@@ -629,12 +652,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             )
         else:
             self._cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
+                self._full_cell_bytes()
                 + self._swa_per_token * self._draft_swa_full_layers_num
-                + self._swa_full_tokens_ratio
-                * self._swa_per_token
-                * (self._swa_layers_num + self._draft_swa_layers_num)
+                + self._swa_full_tokens_ratio * self._swa_cell_bytes()
                 + self._draft_cell_size
             )
 
@@ -816,19 +836,14 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
     ) -> MemoryPoolConfig:
         # SWA pool sized tightly from the cap; the rest of the budget goes to full.
         swa_tokens = ceil_align(self._swa_cap, page_size)
-        fixed_swa_bytes = (
-            swa_tokens
-            * self._swa_per_token
-            * (self._swa_layers_num + self._draft_swa_layers_num)
-        )
+        fixed_swa_bytes = swa_tokens * self._swa_cell_bytes()
         if self._enable_unified_memory and self._draft_pool_bytes_per_token() > 0:
             full_tokens = self._max_unified_full_tokens(
                 available_bytes, page_size, fixed_swa_tokens=swa_tokens
             )
         else:
             full_cell_size = (
-                self._full_per_token
-                * (self._full_layers_num + self._draft_full_layers_num)
+                self._full_cell_bytes()
                 + self._swa_per_token * self._draft_swa_full_layers_num
             )
             full_tokens = (
