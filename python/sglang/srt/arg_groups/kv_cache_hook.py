@@ -208,7 +208,9 @@ _SPEC_VERIFY_AUDITED_BACKENDS = frozenset(
 )
 
 
-def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
+def _assert_spec_verify_backends(
+    server_args: Any, *, algorithm: str, allowed: frozenset = None
+) -> None:
     """Refuse spec backends whose verify id rails are not translation-audited.
 
     Checks the target's prefill/decode pair AND the draft worker's own
@@ -216,7 +218,8 @@ def _assert_spec_verify_backends(server_args: Any, *, algorithm: str) -> None:
     before inheriting the target's, so it can be unaudited on its own."""
     from sglang.srt.arg_groups.overrides import attention_backends_of
 
-    allowed = _SPEC_VERIFY_AUDITED_BACKENDS
+    if allowed is None:
+        allowed = _SPEC_VERIFY_AUDITED_BACKENDS
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     assert backends <= allowed, (
@@ -263,11 +266,30 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "ships host/C4 rows straight from the allocator, bypassing the "
             "virtual->physical translation the unified pool needs."
         )
-    assert cfg.speculative_algorithm in (None, "DSPARK", "EAGLE", "EAGLE3"), (
+    # Speculative decoding: DSPARK (chain draft, #33974) and NGRAM
+    # (draft-model-less target verify) are supported on the unified pool,
+    # and EAGLE/EAGLE3 chain drafting is supported on hybrid-SWA targets,
+    # whose draft KV rides fused inside the full pool's page envelope
+    # (DenseDraftRegion in mem_cache/unified_memory_pool.py). Other
+    # algorithms are not yet audited for the virtual/dense loc
+    # translation. The id-space choke point plugs in the same way when
+    # they are: its canonical builder takes seq_lens as a tensor
+    # (target-verify's seq_lens + num_draft plugs in), write rails
+    # resolve through the source (rebind_write_loc /
+    # sliding_window_write_loc), and verify tables consume the same
+    # KVIndexTable.
+    assert cfg.speculative_algorithm in (
+        None,
+        "DSPARK",
+        "EAGLE",
+        "EAGLE3",
+        "DFLASH",
+    ), (
         "--enable-unified-memory only supports --speculative-algorithm "
-        "DSPARK (chain draft) and EAGLE/EAGLE3 (fused draft KV); other "
-        "speculative algorithms are not yet audited for the unified pool's "
-        "virtual/kernel-facing loc translation. Got "
+        "DSPARK (chain draft), DFLASH (fused block draft), and "
+        "EAGLE/EAGLE3 (fused draft KV); other speculative algorithms are "
+        "not yet audited for the unified pool's virtual/kernel-facing loc "
+        "translation. Got "
         f"--speculative-algorithm={cfg.speculative_algorithm!r}."
     )
     # Refused for EVERY algorithm, in one place. NGRAM is off the allow-list
@@ -287,13 +309,19 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
             "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
-            "fused inside the full-attention page envelope."
+            "fused inside the full-attention page envelope (or falls back "
+            "to a private pool over the unified virtual id space)."
         )
-        # None refuses EXPLICITLY: an unset backend resolves to a default
-        # later in the pipeline, which would silently leave the audited set.
-        # MLA hosts verify on the MLA family; MHA hosts on the translated
-        # MHA rails. One arm, two answers, because the fused region's host
-        # kind decides which kernels read it.
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
+            "draft chain only (--speculative-eagle-topk in {None, 1}); "
+            "tree verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
+        # None refuses EXPLICITLY: an unset backend would default to
+        # fa3/flashinfer later in resolution, silently leaving the audited
+        # envelope. MLA hosts verify on the MLA family; MHA hosts on the
+        # translated MHA rails.
         eagle_allowed = (
             _SPEC_VERIFY_AUDITED_BACKENDS
             if use_mla_backend(server_args)
@@ -306,9 +334,11 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             and eagle_backends <= eagle_allowed
         ), (
             "--enable-unified-memory + EAGLE/EAGLE3 requires the "
-            f"spec-verify-audited attention backends {sorted(eagle_allowed)}, "
-            f"set explicitly (got {sorted(eagle_backends, key=str)}). The MLA "
-            "verify family does not apply to an MHA-shaped draft."
+            "spec-verify-audited attention backends "
+            f"{sorted(eagle_allowed)}, set explicitly (got "
+            f"{sorted(eagle_backends, key=str)}). Other backends do not "
+            "translate speculative verify indices to the unified pool's "
+            "dense space yet."
         )
         # The draft worker resolves its own backend: explicit flag first,
         # else it inherits the target's (audited, per the assert above).
@@ -321,7 +351,24 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "to inherit the target's."
         )
     if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.speculative_eagle_topk in (None, 1), (
+            "--enable-unified-memory + DSPARK supports a linear draft "
+            "chain only (--speculative-eagle-topk in {None, 1}); tree "
+            "verify is not audited for the unified pool. Got "
+            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
+        )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
+    if cfg.speculative_algorithm == "DFLASH":
+        # DFLASH targets are MHA-family; verify (target and the draft's own
+        # block forward) runs on the translated MHA rails. Draft KV fuses
+        # into the target's pages when the geometry resolves, with the
+        # private-pool arm as the automatic fallback; the compact-window
+        # mode narrows reads over the same fused mapping.
+        _assert_spec_verify_backends(
+            server_args,
+            algorithm="DFLASH",
+            allowed=frozenset({"triton", "fa3", "flashinfer"}),
+        )
     assert not (cfg.enable_hierarchical_cache or cfg.enable_lmcache), (
         "--enable-unified-memory is not yet compatible with hierarchical / "
         "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "
