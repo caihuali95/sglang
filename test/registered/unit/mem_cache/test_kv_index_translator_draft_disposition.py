@@ -29,6 +29,8 @@
     python -m pytest test/registered/unit/mem_cache/test_kv_index_source_draft_disposition.py -v
 """
 
+import ast
+import pathlib
 import unittest
 from types import SimpleNamespace
 
@@ -136,7 +138,7 @@ def _source(allocator, pool_obj):
     )
 
 
-class TestKVIndexSourceDraftDisposition(unittest.TestCase):
+class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
     def test_target_runner_uses_the_host_multiplier(self):
         _, allocator, kvcache, _ = _build()
         src = _source(allocator, kvcache)
@@ -363,6 +365,51 @@ class TestKVIndexSourceDraftDisposition(unittest.TestCase):
 
         raw = KVIndexTable.passthrough(req_to_token=rt, req_pool_indices=rpi)
         self.assertIs(raw.swa_view(), raw)
+
+    def test_target_hidden_injectors_translate_their_locs(self):
+        """BUG REGRESSION (eval_568). DFLASH and DSPARK do not compute their
+        draft KV from the draft's own forward -- they PROJECT the target's
+        hidden states and write them straight into the draft pool. Those
+        writes take locs read off the target's req_to_token (VIRTUAL) and call
+        the KVCache API directly, bypassing the write rebind, which by design
+        leaves the caller's aliases virtual. Under fusion the draft pool
+        expects DRAFT-DENSE ids, so every such write landed at the wrong row:
+        the draft then attended over its own mask-token KV and accept length
+        collapsed to 1.0 (zero drafts accepted) with no crash -- and the stray
+        rows overwrote host KV blocks in the same pages. Identity on a plain
+        pool, which is why it only ever broke the fused arm."""
+        import sglang.srt.mem_cache.kv_index_translator as _kit
+
+        root = pathlib.Path(_kit.__file__).parent.parent
+        for rel, func in (
+            (
+                "speculative/dflash_worker_v2.py",
+                "_append_target_hidden_to_draft_kv_by_loc",
+            ),
+            (
+                "speculative/dspark_components/dspark_kv_inject.py",
+                "inject_target_hidden",
+            ),
+        ):
+            src = (root / rel).read_text()
+            tree = ast.parse(src)
+            fn = next(
+                (
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == func
+                ),
+                None,
+            )
+            self.assertIsNotNone(fn, f"{func} not found in {rel}")
+            body = ast.unparse(fn)
+            self.assertIn(
+                "translate_full_attn_ids",
+                body,
+                f"{rel}::{func} writes draft KV without translating its locs; "
+                "under a fused draft region those virtual ids address the "
+                "wrong rows (silent corruption, accept collapses to 1.0).",
+            )
 
     def test_full_flat_translate_args_per_disposition(self):
         """The flat-translate accessor must hand a kernel exactly what
