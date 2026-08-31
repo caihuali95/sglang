@@ -625,7 +625,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         there, else the target's rows plus the private draft's full rows."""
         if self._fused_full_entry is not None:
             return self._fused_full_entry
-        return self._full_per_token * (self._full_layers_num + self._draft_full_layers_num)
+        return self._full_per_token * (
+            self._full_layers_num + self._draft_full_layers_num
+        )
 
     def _swa_cell_bytes(self) -> int:
         if self._fused_swa_entry is not None:
