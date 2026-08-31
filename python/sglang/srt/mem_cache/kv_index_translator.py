@@ -191,6 +191,14 @@ class KVIndexTranslator:
         )
         self._index_table_memo: Optional[Tuple[weakref.ref, KVIndexTable]] = None
 
+    def full_flat_v2p(self) -> Optional[torch.Tensor]:
+        """The full-side v2p page table for a kernel that translates flat ids
+        itself, or ``None`` when this runner does not translate (pass-through
+        and static pools)."""
+        if not self.is_translating:
+            return None
+        return self._full_v2p_table
+
     # -- per-batch view --------------------------------------------------------
 
     @property
