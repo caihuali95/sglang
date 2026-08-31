@@ -73,6 +73,37 @@ class TestResolverTouchesNoParallelState(unittest.TestCase):
         }
         self.assertNotIn("get_parallel", imported)
 
+    def test_nextn_layers_come_from_a_draft_model_config(self):
+        """BUG REGRESSION (eval_568). Every `num_nextn_predict_layers = 1`
+        assignment in model_config.py is guarded by `if is_draft_model`, so the
+        TARGET's own config always answers None. Reading it off the target made
+        the path-less-NEXTN geometry silently never resolve, and the draft fell
+        back to a private pool instead of fusing. The resolver must therefore
+        build a config with is_draft_model=True and read the field off THAT --
+        never off the target `model_config` parameter."""
+        tree = ast.parse(_SRC.read_text())
+        fn = _function_named(tree, "_resolve_eagle_aux_hidden_state")
+        target_reads = [
+            n
+            for n in ast.walk(fn)
+            if isinstance(n, ast.Attribute)
+            and n.attr == "num_nextn_predict_layers"
+            and isinstance(n.value, ast.Name)
+            and n.value.id == "model_config"
+        ]
+        self.assertEqual(
+            target_reads,
+            [],
+            "_resolve_eagle_aux_hidden_state reads num_nextn_predict_layers off "
+            "the TARGET model_config, where it is always None (the field is "
+            "only filled under is_draft_model=True).",
+        )
+        self.assertIn(
+            "is_draft_model=True",
+            ast.unparse(fn),
+            "the resolver must build the draft config with is_draft_model=True",
+        )
+
     def test_the_recorded_head_count_is_undivided(self):
         """The field name must keep saying TOTAL: a consumer that reads it as
         a per-GPU count silently under-sizes the fused draft region at
