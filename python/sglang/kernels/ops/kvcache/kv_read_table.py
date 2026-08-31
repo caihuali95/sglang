@@ -72,6 +72,7 @@ def build_kv_read_indices_kernel(
     out_stride,  # runtime: uniform row stride, used when row_starts is null
     mult,  # runtime: kernel_page_multiplier of the target sub-pool
     item_stride,  # runtime: items one program advances per loop trip
+    seq_len_delta,  # runtime: verify widening added to every row's live prefix
     PAGE_SIZE: tl.constexpr,
     EMIT_PER_TOKEN: tl.constexpr,
     OUT_INT64: tl.constexpr,
@@ -79,7 +80,7 @@ def build_kv_read_indices_kernel(
 ):
     bid = tl.program_id(0)
     req = tl.load(req_pool_indices_ptr + bid).to(tl.int64)
-    seqlen = tl.load(seq_lens_ptr + bid)
+    seqlen = tl.load(seq_lens_ptr + bid) + seq_len_delta
     # Derived here, not on the host: one elementwise op there costs a whole
     # launch, which a captured graph then replays every step.
     if EMIT_PER_TOKEN:
@@ -134,6 +135,7 @@ def _launch(
     row_starts: Optional[torch.Tensor],
     kv_start_idx: Optional[torch.Tensor],
     emit_per_token: bool,
+    seq_len_delta: int = 0,
 ) -> None:
     bs = int(req_pool_indices.numel())
     item_programs = min(
@@ -151,6 +153,7 @@ def _launch(
         out_stride,
         multiplier,
         item_programs * _BLOCK_ITEMS,
+        seq_len_delta,
         PAGE_SIZE=page_size,
         EMIT_PER_TOKEN=emit_per_token,
         OUT_INT64=out.dtype == torch.int64,
@@ -184,12 +187,17 @@ def build_kv_read_table(
     page_size: int,
     max_pages: int,
     out: torch.Tensor,
+    seq_len_delta: int = 0,
 ) -> torch.Tensor:
     """Fill ``out``'s live prefix with PAGE TABLE entries.
 
     ``out`` is caller-owned (fresh zeros for the eager path, the module's
     capture-stable buffer for replay) and only its ``[:bs, :max_pages]``
     region's live prefix is written -- never rebound, never tail-cleared.
+
+    ``seq_len_delta`` widens every row's live prefix -- the whole-sequence
+    verify contract (draft KV read back from the pool). ``max_pages`` must
+    already cover the delta; columns past it are never launched.
     """
     bs = int(req_pool_indices.numel())
     assert (
@@ -210,7 +218,7 @@ def build_kv_read_table(
     if not req_to_token.is_cuda:
         cols = torch.arange(max_pages, device=req_to_token.device)
         for b in range(bs):
-            n_pages = (int(seq_lens[b]) + page_size - 1) // page_size
+            n_pages = (int(seq_lens[b]) + seq_len_delta + page_size - 1) // page_size
             live = min(n_pages, max_pages)
             out[b, :live] = _entries(
                 req_to_token=req_to_token,
@@ -235,6 +243,7 @@ def build_kv_read_table(
         row_starts=None,
         kv_start_idx=None,
         emit_per_token=False,
+        seq_len_delta=seq_len_delta,
     )
     return out
 
