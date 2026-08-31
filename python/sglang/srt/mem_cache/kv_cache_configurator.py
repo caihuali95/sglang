@@ -53,9 +53,6 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator.unified_mamba import (
-    UnifiedMambaTokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -519,6 +516,13 @@ class KVCacheConfigurator:
         # pool must be sized by that space.
         draft_virtual_id_space: Optional[int] = None
         if self.is_draft_worker and token_to_kv_pool_allocator is not None:
+            from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
+                UnifiedSWATokenToKVPoolAllocator,
+            )
+            from sglang.srt.mem_cache.allocator.unified_mamba import (
+                UnifiedMambaTokenToKVPoolAllocator,
+            )
+
             if isinstance(
                 token_to_kv_pool_allocator,
                 (
@@ -526,16 +530,52 @@ class KVCacheConfigurator:
                     UnifiedSWATokenToKVPoolAllocator,
                 ),
             ):
-                draft_virtual_id_space = (
-                    token_to_kv_pool_allocator.draft_virtual_id_space
-                )
+                alloc = token_to_kv_pool_allocator
+                placement = self._bound_fused_draft_placement(alloc)
+                if placement is not None:
+                    # FUSED arm: the draft's KV lives inside the target's
+                    # entries, so the draft worker binds views over the
+                    # target buffer instead of allocating a pool of its own.
+                    # The id-space choke point recognizes the pool and
+                    # translates its ids exactly as the target's.
+                    from sglang.srt.mem_cache.layout.fused_draft import (
+                        draft_swa_layer_ids,
+                    )
+                    from sglang.srt.mem_cache.unified_draft_pool import (
+                        build_unified_draft_kv_pool,
+                        draft_kv_layer_ids,
+                    )
+
+                    assert (
+                        req_to_token_pool is not None
+                    ), "a draft worker shares the target's req_to_token_pool"
+                    draft_pool = build_unified_draft_kv_pool(
+                        unified_buffer=alloc.unified_buffer,
+                        host_allocator=alloc,
+                        placement=placement,
+                        runner=self.draft_model_idx or 0,
+                        kv_layer_ids=draft_kv_layer_ids(self.model),
+                        swa_layer_ids=draft_swa_layer_ids(self.model_config),
+                        page_size=self.page_size,
+                    )
+                    return _InitializedPools(
+                        req_to_token_pool=req_to_token_pool,
+                        token_to_kv_pool=draft_pool,
+                        token_to_kv_pool_allocator=alloc,
+                        unified_memory_pool=None,
+                    )
+                # PRIVATE arm: the draft owns a pool indexed by the target's
+                # raw virtual ids, so it is sized by the full sub-allocator's
+                # virtual id space. NOT `size_full`: the SWA allocator reports
+                # the static token budget there, smaller than the id space.
+                draft_virtual_id_space = alloc.draft_virtual_id_space
                 assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
                     "unified allocator virtual space smaller than the token "
                     f"budget: virtual_id_space={draft_virtual_id_space} < "
                     f"max_total_num_tokens={sizes.max_total_num_tokens}"
                 )
                 # Round UP to page alignment (paged draft backends view the
-                # pool as (-1, page_size, H, D); the virtual space is not aligned).
+                # pool as (-1, page_size, H, D); the space is not aligned).
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
                     (draft_virtual_id_space + page - 1) // page * page
@@ -639,6 +679,21 @@ class KVCacheConfigurator:
             token_to_kv_pool=token_to_kv_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+
+    def _bound_fused_draft_placement(self, alloc):
+        """The placement this draft binds to, or None for the private-pool
+        fallback (the draft then owns a raw-virtual-indexed pool of its own).
+        Target boot declines a placement for legitimate geometry, so the
+        private arm is the rollback lever, not a boot-order bug."""
+        if not self.spec_algorithm.is_eagle():
+            return None
+        placement = alloc.unified_buffer.fused_draft
+        if placement is None:
+            logger.info(
+                "[unified-memory-pool] no fused draft placement on the target's "
+                "buffer; the draft binds a private pool over the virtual id space."
+            )
+        return placement
 
     def _init_unified_mamba_pools(
         self,
