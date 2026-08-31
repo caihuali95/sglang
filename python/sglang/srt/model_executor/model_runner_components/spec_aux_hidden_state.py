@@ -39,6 +39,11 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     # Draft layers whose KV cache uses the target SWA pool capacity.
     eagle_draft_swa_num_layers: Optional[int] = None
     eagle_aux_hidden_state_layer_ids: Any = None
+    # The draft checkpoint's config, recorded at TARGET boot so the unified
+    # fused-draft path can place and price the draft KV when the pools are
+    # built. Its per-GPU geometry is derived THERE: this resolver runs before
+    # the attention-TP group exists. None when no draft config was loaded.
+    draft_model_config: Optional[ModelConfig] = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
@@ -85,26 +90,39 @@ def _resolve_eagle_aux_hidden_state(
     ):
         return
 
-    draft_model_config = model_config
-    if get_spec().speculative_draft_model_path:
-        draft_model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=get_spec().speculative_draft_model_path,
-            model_revision=get_spec().speculative_draft_model_revision,
-            is_draft_model=True,
-        )
+    # Load draft config to get layer count for KV cache sizing.
+    # A path-less NEXTN run (the MTP head ships INSIDE the target
+    # checkpoint) is the same code path: `from_server_args` falls back to
+    # the target path when model_path is None, and `is_draft_model=True`
+    # is what makes ModelConfig fill in `num_nextn_predict_layers` at all
+    # -- every assignment of that field is guarded by `is_draft_model`, so
+    # reading it off the TARGET's own config always answers None and the
+    # geometry silently never resolves (eval_568: Qwen NEXTN fell back to
+    # a private draft pool instead of fusing).
+    draft_path = get_spec().speculative_draft_model_path
+    draft_model_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=draft_path,
+        model_revision=get_spec().speculative_draft_model_revision,
+        is_draft_model=True,
+    )
     num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
     if num_nextn_predict_layers is not None:
         config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-    elif get_spec().speculative_draft_model_path:
+    elif draft_path is None:
+        # No draft path AND no MTP head: there is no draft geometry to
+        # record. Leave the aux unset so the pool falls back to a private
+        # draft pool rather than fusing a region sized like the whole
+        # target.
+        return
+    else:
         config.eagle_draft_num_layers = int(
             max(
                 draft_model_config.num_hidden_layers,
                 draft_model_config.num_attention_layers,
             )
         )
-    else:
-        return
+    config.draft_model_config = draft_model_config
 
     if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
         config.eagle_draft_swa_num_layers = len(
