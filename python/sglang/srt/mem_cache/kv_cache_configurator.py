@@ -736,6 +736,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            fused_draft=self._resolve_fused_draft_placement(),
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
@@ -889,6 +890,7 @@ class KVCacheConfigurator:
             unified_total_bytes=(None if self.is_draft_worker else unified_total_bytes),
             # bs=1 feasibility floor input (context len is already passed).
             sliding_window_size=self.model_config.sliding_window_size,
+            fused_draft=self._resolve_fused_draft_placement(),
         )
 
     def _num_draft_runners(self) -> int:
@@ -898,10 +900,20 @@ class KVCacheConfigurator:
             return int(get_spec().speculative_num_steps)
         return 1
 
+    def _unified_host_names(self) -> tuple:
+        """The sub-pools the unified factory for this model builds, by name."""
+        names = ["full"]
+        if self.is_hybrid_swa:
+            names.append("swa")
+        if self.mambaish_config is not None:
+            names.append("mamba")
+        return tuple(names)
+
     def _fused_draft_decision(self):
         """Whether, and where, the EAGLE draft's layers fuse into the target's
-        sub-pools. Fusion applies only for: unified memory ON, a hybrid-SWA
-        target, an EAGLE-family algorithm whose draft config was loaded at
+        sub-pools. Fusion applies only for: unified memory ON, a target whose
+        full sub-pool is MHA-shaped (hybrid-SWA, or a mamba hybrid off the MLA
+        backend), an EAGLE-family algorithm whose draft config was loaded at
         target boot; `place_fused_draft` then admits or declines the draft's
         layer kinds."""
         from sglang.srt.mem_cache.layout.fused_draft import (
@@ -912,9 +924,12 @@ class KVCacheConfigurator:
         from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
 
         aux = self.spec_aux_config
+        host_has_mha_full_pool = self.is_hybrid_swa or (
+            self.mambaish_config is not None and not self.use_mla_backend
+        )
         if not (
             get_memory().enable_unified_memory
-            and self.is_hybrid_swa
+            and host_has_mha_full_pool
             and not self.is_draft_worker
             and self.spec_algorithm.is_eagle()
             and aux.eagle_draft_num_layers
@@ -929,7 +944,7 @@ class KVCacheConfigurator:
         return place_fused_draft(
             profile=profile,
             num_runners=self._num_draft_runners(),
-            host_names=("full", "swa"),
+            host_names=self._unified_host_names(),
             # Drafts store KV in the same server kv dtype as the target.
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
         )
@@ -988,9 +1003,17 @@ class KVCacheConfigurator:
         )
 
         assert sub_pool_name == "full", sub_pool_name
+        # Hybrid-SWA hosts split layers on the ModelConfig wrapper; the
+        # mambaish list is the conv/attention pairing and names ALL layers on
+        # a host that is both.
+        full_attention_layer_ids = (
+            self.model_config.full_attention_layer_ids
+            if self.is_hybrid_swa
+            else self.mambaish_config.full_attention_layer_ids
+        )
         return MHASubPoolSpec(
             name="full",
-            layer_num=len(self.model_config.full_attention_layer_ids),
+            layer_num=len(full_attention_layer_ids),
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
