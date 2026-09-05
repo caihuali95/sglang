@@ -312,12 +312,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "fused inside the full-attention page envelope (or falls back "
             "to a private pool over the unified virtual id space)."
         )
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + EAGLE/EAGLE3 supports a linear "
-            "draft chain only (--speculative-eagle-topk in {None, 1}); "
-            "tree verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
-        )
         # None refuses EXPLICITLY: an unset backend would default to
         # fa3/flashinfer later in resolution, silently leaving the audited
         # envelope. MLA hosts verify on the MLA family; MHA hosts on the
@@ -349,13 +343,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "got --speculative-draft-attention-backend="
             f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
             "to inherit the target's."
-        )
-    if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.speculative_eagle_topk in (None, 1), (
-            "--enable-unified-memory + DSPARK supports a linear draft "
-            "chain only (--speculative-eagle-topk in {None, 1}); tree "
-            "verify is not audited for the unified pool. Got "
-            f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
         )
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     if cfg.speculative_algorithm == "DFLASH":
