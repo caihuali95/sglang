@@ -70,6 +70,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -97,8 +98,13 @@ class KVIndexTable(msgspec.Struct, frozen=True):
     def sliding_window_read_ids(self) -> torch.Tensor:
         """Which array a sliding-window gather reads: the parallel swa array
         when translated, else the full-attention array, which the caller maps
-        through the pool's own full->swa map."""
-        return self.sliding_window_ids if self.is_translated else self.ids
+        through the pool's own full->swa map. A translated view without a
+        swa side (a dense fused draft) reads from the one array too."""
+        if not self.is_translated:
+            return self.ids
+        return (
+            self.sliding_window_ids if self.sliding_window_ids is not None else self.ids
+        )
 
 
 class KVIndexTranslator:
@@ -117,13 +123,23 @@ class KVIndexTranslator:
         self.page_size = page_size
         self.device = device
 
-        self.is_translating = (
+        is_unified_target = (
             isinstance(
                 token_to_kv_pool_allocator,
                 (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
+        # Fused draft KV: the draft runner reads and writes the draft parts of
+        # the target's entries, so it translates through the HOST allocator.
+        # The identity check keeps a draft pool bound to a foreign allocator,
+        # and every private-pool draft, on the strict passthrough: their
+        # virtual-indexed buffers must never be translated.
+        host_allocator = fused_draft_host_allocator(token_to_kv_pool)
+        is_fused_draft = (
+            host_allocator is not None and host_allocator is token_to_kv_pool_allocator
+        )
+        self.is_translating = is_unified_target or is_fused_draft
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._full_v2p_table = alloc.full_v2p_page_table
@@ -137,7 +153,17 @@ class KVIndexTranslator:
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
-            if isinstance(alloc, UnifiedSWATokenToKVPoolAllocator):
+            # The swa rail follows the POOL SHAPE: the target's own kvcache
+            # routes window layers to the swa sub-pool whenever the allocator
+            # has one; a fused draft pool does so only when it is SWA-shaped,
+            # and a dense one has no second id space at all.
+            routes_window_layers = is_unified_target or isinstance(
+                token_to_kv_pool, BaseSWAKVPool
+            )
+            if (
+                isinstance(alloc, UnifiedSWATokenToKVPoolAllocator)
+                and routes_window_layers
+            ):
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_write_loc_from_full = self._swa_write_loc_unified
             else:
