@@ -2537,7 +2537,15 @@ def update_sliding_window_buffer(
         total_tokens=window_kv_indices.numel(),
         out=window_kv_indices,
         kv_start_idx=window_kv_start_idx,
-        sliding_window=translator.reads_are_translated,
+        # BOTH conditions, as flashinfer's `use_swa_source` does: the swa v2p
+        # exists only when the POOL has an swa side. A model can declare a
+        # sliding window while its unified pool is full+mamba (Qwen3.5-9B), and
+        # asking for the swa stream there trips
+        # "sliding_window on a pool with no swa sub-pool" during graph capture.
+        sliding_window=(
+            translator.reads_are_translated
+            and isinstance(token_to_kv_pool, BaseSWAKVPool)
+        ),
     )
     if not translated and isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_last_index = window_kv_indptr[-1]

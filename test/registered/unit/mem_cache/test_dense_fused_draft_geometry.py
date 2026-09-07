@@ -454,5 +454,6 @@ class TestFusedMLAHost(unittest.TestCase):
             dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), entry
         )
 
+
 if __name__ == "__main__":
     unittest.main()

@@ -1168,6 +1168,7 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(sizes.swa_max_total_num_tokens, 3072)
         self.assertEqual(sizes.c4_state_pool_size, 0)
 
+
 class TestFusedDraftPricing(unittest.TestCase):
     """Fused draft KV: the boot solve must price the EXACT fused entry.
 
