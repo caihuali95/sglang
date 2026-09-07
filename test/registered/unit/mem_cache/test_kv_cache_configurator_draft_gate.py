@@ -162,7 +162,7 @@ class TestDraftBindingDispatch(CustomTestCase):
     def _swa_allocator(self, *, with_draft_region: bool, n_full=32, n_swa=16):
         region = (
             DenseDraftRegion(
-                layer_num=1, head_num=1, head_dim=3, store_dtype=torch.bfloat16
+                layer_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
             )
             if with_draft_region
             else None
