@@ -344,6 +344,7 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             f"{cfg.speculative_draft_attention_backend!r}. Leave it unset "
             "to inherit the target's."
         )
+    if cfg.speculative_algorithm == "DSPARK":
         _assert_spec_verify_backends(server_args, algorithm="DSPARK")
     if cfg.speculative_algorithm == "DFLASH":
         # DFLASH targets are MHA-family; verify (target and the draft's own
