@@ -37,10 +37,10 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.mem_cache import kv_index_translator
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.multi_ended_allocator import (
+from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWATokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,

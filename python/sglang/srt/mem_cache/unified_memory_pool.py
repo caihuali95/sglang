@@ -294,9 +294,9 @@ class MambaSubPoolSpec(SubPoolSpec):
     def __post_init__(self):
         super().__post_init__()
         assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
-        assert (
-            self.draft_region is None
-        ), "mamba state pages carry no fused draft region yet"
+        assert self.draft_region is None, (
+            "mamba state pages carry no fused draft region yet"
+        )
 
     def conv_row_bytes(self, idx: int) -> int:
         return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
@@ -539,9 +539,9 @@ class UnifiedKVPool:
         Kind-agnostic: any spec that resolves a `draft_region` also lays the
         draft parts out in its `layout()`."""
         s = self._specs_by_name[name]
-        assert (
-            s.draft_region is not None
-        ), f"sub-pool {name!r} carries no fused draft region"
+        assert s.draft_region is not None, (
+            f"sub-pool {name!r} carries no fused draft region"
+        )
         return s
 
     def max_slots(self, name: str) -> int:

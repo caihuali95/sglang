@@ -134,9 +134,7 @@ class TestDraftKVProfile(CustomTestCase):
             head_dim=64,
             v_head_dim=32,
         )
-        with patch(
-            "sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None
-        ):
+        with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
             profile = draft_kv_profile(mc, num_layers=1, attn_tp_size=2)
         self.assertEqual(
             profile.full, DraftKVGeometry(head_num=4, head_dim=64, v_head_dim=32)

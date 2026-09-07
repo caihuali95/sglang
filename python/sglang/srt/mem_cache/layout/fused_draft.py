@@ -135,7 +135,6 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
         return cls(runners=tuple(runners), full=full)
 
 
-
 class DraftKVGeometry(msgspec.Struct, frozen=True, kw_only=True):
     """Per-GPU K/V row geometry of one kind of draft attention layer."""
 
@@ -222,8 +221,7 @@ def _runner_layer_counts(
         )
     if num_runners > profile.num_depths:
         return None, (
-            f"{num_runners} draft runners exceed the head's "
-            f"{profile.num_depths} depths"
+            f"{num_runners} draft runners exceed the head's {profile.num_depths} depths"
         )
     swa = set(profile.swa_layer_ids)
     return [(0, 1) if r in swa else (1, 0) for r in range(num_runners)], None

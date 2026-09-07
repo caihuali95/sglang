@@ -21,15 +21,15 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.layout.page_major import (
     ENTRY_ALIGN_BYTES,
     ROW_ALIGN_BYTES,
     align_entry_bytes,
     align_part_offset,
-)
-from sglang.srt.mem_cache.layout.fused_draft import (
-    DenseDraftRegion,
-    FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
 from sglang.srt.mem_cache.unified_memory_pool import (
@@ -72,7 +72,6 @@ def _placement(region, num_runners=1):
     return FusedDraftPlacement.from_counts(
         full_counts=[region.layer_num] * num_runners, full=region
     )
-
 
 
 class TestFusedSpecMath(unittest.TestCase):
@@ -398,10 +397,10 @@ class TestFusedMLAHost(unittest.TestCase):
         through the mamba allocator's full-side v2p, exactly as on the SWA
         host. A kind-specific probe regression here silently reverts the
         draft to passthrough (raw virtual ids into the views)."""
-        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-        from sglang.srt.mem_cache.multi_ended_allocator import (
+        from sglang.srt.mem_cache.allocator.unified_mamba import (
             UnifiedMambaTokenToKVPoolAllocator,
         )
+        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 
         pool = self._pool()
 
@@ -453,6 +452,7 @@ class TestFusedMLAHost(unittest.TestCase):
         self.assertEqual(
             dp.k_buffer[0].stride(0) * dp.k_buffer[0].element_size(), entry
         )
+
 
 if __name__ == "__main__":
     unittest.main()
