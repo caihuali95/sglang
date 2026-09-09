@@ -71,19 +71,23 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-_HOST_NAMES = ("full",)
+_HOST_NAMES = ("full", "swa")
 
 
 class RunnerSlots(msgspec.Struct, frozen=True, kw_only=True):
     """One draft runner's slots inside each host region, as ``(start, count)``."""
 
     full: Tuple[int, int] = (0, 0)
+    swa: Tuple[int, int] = (0, 0)
 
     def range_for(self, host: str) -> range:
         if host == "full":
             start, count = self.full
-            return range(start, start + count)
-        return range(0)
+        elif host == "swa":
+            start, count = self.swa
+        else:
+            return range(0)
+        return range(start, start + count)
 
 
 class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
@@ -97,6 +101,7 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
 
     runners: Tuple[RunnerSlots, ...]
     full: Optional[DenseDraftRegion] = None
+    swa: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         assert len(self.runners) > 0, "a placement needs at least one draft runner"
@@ -114,6 +119,8 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
     def region(self, host: str) -> Optional[DenseDraftRegion]:
         if host == "full":
             return self.full
+        if host == "swa":
+            return self.swa
         return None
 
     def hosts(self) -> Tuple[str, ...]:
@@ -124,15 +131,25 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
 
     @classmethod
     def from_counts(
-        cls, *, full_counts: Sequence[int], full: Optional[DenseDraftRegion]
+        cls,
+        *,
+        full_counts: Sequence[int],
+        full: Optional[DenseDraftRegion],
+        swa_counts: Optional[Sequence[int]] = None,
+        swa: Optional[DenseDraftRegion] = None,
     ) -> "FusedDraftPlacement":
         """Tile each host's region with the runners' layer counts, in runner order."""
+        if swa_counts is None:
+            swa_counts = [0] * len(full_counts)
         runners = []
-        start = 0
-        for count in full_counts:
-            runners.append(RunnerSlots(full=(start, count)))
-            start += count
-        return cls(runners=tuple(runners), full=full)
+        full_start = swa_start = 0
+        for full_count, swa_count in zip(full_counts, swa_counts, strict=True):
+            runners.append(
+                RunnerSlots(full=(full_start, full_count), swa=(swa_start, swa_count))
+            )
+            full_start += full_count
+            swa_start += swa_count
+        return cls(runners=tuple(runners), full=full, swa=swa)
 
 
 
@@ -149,12 +166,16 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
 
     ``num_depths`` > 1 marks a per-depth head (one transformer block per MTP
     depth, served by one runner each under multi-layer EAGLE); otherwise
-    every runner serves all ``num_layers`` layers.
+    every runner serves all ``num_layers`` layers. ``swa`` is the row
+    geometry of the ``swa_layer_ids`` layers and ``sliding_window_size`` the
+    window they read back.
     """
 
     num_layers: int
     full: DraftKVGeometry
     swa_layer_ids: Tuple[int, ...] = ()
+    swa: Optional[DraftKVGeometry] = None
+    sliding_window_size: Optional[int] = None
     num_depths: int = 1
     num_state_layers: int = 0
 
@@ -185,6 +206,14 @@ def draft_kv_profile(
     if num_depths is None:
         num_depths = mc.num_nextn_predict_layers
     mambaish = mambaish_config(mc)
+    swa_layer_ids = draft_swa_layer_ids(mc)
+    swa = None
+    if swa_layer_ids:
+        swa = DraftKVGeometry(
+            head_num=int(mc.get_swa_num_kv_heads(attn_tp_size)),
+            head_dim=int(mc.swa_head_dim),
+            v_head_dim=int(mc.swa_v_head_dim),
+        )
     return DraftKVProfile(
         num_layers=int(num_layers),
         full=DraftKVGeometry(
@@ -192,7 +221,11 @@ def draft_kv_profile(
             head_dim=int(mc.head_dim),
             v_head_dim=int(mc.v_head_dim),
         ),
-        swa_layer_ids=draft_swa_layer_ids(mc),
+        swa_layer_ids=swa_layer_ids,
+        swa=swa,
+        sliding_window_size=(
+            None if mc.sliding_window_size is None else int(mc.sliding_window_size)
+        ),
         num_depths=1 if num_depths is None else int(num_depths),
         num_state_layers=(
             0 if mambaish is None else len(mambaish.mamba2_cache_params.layers)
@@ -202,10 +235,12 @@ def draft_kv_profile(
 
 class FusedDraftDecision(msgspec.Struct, frozen=True, kw_only=True):
     """`place_fused_draft`'s answer: the placement, or why the draft keeps a
-    private pool. Neither means fusion simply does not apply."""
+    private pool. Neither means fusion simply does not apply. ``note`` says
+    why a placed layer kind did not get its first-choice host."""
 
     placement: Optional[FusedDraftPlacement] = None
     declined: Optional[str] = None
+    note: Optional[str] = None
 
 
 def _runner_layer_counts(
@@ -229,6 +264,52 @@ def _runner_layer_counts(
     return [(0, 1) if r in swa else (1, 0) for r in range(num_runners)], None
 
 
+def _window_host_reason(
+    *, window: Optional[int], target_window: Optional[int], host_names: Sequence[str]
+) -> Optional[str]:
+    """Why a sliding-window draft layer cannot ride in the host's swa
+    sub-pool, or None when it can: the swa sub-pool keeps only the target's
+    window, so the draft must read back no further than that."""
+    if "swa" not in host_names:
+        return "the host has no swa sub-pool"
+    if window is None:
+        return "the draft declares no sliding window size"
+    if target_window is None:
+        return "the target declares no sliding window size"
+    if window > target_window:
+        return f"its window {window} exceeds the target's window {target_window}"
+    return None
+
+
+def _asymmetric_rows_declined(
+    geometry: Optional[DraftKVGeometry], asymmetric_rows_ok: bool
+) -> Optional[str]:
+    if geometry is None or geometry.head_dim == geometry.v_head_dim:
+        return None
+    if asymmetric_rows_ok:
+        return None
+    return (
+        "the draft's K/V rows are asymmetric "
+        f"(head_dim={geometry.head_dim}, v_head_dim={geometry.v_head_dim}) "
+        "and a resolved attention backend does not carry v_head_dim through to "
+        "the kernel"
+    )
+
+
+def _region(
+    geometry: DraftKVGeometry, layer_num: int, store_dtype
+) -> Optional[DenseDraftRegion]:
+    if layer_num == 0:
+        return None
+    return DenseDraftRegion(
+        layer_num=layer_num,
+        head_num=geometry.head_num,
+        head_dim=geometry.head_dim,
+        v_head_dim=geometry.v_head_dim,
+        store_dtype=store_dtype,
+    )
+
+
 def place_fused_draft(
     *,
     profile: DraftKVProfile,
@@ -236,12 +317,15 @@ def place_fused_draft(
     host_names: Sequence[str],
     store_dtype: torch.dtype,
     asymmetric_rows_ok: bool,
+    target_window: Optional[int] = None,
 ) -> FusedDraftDecision:
     """Assign every draft layer of every runner to the host sub-pool whose
     lifetime covers what the layer reads: a full-attention layer rides in
-    ``"full"``. A layer kind no host arm serves declines the whole draft to
-    its private pool, as do asymmetric K/V rows unless the caller vouches
-    that every attention backend carries v_head_dim through to the kernel."""
+    ``"full"``; a sliding-window layer rides in ``"swa"`` when the host has
+    one and the draft's window fits inside the target's, else in ``"full"``.
+    A layer kind no host arm serves declines the whole draft to its private
+    pool, as do asymmetric K/V rows unless the caller vouches that every
+    attention backend carries v_head_dim through to the kernel."""
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
@@ -252,34 +336,45 @@ def place_fused_draft(
                 "layer(s) of its own, which no host state pool carries"
             )
         )
-    num_swa = sum(swa for _, swa in counts)
-    if num_swa:
-        return FusedDraftDecision(
-            declined=(
-                f"the draft has {num_swa} SWA layer(s) of its own, which the "
-                "fused dense pool cannot serve"
-            )
-        )
-    geometry = profile.full
-    if geometry.head_dim != geometry.v_head_dim and not asymmetric_rows_ok:
-        return FusedDraftDecision(
-            declined=(
-                "the draft's K/V rows are asymmetric "
-                f"(head_dim={geometry.head_dim}, v_head_dim={geometry.v_head_dim}) "
-                "and a resolved attention backend does not carry v_head_dim "
-                "through to the kernel"
-            )
-        )
+    for geometry in (profile.full, profile.swa):
+        reason = _asymmetric_rows_declined(geometry, asymmetric_rows_ok)
+        if reason is not None:
+            return FusedDraftDecision(declined=reason)
     assert "full" in host_names, host_names
-    full = DenseDraftRegion(
-        layer_num=sum(full for full, _ in counts),
-        head_num=geometry.head_num,
-        head_dim=geometry.head_dim,
-        v_head_dim=geometry.v_head_dim,
-        store_dtype=store_dtype,
-    )
-    return FusedDraftDecision(
-        placement=FusedDraftPlacement.from_counts(
-            full_counts=[full for full, _ in counts], full=full
+
+    num_full = sum(full for full, _ in counts)
+    num_swa = sum(swa for _, swa in counts)
+    full_geometry = profile.full
+    note = None
+    if num_swa:
+        assert profile.swa is not None, "a draft with window layers has a swa geometry"
+        reason = _window_host_reason(
+            window=profile.sliding_window_size,
+            target_window=target_window,
+            host_names=host_names,
         )
+        if reason is not None:
+            # One region holds one row geometry: the fold only works when the
+            # full sub-pool need not mix two.
+            if num_full and profile.swa != profile.full:
+                return FusedDraftDecision(
+                    declined=(
+                        f"{reason}, and its window layers' rows differ from its "
+                        "full layers' rows, so they cannot share the full sub-pool"
+                    )
+                )
+            note = (
+                f"the draft's {num_swa} sliding-window layer(s) ride in the "
+                f"full sub-pool: {reason}"
+            )
+            counts = [(full + swa, 0) for full, swa in counts]
+            if not num_full:
+                full_geometry = profile.swa
+            num_full, num_swa = num_full + num_swa, 0
+    placement = FusedDraftPlacement.from_counts(
+        full_counts=[full for full, _ in counts],
+        full=_region(full_geometry, num_full, store_dtype),
+        swa_counts=[swa for _, swa in counts],
+        swa=None if num_swa == 0 else _region(profile.swa, num_swa, store_dtype),
     )
+    return FusedDraftDecision(placement=placement, note=note)

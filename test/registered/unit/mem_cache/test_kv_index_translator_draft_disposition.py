@@ -45,7 +45,10 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+from sglang.srt.mem_cache.unified_draft_pool import (
+    UnifiedDraftKVPool,
+    UnifiedDraftSWAKVPool,
+)
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -78,7 +81,7 @@ class _FakeUnifiedSWAKVPool:
         self._swa_allocator = swa_allocator
 
 
-def _build(n_full=32, n_swa=16):
+def _build(n_full=32, n_swa=16, *, swa_region=None):
     full_spec = MHASubPoolSpec(
         name="full",
         layer_num=2,
@@ -97,6 +100,7 @@ def _build(n_full=32, n_swa=16):
         head_dim=4,
         store_dtype=torch.bfloat16,
         grow_direction="up",
+        draft_region=swa_region,
     )
     total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
     pool = UnifiedKVPool(
@@ -106,7 +110,10 @@ def _build(n_full=32, n_swa=16):
         enable_memory_saver=False,
         page_size=_PS,
         fused_draft=FusedDraftPlacement.from_counts(
-            full_counts=[1], full=full_spec.draft_region
+            full_counts=[1],
+            full=full_spec.draft_region,
+            swa_counts=[0 if swa_region is None else 1],
+            swa=swa_region,
         ),
     )
     kvcache = _FakeUnifiedSWAKVPool(pool)
@@ -218,6 +225,58 @@ class TestKVIndexTranslatorDraftDisposition(unittest.TestCase):
         self.assertIsNotNone(tswa)
         self.assertIsNot(tswa, tfb.out_cache_loc)
         self.assertTrue(torch.equal(tswa, allocator.translate_loc_from_full_to_swa(tv)))
+
+    def test_swa_shaped_fused_draft_rides_the_target_swa_rail(self):
+        """A draft with window layers binds the swa sub-pool, so its runner
+        gets the same swa rail as the target: the derived write loc and the
+        window read table are the target's, byte for byte."""
+        swa_region = DenseDraftRegion(
+            layer_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+        )
+        pool, allocator, kvcache, _ = _build(swa_region=swa_region)
+        composite = UnifiedDraftSWAKVPool(
+            unified_buffer=pool,
+            host_allocator=allocator,
+            page_size=_PS,
+            full_layer_slots={0: 0},
+            swa_layer_slots={1: 0},
+        )
+        src = _source(allocator, composite)
+        tgt = _source(allocator, kvcache)
+        self.assertTrue(src.is_translating)
+        self.assertIsNotNone(src._swa_v2p_table)
+        v = allocator.alloc(2 * _PS)
+        self.assertIsNotNone(v)
+        fb = SimpleNamespace(out_cache_loc=v)
+        src.rebind_write_loc(fb)
+        self.assertTrue(
+            torch.equal(
+                src.sliding_window_write_loc_for(fb.out_cache_loc),
+                allocator.translate_loc_from_full_to_swa(v),
+            )
+        )
+        rt = torch.zeros((2, 8), dtype=torch.int32)
+        rt[0, : v.numel()] = v.to(torch.int32)
+        rpi = torch.tensor([0], dtype=torch.int64)
+        seq = torch.tensor([2 * _PS], dtype=torch.int64)
+        draft_view = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=composite,
+            page_size=_PS,
+            device=_DEV,
+        ).build_index_table(req_pool_indices=rpi, seq_lens=seq, max_pages=2)
+        target_view = KVIndexTranslator(
+            req_to_token=rt,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kvcache,
+            page_size=_PS,
+            device=_DEV,
+        ).build_index_table(req_pool_indices=rpi, seq_lens=seq, max_pages=2)
+        self.assertIsNotNone(draft_view.sliding_window_ids)
+        self.assertTrue(
+            torch.equal(draft_view.sliding_window_ids, target_view.sliding_window_ids)
+        )
 
     def test_private_pool_draft_stays_a_strict_passthrough(self):
         _, allocator, _, _ = _build()

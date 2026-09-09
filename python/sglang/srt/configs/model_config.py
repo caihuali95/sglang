@@ -813,6 +813,10 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "InklingForConditionalGeneration"
         ):
             self.hf_config.architectures[0] = "InklingForConditionalGenerationMTP"
+            if self.hf_text_config.mtp_local_layer_ids:
+                # A banded MTP depth is a sliding-window block with its own
+                # extent (InklingMTPLayer); the trunk's window is only its default.
+                self.sliding_window_size = self.hf_text_config.mtp_local_extent
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"

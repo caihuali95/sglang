@@ -308,9 +308,9 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         _mc = model_config_of(server_args)
         assert _mc.is_hybrid_swa or mambaish_config(_mc) is not None, (
             "--enable-unified-memory + EAGLE/EAGLE3 requires a unified "
-            "target (hybrid-SWA or a mamba hybrid): the draft's KV lives "
-            "fused inside the full-attention page envelope (or falls back "
-            "to a private pool over the unified virtual id space)."
+            "target (hybrid-SWA or a mamba hybrid): the draft's KV is placed "
+            "inside the target's sub-pool entries (or falls back to a private "
+            "pool over the unified virtual id space)."
         )
         # None refuses EXPLICITLY: an unset backend would default to
         # fa3/flashinfer later in resolution, silently leaving the audited

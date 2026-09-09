@@ -37,6 +37,7 @@ import torch
 
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache import unified_draft_pool
+from sglang.srt.mem_cache.layout import fused_draft as fused_draft_layout
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -44,7 +45,10 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedSWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+from sglang.srt.mem_cache.unified_draft_pool import (
+    UnifiedDraftKVPool,
+    UnifiedDraftSWAKVPool,
+)
 from sglang.srt.mem_cache.unified_memory_pool import MHASubPoolSpec, UnifiedKVPool
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -159,7 +163,9 @@ _PS = 2
 
 
 class TestDraftBindingDispatch(CustomTestCase):
-    def _swa_allocator(self, *, with_draft_region: bool, n_full=32, n_swa=16):
+    def _swa_allocator(
+        self, *, with_draft_region: bool, n_full=32, n_swa=16, window_draft=False
+    ):
         region = (
             DenseDraftRegion(
                 layer_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
@@ -167,6 +173,8 @@ class TestDraftBindingDispatch(CustomTestCase):
             if with_draft_region
             else None
         )
+        # A window draft's region rides in the swa sub-pool instead.
+        full_region, swa_region = (None, region) if window_draft else (region, None)
         full_spec = MHASubPoolSpec(
             name="full",
             layer_num=2,
@@ -174,7 +182,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             head_dim=4,
             store_dtype=torch.bfloat16,
             grow_direction="down",
-            draft_region=region,
+            draft_region=full_region,
         )
         swa_spec = MHASubPoolSpec(
             name="swa",
@@ -183,6 +191,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             head_dim=4,
             store_dtype=torch.bfloat16,
             grow_direction="up",
+            draft_region=swa_region,
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
         pool = UnifiedKVPool(
@@ -192,7 +201,12 @@ class TestDraftBindingDispatch(CustomTestCase):
             enable_memory_saver=False,
             page_size=_PS,
             fused_draft=(
-                FusedDraftPlacement.from_counts(full_counts=[1], full=region)
+                FusedDraftPlacement.from_counts(
+                    full_counts=[0 if window_draft else 1],
+                    full=full_region,
+                    swa_counts=[1 if window_draft else 0],
+                    swa=swa_region,
+                )
                 if region is not None
                 else None
             ),
@@ -328,6 +342,25 @@ class TestDraftBindingDispatch(CustomTestCase):
         )
         self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
         self.assertEqual(pools.req_to_token_pool.kind, "private-compact")
+
+    def test_window_draft_binds_the_swa_composite(self):
+        """MiMoV2MTP shape: the runner's one layer is a window layer placed in
+        the swa sub-pool, so it binds the SWA-shaped composite (the backends
+        key their swa rail on it), with no full side at all."""
+        alloc = self._swa_allocator(with_draft_region=True, window_draft=True)
+        with patch.object(
+            fused_draft_layout, "draft_swa_layer_ids", return_value=(0,)
+        ):
+            pools = self._run(
+                algorithm=SpeculativeAlgorithm.EAGLE3,
+                alloc=alloc,
+                max_total_num_tokens=alloc.size_full,
+            )
+        pool = pools.token_to_kv_pool
+        self.assertIsInstance(pool, UnifiedDraftSWAKVPool)
+        self.assertEqual(pool.layers_mapping, {0: (0, True)})
+        self.assertIsNone(pool.full_kv_pool)
+        self.assertIs(pools.token_to_kv_pool_allocator, alloc)
 
     def test_eagle_draft_without_a_placement_falls_back_to_the_private_arm(self):
         """Target boot declines a placement for legitimate configurations (a

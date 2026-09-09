@@ -992,6 +992,9 @@ class KVCacheConfigurator:
             num_runners=self._num_draft_runners(),
             host_names=self._unified_host_names(),
             asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
+            # The swa sub-pool keeps only the target's window, so a draft
+            # window layer rides there only if it reads back no further.
+            target_window=self.model_config.sliding_window_size,
             # Drafts store KV in the same server kv dtype as the target.
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
         )
@@ -1021,6 +1024,8 @@ class KVCacheConfigurator:
                 logger.warning("fused draft KV disabled: %s", decision.declined)
             return None
         placement = decision.placement
+        if decision.note is not None:
+            logger.info("[unified-memory-pool] fused draft KV: %s", decision.note)
         for host in placement.hosts():
             region = placement.region(host)
             logger.info(
@@ -1061,6 +1066,19 @@ class KVCacheConfigurator:
             _store_dtype_for,
         )
 
+        if sub_pool_name == "swa":
+            assert self.is_hybrid_swa, sub_pool_name
+            geometry = self._unified_swa_head_geometry()
+            return MHASubPoolSpec(
+                name="swa",
+                layer_num=len(self.model_config.swa_attention_layer_ids),
+                head_num=geometry.swa_head_num,
+                head_dim=geometry.swa_head_dim,
+                v_head_dim=geometry.swa_v_head_dim,
+                store_dtype=_store_dtype_for(self.kv_cache_dtype),
+                grow_direction="up",
+                draft_region=region,
+            )
         assert sub_pool_name == "full", sub_pool_name
         # Hybrid-SWA hosts split layers on the ModelConfig wrapper; the
         # mambaish list is the conv/attention pairing and names ALL layers on

@@ -21,8 +21,12 @@ prices. Pinned:
     (one shared region would let the runners clobber each other's KV);
   - a per-depth head serves one depth per runner and needs one runner per
     depth;
-  - a draft with SWA or recurrent-state layers of its own declines: the
-    fused arm binds one dense pool over the host's full slots;
+  - a sliding-window draft layer rides in the host's swa sub-pool only when
+    the host has one and the draft's window fits inside the target's (the
+    swa sub-pool keeps only the target's window); otherwise it rides in the
+    full sub-pool, and a draft whose window rows differ from its full rows
+    cannot fold there;
+  - a draft with recurrent-state layers of its own declines;
   - an asymmetric-row draft fuses only when every resolved backend, the
     draft's included, carries v_head_dim through to the kernel, and the
     region then carries the V width the fused entry is priced from;
@@ -58,31 +62,47 @@ _HOSTS = ("full", "swa")
 _DTYPE = torch.bfloat16
 
 
+_SWA = DraftKVGeometry(head_num=2, head_dim=32, v_head_dim=32)
+
+
 def _profile(
     *,
     num_layers=1,
     swa_layer_ids=(),
+    swa=None,
+    sliding_window_size=None,
     num_depths=1,
     num_state_layers=0,
     head_dim=64,
     v_head_dim=64,
 ):
+    if swa_layer_ids and swa is None:
+        swa = _SWA
     return DraftKVProfile(
         num_layers=num_layers,
         full=DraftKVGeometry(head_num=4, head_dim=head_dim, v_head_dim=v_head_dim),
         swa_layer_ids=swa_layer_ids,
+        swa=swa,
+        sliding_window_size=sliding_window_size,
         num_depths=num_depths,
         num_state_layers=num_state_layers,
     )
 
 
-def _place(profile, num_runners=1, asymmetric_rows_ok=False):
+def _place(
+    profile,
+    num_runners=1,
+    asymmetric_rows_ok=False,
+    host_names=_HOSTS,
+    target_window=None,
+):
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
-        host_names=_HOSTS,
+        host_names=host_names,
         store_dtype=_DTYPE,
         asymmetric_rows_ok=asymmetric_rows_ok,
+        target_window=target_window,
     )
 
 
@@ -119,15 +139,88 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 9).placement)
 
-    def test_swa_state_and_asymmetric_drafts_decline(self):
+    def test_state_and_asymmetric_drafts_decline(self):
         for profile in (
-            _profile(swa_layer_ids=(0,)),
             _profile(num_state_layers=1),
             _profile(head_dim=64, v_head_dim=32),
+            _profile(
+                swa_layer_ids=(0,),
+                swa=DraftKVGeometry(head_num=2, head_dim=64, v_head_dim=32),
+            ),
         ):
             decision = _place(profile)
             self.assertIsNone(decision.placement)
             self.assertIsNotNone(decision.declined)
+
+    def test_window_layers_ride_in_the_swa_sub_pool_within_the_target_window(self):
+        # MiMoV2MTP shape: one window layer per runner, the target's own window.
+        decision = _place(
+            _profile(swa_layer_ids=(0,), sliding_window_size=128),
+            num_runners=3,
+            target_window=128,
+        )
+        placement = decision.placement
+        self.assertIsNotNone(placement, decision.declined)
+        self.assertIsNone(decision.note)
+        self.assertEqual(placement.hosts(), ("swa",))
+        self.assertIsNone(placement.full)
+        self.assertEqual(placement.swa.layer_num, 3)
+        self.assertEqual(placement.swa.head_num, _SWA.head_num)
+        self.assertEqual(placement.swa.head_dim, _SWA.head_dim)
+        for r in range(3):
+            self.assertEqual(placement.slots_for(r, "swa"), range(r, r + 1))
+            self.assertEqual(placement.slots_for(r, "full"), range(0))
+
+    def test_per_depth_head_places_each_depth_by_its_kind(self):
+        # Inkling shape: depth 1 is a local (window) block, depths 0 and 2 full.
+        decision = _place(
+            _profile(
+                num_layers=8, num_depths=8, swa_layer_ids=(1,), sliding_window_size=64
+            ),
+            num_runners=3,
+            target_window=128,
+        )
+        placement = decision.placement
+        self.assertIsNotNone(placement, decision.declined)
+        self.assertEqual(placement.full.layer_num, 2)
+        self.assertEqual(placement.swa.layer_num, 1)
+        self.assertEqual(placement.slots_for(0, "full"), range(0, 1))
+        self.assertEqual(placement.slots_for(1, "swa"), range(0, 1))
+        self.assertEqual(placement.slots_for(1, "full"), range(0))
+        self.assertEqual(placement.slots_for(2, "full"), range(1, 2))
+
+    def test_window_layers_fall_back_to_the_full_sub_pool(self):
+        """A window wider than the target's, an undeclared window, or a host
+        without an swa sub-pool sends the window layers to the full sub-pool
+        with their own row geometry; the decision says why."""
+        for kwargs in (
+            dict(sliding_window_size=256, target_window=128),
+            dict(sliding_window_size=None, target_window=128),
+            dict(sliding_window_size=64, target_window=None),
+            dict(
+                sliding_window_size=64,
+                target_window=128,
+                host_names=("full", "mamba"),
+            ),
+        ):
+            profile = _profile(
+                swa_layer_ids=(0,), sliding_window_size=kwargs.pop("sliding_window_size")
+            )
+            decision = _place(profile, num_runners=2, **kwargs)
+            self.assertIsNotNone(decision.placement, decision.declined)
+            self.assertIsNotNone(decision.note)
+            self.assertIsNone(decision.placement.swa)
+            self.assertEqual(decision.placement.full.layer_num, 2)
+            self.assertEqual(decision.placement.full.head_dim, _SWA.head_dim)
+            self.assertEqual(decision.placement.slots_for(1, "full"), range(1, 2))
+
+    def test_a_fold_cannot_mix_two_row_geometries(self):
+        decision = _place(
+            _profile(num_layers=2, swa_layer_ids=(1,), sliding_window_size=256),
+            target_window=128,
+        )
+        self.assertIsNone(decision.placement)
+        self.assertIn("cannot share", decision.declined)
 
     def test_asymmetric_rows_fuse_with_their_v_width_when_backends_allow(self):
         placement = _place(
@@ -212,6 +305,8 @@ class TestFusedDraftPlacement(CustomTestCase):
             FusedDraftPlacement(runners=(RunnerSlots(full=(0, 1)),), full=region)
         with self.assertRaises(AssertionError):
             FusedDraftPlacement(runners=(RunnerSlots(full=(0, 1)),), full=None)
+        with self.assertRaises(AssertionError):
+            FusedDraftPlacement(runners=(RunnerSlots(swa=(0, 1)),), full=region)
 
 
 if __name__ == "__main__":

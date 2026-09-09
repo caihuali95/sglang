@@ -1224,6 +1224,27 @@ class TestFusedDraftPricing(unittest.TestCase):
         self.assertEqual(cfg._draft_full_layers_num, 0)
         self.assertEqual(cfg._cell_size, self._expected_cell(cfg, fused_entry))
 
+    def test_fused_swa_entry_replaces_the_swa_terms(self):
+        """A draft placed in the swa sub-pool is priced through the fused swa
+        entry: the separate per-layer swa draft term must go, or the draft is
+        charged twice (once inside the entry, once as a private pool)."""
+        mr, cfg = self._make(fused_entry=None, draft_layers=2)
+        mr.spec_aux_config.eagle_draft_swa_num_layers = 2
+        mr.fused_entry_bytes.side_effect = lambda name: 4_321 if name == "swa" else None
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                HybridSWAPoolConfigurator,
+            )
+
+            fused = HybridSWAPoolConfigurator(mr)
+        self.assertEqual(fused._draft_swa_layers_num, 0)
+        self.assertEqual(fused._draft_full_layers_num, 0)
+        self.assertEqual(
+            fused._cell_size,
+            fused._full_per_token * fused._full_layers_num
+            + fused._swa_full_tokens_ratio * 4_321,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

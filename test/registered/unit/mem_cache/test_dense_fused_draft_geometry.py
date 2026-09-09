@@ -31,7 +31,11 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.unified_draft_pool import UnifiedDraftKVPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.unified_draft_pool import (
+    UnifiedDraftKVPool,
+    UnifiedDraftSWAKVPool,
+)
 from sglang.srt.mem_cache.unified_memory_pool import (
     MambaSubPoolSpec,
     MHASubPoolSpec,
@@ -299,6 +303,97 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
             dp.get_contiguous_buf_infos()
         with self.assertRaises(NotImplementedError):
             dp.get_cpu_copy(one)
+
+
+class TestUnifiedDraftSWAKVPool(unittest.TestCase):
+    """A draft with window layers binds one dense side per host sub-pool and
+    routes per layer like the target's composite: a window layer's write
+    needs the swa loc and lands in the swa entry's draft part, never in the
+    full entry."""
+
+    PS = 2
+    PAGES = 8
+
+    def _pool(self):
+        full_region = _draft_region()
+        swa_region = DenseDraftRegion(
+            layer_num=1, head_num=1, head_dim=8, store_dtype=_DTYPE
+        )
+        full = _host_spec(full_region)
+        swa = MHASubPoolSpec(
+            name="swa",
+            layer_num=1,
+            head_num=2,
+            head_dim=4,
+            store_dtype=_DTYPE,
+            grow_direction="up",
+            draft_region=swa_region,
+        )
+        total = self.PAGES * self.PS * (full.entry_bytes() + swa.entry_bytes())
+        return UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, swa],
+            device=_DEV,
+            enable_memory_saver=False,
+            page_size=self.PS,
+            fused_draft=FusedDraftPlacement.from_counts(
+                full_counts=[1], full=full_region, swa_counts=[1], swa=swa_region
+            ),
+        )
+
+    def _draft_pool(self, pool):
+        return UnifiedDraftSWAKVPool(
+            unified_buffer=pool,
+            host_allocator=object(),
+            page_size=self.PS,
+            full_layer_slots={0: 0},
+            swa_layer_slots={1: 0},
+        )
+
+    def test_routes_each_layer_to_its_side(self):
+        pool = self._pool()
+        dp = self._draft_pool(pool)
+        self.assertEqual(dp.layers_mapping, {0: (0, False), 1: (0, True)})
+        dk, _ = pool.build_dense_draft_views("swa")
+        self.assertEqual(dp.get_key_buffer(1).data_ptr(), dk[0].data_ptr())
+        self.assertEqual(dp.get_key_buffer(1).shape[1:], (1, 8))
+        self.assertEqual(dp.get_key_buffer(0).shape[1:], (1, 24))
+        self.assertEqual(dp.swa_layer_nums, 1)
+        self.assertEqual(dp.full_layer_nums, 1)
+
+    def test_a_window_only_draft_answers_its_own_v_width(self):
+        # MiMoV2MTP: no full layer at all; the composite still works.
+        pool = self._pool()
+        swa_only = UnifiedDraftSWAKVPool(
+            unified_buffer=pool,
+            host_allocator=object(),
+            page_size=self.PS,
+            full_layer_slots={},
+            swa_layer_slots={0: 0},
+        )
+        self.assertIsNone(swa_only.full_kv_pool)
+        self.assertEqual(swa_only.get_v_head_dim(), 8)
+        self.assertEqual(swa_only.layers_mapping, {0: (0, True)})
+
+    def test_window_write_needs_the_swa_loc_and_stays_in_the_swa_entry(self):
+        pool = self._pool()
+        dp = self._draft_pool(pool)
+        layer = SimpleNamespace(layer_id=1)
+        k = torch.full((1, 1, 8), 3.0, dtype=_DTYPE)
+        v = torch.full((1, 1, 8), 5.0, dtype=_DTYPE)
+        loc = torch.tensor([6], dtype=torch.int64)
+        with self.assertRaises(AssertionError):
+            dp.set_kv_buffer(layer, KVWriteLoc(loc, id_space="kernel"), k, v)
+        raw = pool._raw
+        raw.zero_()
+        dp.set_kv_buffer(
+            layer, KVWriteLoc(loc, swa_loc=loc, id_space="kernel"), k, v
+        )
+        swa_entry = pool.spec("swa").entry_bytes()
+        lo = 6 * swa_entry + pool.spec("swa").draft_offset_in_entry()
+        nz = raw.nonzero()
+        self.assertGreater(nz.numel(), 0)
+        self.assertTrue(bool((nz >= lo).all() and (nz < 7 * swa_entry).all()))
 
 
 def _mla_host_spec(draft_region=None):
