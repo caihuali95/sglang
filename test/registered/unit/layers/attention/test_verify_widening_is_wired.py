@@ -47,6 +47,8 @@ so they materialize no table to under-fill and no widening to drop.
 
 import ast
 import pathlib
+import shutil
+import tempfile
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -166,6 +168,19 @@ def _unwidened_captured_builds(path: pathlib.Path):
 
 
 class TestVerifyWideningIsWired(unittest.TestCase):
+    def _probe(self, src):
+        """Write a throwaway module for the detectors to walk.
+
+        The eval container bind-mounts the source tree read-only, so a path
+        built from the test id alone lands in an unwritable CWD and raises
+        OSError there while passing on a developer checkout.
+        """
+        scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, scratch, ignore_errors=True)
+        tmp = pathlib.Path(scratch) / (self.id().replace(".", "_") + ".py")
+        tmp.write_text(src)
+        return tmp
+
     def test_widened_table_is_consumed(self):
         """A widened table that is never read cannot reach a kernel, so the
         verify tail silently falls back to the un-widened prefix."""
@@ -210,15 +225,11 @@ class TestVerifyWideningIsWired(unittest.TestCase):
             "        )\n"
             "        self.u.update(kv_view=kv_view)\n"
         )
-        tmp = pathlib.Path(self.id().replace(".", "_") + ".py")
-        tmp.write_text(src)
-        try:
-            self.assertEqual(
-                _unwidened_captured_builds(tmp),
-                [("init_forward_metadata_out_graph", 3)],
-            )
-        finally:
-            tmp.unlink()
+        tmp = self._probe(src)
+        self.assertEqual(
+            _unwidened_captured_builds(tmp),
+            [("init_forward_metadata_out_graph", 3)],
+        )
 
     def test_guard_accepts_a_widened_captured_build(self):
         """...and must NOT fire once the delta is passed, else it is unfixable."""
@@ -229,12 +240,8 @@ class TestVerifyWideningIsWired(unittest.TestCase):
             "            seq_lens=fb.seq_lens, seq_len_delta=4\n"
             "        )\n"
         )
-        tmp = pathlib.Path(self.id().replace(".", "_") + ".py")
-        tmp.write_text(src)
-        try:
-            self.assertEqual(_unwidened_captured_builds(tmp), [])
-        finally:
-            tmp.unlink()
+        tmp = self._probe(src)
+        self.assertEqual(_unwidened_captured_builds(tmp), [])
 
     def test_guard_detects_an_unwidened_helper_hop(self):
         """A captured builder that reaches the translator through a helper
@@ -248,15 +255,11 @@ class TestVerifyWideningIsWired(unittest.TestCase):
             "    def init_forward_metadata_out_graph(self, fb):\n"
             "        self.kv_view = self._spec_table(seq_lens=fb.seq_lens)\n"
         )
-        tmp = pathlib.Path(self.id().replace(".", "_") + ".py")
-        tmp.write_text(src)
-        try:
-            self.assertEqual(
-                _unwidened_captured_builds(tmp),
-                [("init_forward_metadata_out_graph", 7)],
-            )
-        finally:
-            tmp.unlink()
+        tmp = self._probe(src)
+        self.assertEqual(
+            _unwidened_captured_builds(tmp),
+            [("init_forward_metadata_out_graph", 7)],
+        )
 
     def test_guard_detects_a_published_widening_nothing_reads(self):
         """Publishing to an attribute is only a consumption if something reads
@@ -266,15 +269,11 @@ class TestVerifyWideningIsWired(unittest.TestCase):
             "    def init_forward_metadata(self, fb):\n"
             "        self.spec_kv_view = self.t.widened_index_table(fb, 4)\n"
         )
-        tmp = pathlib.Path(self.id().replace(".", "_") + ".py")
-        tmp.write_text(src)
-        try:
-            self.assertEqual(
-                _dead_widenings(tmp),
-                [("init_forward_metadata", "self.spec_kv_view", 3)],
-            )
-        finally:
-            tmp.unlink()
+        tmp = self._probe(src)
+        self.assertEqual(
+            _dead_widenings(tmp),
+            [("init_forward_metadata", "self.spec_kv_view", 3)],
+        )
 
     def test_guard_accepts_a_published_widening_that_is_read(self):
         """...and must NOT fire once a consumer reads it, else it is unfixable."""
@@ -286,12 +285,8 @@ class TestVerifyWideningIsWired(unittest.TestCase):
             "    def call_begin_forward(self):\n"
             "        return self.backend.spec_kv_view\n"
         )
-        tmp = pathlib.Path(self.id().replace(".", "_") + ".py")
-        tmp.write_text(src)
-        try:
-            self.assertEqual(_dead_widenings(tmp), [])
-        finally:
-            tmp.unlink()
+        tmp = self._probe(src)
+        self.assertEqual(_dead_widenings(tmp), [])
 
     def test_guard_detects_a_dead_widening(self):
         """The detector itself must catch the shape it guards -- otherwise it
@@ -303,14 +298,10 @@ class TestVerifyWideningIsWired(unittest.TestCase):
             "        index_table = self.t.widened_index_table(fb, seq_len_delta=4)\n"
             "        self.u.update(kv_view=kv_view)\n"
         )
-        tmp = pathlib.Path(self.id().replace(".", "_") + ".py")
-        tmp.write_text(src)
-        try:
-            self.assertEqual(
-                _dead_widenings(tmp), [("init_forward_metadata", "index_table", 4)]
-            )
-        finally:
-            tmp.unlink()
+        tmp = self._probe(src)
+        self.assertEqual(
+            _dead_widenings(tmp), [("init_forward_metadata", "index_table", 4)]
+        )
 
 
 if __name__ == "__main__":
