@@ -7,7 +7,8 @@ allocation, one free, one whole-page relocation carry both. A region is not a
 geometry the host entry lays out at its `draft_offset_in_entry()`.
 """
 
-from typing import List, Optional, Sequence, Tuple
+import math
+from typing import List, Optional, Sequence, Tuple, Union
 
 import msgspec
 import torch
@@ -71,7 +72,51 @@ class DenseDraftRegion(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-_HOST_NAMES = ("full", "swa")
+class DraftStateGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """Per-GPU shapes of one recurrent-state layer of the draft: one conv
+    tensor per stream plus the temporal state, as `MambaPool.State` lays them
+    out. Every stream is carried, even ones a depth never touches, because
+    the backend indexes ``conv[stream]`` by absolute stream number."""
+
+    conv_state_shapes: Tuple[Tuple[int, ...], ...]
+    conv_dtype: torch.dtype
+    temporal_state_shape: Tuple[int, ...]
+    temporal_dtype: torch.dtype
+
+    def conv_row_bytes(self, idx: int) -> int:
+        return math.prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
+
+    def temporal_row_bytes(self) -> int:
+        return math.prod(self.temporal_state_shape) * self.temporal_dtype.itemsize
+
+    def layer_bytes(self) -> int:
+        conv = sum(self.conv_row_bytes(i) for i in range(len(self.conv_state_shapes)))
+        return conv + self.temporal_row_bytes()
+
+
+class DraftStateRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """The draft's recurrent state fused into every slot of a host state
+    sub-pool: one block per fused (runner, layer), laid out stream-major like
+    the host's own block, after it. The host's whole-entry clear and copy then
+    carry the draft's state with the target's."""
+
+    layer_num: int
+    state: DraftStateGeometry
+
+    def validate(self) -> None:
+        assert self.layer_num > 0, f"layer_num must be positive; got {self.layer_num}"
+        assert (
+            len(self.state.conv_state_shapes) > 0
+        ), "conv_state_shapes must be non-empty"
+
+    def entry_bytes(self) -> int:
+        """Draft state bytes per slot, before the host entry's alignment."""
+        return self.layer_num * self.state.layer_bytes()
+
+
+DraftRegion = Union[DenseDraftRegion, DraftStateRegion]
+
+_HOST_NAMES = ("full", "swa", "mamba")
 
 
 class RunnerSlots(msgspec.Struct, frozen=True, kw_only=True):
@@ -79,12 +124,15 @@ class RunnerSlots(msgspec.Struct, frozen=True, kw_only=True):
 
     full: Tuple[int, int] = (0, 0)
     swa: Tuple[int, int] = (0, 0)
+    state: Tuple[int, int] = (0, 0)
 
     def range_for(self, host: str) -> range:
         if host == "full":
             start, count = self.full
         elif host == "swa":
             start, count = self.swa
+        elif host == "mamba":
+            start, count = self.state
         else:
             return range(0)
         return range(start, start + count)
@@ -102,6 +150,7 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
     runners: Tuple[RunnerSlots, ...]
     full: Optional[DenseDraftRegion] = None
     swa: Optional[DenseDraftRegion] = None
+    mamba: Optional[DraftStateRegion] = None
 
     def __post_init__(self):
         assert len(self.runners) > 0, "a placement needs at least one draft runner"
@@ -116,11 +165,13 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
                 f"range({region.layer_num}) in runner order"
             )
 
-    def region(self, host: str) -> Optional[DenseDraftRegion]:
+    def region(self, host: str) -> Optional[DraftRegion]:
         if host == "full":
             return self.full
         if host == "swa":
             return self.swa
+        if host == "mamba":
+            return self.mamba
         return None
 
     def hosts(self) -> Tuple[str, ...]:
@@ -137,19 +188,30 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
         full: Optional[DenseDraftRegion],
         swa_counts: Optional[Sequence[int]] = None,
         swa: Optional[DenseDraftRegion] = None,
+        state_counts: Optional[Sequence[int]] = None,
+        mamba: Optional[DraftStateRegion] = None,
     ) -> "FusedDraftPlacement":
         """Tile each host's region with the runners' layer counts, in runner order."""
         if swa_counts is None:
             swa_counts = [0] * len(full_counts)
+        if state_counts is None:
+            state_counts = [0] * len(full_counts)
         runners = []
-        full_start = swa_start = 0
-        for full_count, swa_count in zip(full_counts, swa_counts, strict=True):
+        full_start = swa_start = state_start = 0
+        for full_count, swa_count, state_count in zip(
+            full_counts, swa_counts, state_counts, strict=True
+        ):
             runners.append(
-                RunnerSlots(full=(full_start, full_count), swa=(swa_start, swa_count))
+                RunnerSlots(
+                    full=(full_start, full_count),
+                    swa=(swa_start, swa_count),
+                    state=(state_start, state_count),
+                )
             )
             full_start += full_count
             swa_start += swa_count
-        return cls(runners=tuple(runners), full=full, swa=swa)
+            state_start += state_count
+        return cls(runners=tuple(runners), full=full, swa=swa, mamba=mamba)
 
 
 
@@ -168,7 +230,8 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
     depth, served by one runner each under multi-layer EAGLE); otherwise
     every runner serves all ``num_layers`` layers. ``swa`` is the row
     geometry of the ``swa_layer_ids`` layers and ``sliding_window_size`` the
-    window they read back.
+    window they read back; ``state`` the recurrent state of each of the
+    ``num_state_layers`` conv/mamba layers.
     """
 
     num_layers: int
@@ -178,6 +241,7 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
     sliding_window_size: Optional[int] = None
     num_depths: int = 1
     num_state_layers: int = 0
+    state: Optional[DraftStateGeometry] = None
 
 
 def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
@@ -188,6 +252,20 @@ def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
     if mc.is_hybrid_swa and not mc.is_deepseek_v4_arch:
         return tuple(int(i) for i in mc.swa_attention_layer_ids)
     return ()
+
+
+def draft_state_layer_ids(draft_model_config, *, runner: int) -> Tuple[int, ...]:
+    """The recurrent-state layer ids draft runner ``runner`` serves: its own
+    depth for a per-depth head, every conv layer otherwise."""
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    mambaish = mambaish_config(draft_model_config)
+    if mambaish is None:
+        return ()
+    num_depths = draft_model_config.num_nextn_predict_layers
+    if num_depths is not None and num_depths > 1:
+        return (runner,)
+    return tuple(int(i) for i in mambaish.mamba2_cache_params.layers)
 
 
 def draft_kv_profile(
@@ -206,6 +284,17 @@ def draft_kv_profile(
     if num_depths is None:
         num_depths = mc.num_nextn_predict_layers
     mambaish = mambaish_config(mc)
+    state = None
+    num_state_layers = 0
+    if mambaish is not None:
+        cp = mambaish.mamba2_cache_params
+        state = DraftStateGeometry(
+            conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
+            conv_dtype=cp.dtype.conv,
+            temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+            temporal_dtype=cp.dtype.temporal,
+        )
+        num_state_layers = len(cp.layers)
     swa_layer_ids = draft_swa_layer_ids(mc)
     swa = None
     if swa_layer_ids:
@@ -227,9 +316,8 @@ def draft_kv_profile(
             None if mc.sliding_window_size is None else int(mc.sliding_window_size)
         ),
         num_depths=1 if num_depths is None else int(num_depths),
-        num_state_layers=(
-            0 if mambaish is None else len(mambaish.mamba2_cache_params.layers)
-        ),
+        num_state_layers=num_state_layers,
+        state=state,
     )
 
 
@@ -245,11 +333,13 @@ class FusedDraftDecision(msgspec.Struct, frozen=True, kw_only=True):
 
 def _runner_layer_counts(
     profile: DraftKVProfile, num_runners: int
-) -> Tuple[Optional[List[Tuple[int, int]]], Optional[str]]:
-    """Per runner, its (full, swa) layer counts; or why no runner layout exists."""
+) -> Tuple[Optional[List[Tuple[int, int, int]]], Optional[str]]:
+    """Per runner, its (full, swa, state) layer counts; or why no runner
+    layout exists."""
     if profile.num_depths <= 1:
         num_swa = len(profile.swa_layer_ids)
-        return [(profile.num_layers - num_swa, num_swa)] * num_runners, None
+        counts = (profile.num_layers - num_swa, num_swa, profile.num_state_layers)
+        return [counts] * num_runners, None
     if num_runners == 1:
         return None, (
             f"a per-depth draft head ({profile.num_depths} depths) needs one "
@@ -261,7 +351,10 @@ def _runner_layer_counts(
             f"{profile.num_depths} depths"
         )
     swa = set(profile.swa_layer_ids)
-    return [(0, 1) if r in swa else (1, 0) for r in range(num_runners)], None
+    state = 1 if profile.num_state_layers else 0
+    return [
+        (0, 1, state) if r in swa else (1, 0, state) for r in range(num_runners)
+    ], None
 
 
 def _window_host_reason(
@@ -322,18 +415,21 @@ def place_fused_draft(
     """Assign every draft layer of every runner to the host sub-pool whose
     lifetime covers what the layer reads: a full-attention layer rides in
     ``"full"``; a sliding-window layer rides in ``"swa"`` when the host has
-    one and the draft's window fits inside the target's, else in ``"full"``.
-    A layer kind no host arm serves declines the whole draft to its private
-    pool, as do asymmetric K/V rows unless the caller vouches that every
-    attention backend carries v_head_dim through to the kernel."""
+    one and the draft's window fits inside the target's, else in ``"full"``;
+    a recurrent-state layer rides in the host's ``"mamba"`` entries, whose
+    slot is the request's. A layer kind no host arm serves declines the
+    whole draft to its private pool, as do asymmetric K/V rows unless the
+    caller vouches that every attention backend carries v_head_dim through
+    to the kernel."""
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
-    if profile.num_state_layers:
+    num_state = sum(state for _, _, state in counts)
+    if num_state and "mamba" not in host_names:
         return FusedDraftDecision(
             declined=(
-                f"the draft has {profile.num_state_layers} recurrent-state "
-                "layer(s) of its own, which no host state pool carries"
+                f"the draft has {num_state} recurrent-state layer(s) and the "
+                "host has no state sub-pool to carry them"
             )
         )
     for geometry in (profile.full, profile.swa):
@@ -342,6 +438,8 @@ def place_fused_draft(
             return FusedDraftDecision(declined=reason)
     assert "full" in host_names, host_names
 
+    state_counts = [state for _, _, state in counts]
+    counts = [(full, swa) for full, swa, _ in counts]
     num_full = sum(full for full, _ in counts)
     num_swa = sum(swa for _, swa in counts)
     full_geometry = profile.full
@@ -371,10 +469,18 @@ def place_fused_draft(
             if not num_full:
                 full_geometry = profile.swa
             num_full, num_swa = num_full + num_swa, 0
+    mamba = None
+    if num_state:
+        assert (
+            profile.state is not None
+        ), "a draft with state layers has a state geometry"
+        mamba = DraftStateRegion(layer_num=num_state, state=profile.state)
     placement = FusedDraftPlacement.from_counts(
         full_counts=[full for full, _ in counts],
         full=_region(full_geometry, num_full, store_dtype),
         swa_counts=[swa for _, swa in counts],
         swa=None if num_swa == 0 else _region(profile.swa, num_swa, store_dtype),
+        state_counts=state_counts,
+        mamba=mamba,
     )
     return FusedDraftDecision(placement=placement, note=note)

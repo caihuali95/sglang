@@ -249,6 +249,8 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     if cfg.disaggregation_mode != "null":
         # Constraints of the whole-envelope transfer; see
         # UnifiedMLATokenToKVPool.get_contiguous_buf_infos.
+        # P and D ship whole entries, so both must resolve the same fused
+        # draft placement (same draft, same runner count, same window rule).
         assert cfg.disaggregation_transfer_backend == "mooncake", (
             "--enable-unified-memory with PD disaggregation supports only "
             "the mooncake transfer backend; got "

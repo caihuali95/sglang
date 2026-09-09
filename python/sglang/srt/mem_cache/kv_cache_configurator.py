@@ -576,15 +576,20 @@ class KVCacheConfigurator:
                         req_to_token_pool = self._build_req_to_token_pool(
                             max_num_reqs=sizes.max_running_requests
                         )
+                    runner = self.draft_model_idx or 0
                     draft_pool = build_unified_draft_kv_pool(
                         unified_buffer=alloc.unified_buffer,
                         host_allocator=alloc,
                         placement=placement,
-                        runner=self.draft_model_idx or 0,
+                        runner=runner,
                         kv_layer_ids=draft_kv_layer_ids(self.model),
                         swa_layer_ids=draft_swa_layer_ids(self.model_config),
                         page_size=self.page_size,
                     )
+                    if placement.region("mamba") is not None:
+                        req_to_token_pool = self._bind_fused_draft_state(
+                            req_to_token_pool, placement=placement, runner=runner
+                        )
                     return _InitializedPools(
                         req_to_token_pool=req_to_token_pool,
                         token_to_kv_pool=draft_pool,
@@ -705,6 +710,28 @@ class KVCacheConfigurator:
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+
+    def _bind_fused_draft_state(self, req_to_token_pool, *, placement, runner: int):
+        """The draft runner's req pool over the state block fused into the
+        target's state entries: the target's mappings and allocator, with a
+        `mamba_pool` view keyed by this runner's own state layer ids."""
+        from sglang.srt.mem_cache.layout.fused_draft import draft_state_layer_ids
+        from sglang.srt.mem_cache.unified_memory_pool import (
+            UnifiedHybridReqToTokenPool,
+        )
+
+        assert isinstance(req_to_token_pool, UnifiedHybridReqToTokenPool), (
+            "a fused draft state block needs the target's unified state pool"
+        )
+        layer_ids = draft_state_layer_ids(self.model_config, runner=runner)
+        slots = placement.slots_for(runner, "mamba")
+        assert len(layer_ids) == len(slots), (
+            f"draft runner {runner}: state layers {list(layer_ids)} vs placed "
+            f"slots {list(slots)}"
+        )
+        return req_to_token_pool.clone_for_fused_draft(
+            layer_slots=dict(zip(layer_ids, slots))
         )
 
     def _bound_fused_draft_placement(self, alloc):

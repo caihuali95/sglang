@@ -26,7 +26,8 @@ prices. Pinned:
     swa sub-pool keeps only the target's window); otherwise it rides in the
     full sub-pool, and a draft whose window rows differ from its full rows
     cannot fold there;
-  - a draft with recurrent-state layers of its own declines;
+  - a recurrent-state draft layer rides in the host's mamba entries (one
+    block per fused runner layer) and declines on a host without them;
   - an asymmetric-row draft fuses only when every resolved backend, the
     draft's included, carries v_head_dim through to the kernel, and the
     region then carries the V width the fused entry is priced from;
@@ -48,6 +49,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftKVGeometry,
     DraftKVProfile,
+    DraftStateGeometry,
     FusedDraftPlacement,
     RunnerSlots,
     draft_kv_profile,
@@ -62,7 +64,14 @@ _HOSTS = ("full", "swa")
 _DTYPE = torch.bfloat16
 
 
+_HOSTS_TRI = ("full", "swa", "mamba")
 _SWA = DraftKVGeometry(head_num=2, head_dim=32, v_head_dim=32)
+_STATE = DraftStateGeometry(
+    conv_state_shapes=((3, 8), (3, 8)),
+    conv_dtype=torch.bfloat16,
+    temporal_state_shape=(0, 0, 0),
+    temporal_dtype=torch.float32,
+)
 
 
 def _profile(
@@ -86,6 +95,7 @@ def _profile(
         sliding_window_size=sliding_window_size,
         num_depths=num_depths,
         num_state_layers=num_state_layers,
+        state=_STATE if num_state_layers else None,
     )
 
 
@@ -213,6 +223,30 @@ class TestPlaceFusedDraft(CustomTestCase):
             self.assertEqual(decision.placement.full.layer_num, 2)
             self.assertEqual(decision.placement.full.head_dim, _SWA.head_dim)
             self.assertEqual(decision.placement.slots_for(1, "full"), range(1, 2))
+
+    def test_state_layers_ride_in_the_mamba_sub_pool(self):
+        # Inkling shape: one block per depth, every depth carrying conv state.
+        decision = _place(
+            _profile(num_layers=8, num_depths=8, num_state_layers=8),
+            num_runners=3,
+            host_names=_HOSTS_TRI,
+        )
+        placement = decision.placement
+        self.assertIsNotNone(placement, decision.declined)
+        self.assertEqual(placement.hosts(), ("full", "mamba"))
+        self.assertEqual(placement.mamba.layer_num, 3)
+        self.assertEqual(placement.mamba.state, _STATE)
+        self.assertEqual(placement.mamba.entry_bytes(), 3 * 2 * 3 * 8 * 2)
+        for r in range(3):
+            self.assertEqual(placement.slots_for(r, "mamba"), range(r, r + 1))
+        # A replicated head carries every conv layer per runner.
+        placement = _place(
+            _profile(num_layers=2, num_state_layers=2),
+            num_runners=2,
+            host_names=_HOSTS_TRI,
+        ).placement
+        self.assertEqual(placement.mamba.layer_num, 4)
+        self.assertEqual(placement.slots_for(1, "mamba"), range(2, 4))
 
     def test_a_fold_cannot_mix_two_row_geometries(self):
         decision = _place(

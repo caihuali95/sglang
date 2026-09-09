@@ -6,15 +6,20 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DraftStateRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
+    MambaPool,
     MHATokenToKVPool,
     unwrap_write_loc,
     write_loc_id_space,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 class UnifiedDraftKVPool(MHATokenToKVPool):
@@ -303,6 +308,102 @@ class UnifiedDraftSWAKVPool(SWAKVPool):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         raise NotImplementedError("CPU offloading is unsupported for fused draft KV.")
+
+
+class UnifiedDraftMambaPool(MambaPool):
+    """A draft runner's recurrent state as views of the draft block fused into
+    the host's state entries: `mamba_cache.conv[stream][layer]` is laid out
+    exactly as a private `MambaPool`'s. Slot ids are the target's, translated
+    by the shared allocator. Pure view: the host's whole-entry clear and copy
+    already cover the draft block, so the slot ops here are no-ops, and it
+    never calls `MambaPool.__init__` (no buffers of its own)."""
+
+    def __init__(
+        self,
+        *,
+        unified_buffer: UnifiedKVPool,
+        sub_pool_name: str,
+        layer_slots: Mapping[int, int],
+    ):
+        spec = unified_buffer.mamba_spec(sub_pool_name)
+        region = spec.draft_region
+        assert isinstance(region, DraftStateRegion), (
+            f"UnifiedDraftMambaPool: sub-pool {sub_pool_name!r} carries no fused "
+            "draft state region"
+        )
+        layer_ids = sorted(layer_slots)
+        assert layer_ids, "UnifiedDraftMambaPool binds at least one layer"
+        slots = [layer_slots[layer_id] for layer_id in layer_ids]
+        # A runner's slots are one contiguous range, so its layers are one
+        # strided slice of the region's views (a gather would copy).
+        start = slots[0]
+        assert slots == list(range(start, start + len(slots))) and (
+            0 <= start and start + len(slots) <= region.layer_num
+        ), (
+            f"draft state slots {slots} must be a contiguous range within "
+            f"{region.layer_num}"
+        )
+        conv_views, temporal_view = unified_buffer.build_draft_state_views(
+            sub_pool_name
+        )
+        stop = start + len(slots)
+
+        self._unified_buffer = unified_buffer
+        self._sub_pool_name = sub_pool_name
+        self.layer_slots: Dict[int, int] = dict(layer_slots)
+        self.mamba_layer_ids = layer_ids
+        self.num_mamba_layers = len(layer_ids)
+        self._max_size = unified_buffer.max_slots(sub_pool_name) - 1
+        self.size = self._max_size
+        self.device = unified_buffer.device
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        self.enable_custom_mem_pool = False
+        self.custom_mem_pool = None
+        # Same disabled-state attributes `UnifiedMambaPool` replicates for the
+        # base class's unconditional reads.
+        self.enable_linear_replayssm = False
+        self.linear_replayssm_cache_len = 16
+        self.replayssm_write_pos = None
+        self.replayssm_is_kda = False
+        self.enable_linear_replayssm_spec = False
+        self.replayssm_spec_fold = False
+        self.replayssm_cache_base = None
+        self.replayssm_is_flush = None
+        self.debug_memory_pool = False
+        self.conv_shard_groups = None
+        self.conv_slice_axis = spec.conv_slice_axis
+        self.mamba_cache = self.State(
+            conv=[view[start:stop] for view in conv_views],
+            temporal=temporal_view[start:stop],
+        )
+        self.mem_usage = 0.0  # fused into the host entries
+
+    def clear_slots(self, indices: torch.Tensor):
+        return  # the host's whole-entry clear covers the draft block
+
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
+        return  # the host's whole-entry copy covers the draft block
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        raise NotImplementedError(
+            "fused draft state relocates with the HOST pool's whole-entry move"
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "fused draft state has no contiguous region of its own; state "
+            "transfer / disaggregation is unsupported."
+        )
+
+    def get_cpu_copy(self, indices):
+        raise NotImplementedError(
+            "CPU offloading is unsupported for fused draft state."
+        )
+
+    def load_cpu_copy(self, mamba_cache_cpu, indices):
+        raise NotImplementedError(
+            "CPU offloading is unsupported for fused draft state."
+        )
 
 
 def fused_draft_host_allocator(token_to_kv_pool: Any) -> Optional[Any]:

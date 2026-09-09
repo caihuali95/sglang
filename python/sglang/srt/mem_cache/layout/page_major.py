@@ -21,7 +21,7 @@ allocator/ownership state. ``anchor_bytes`` is the byte offset of the pool's
 region inside the raw buffer (0 for a standalone pool).
 """
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -221,21 +221,26 @@ def build_page_major_mamba_views(
     temporal_dtype: torch.dtype,
     max_slots: int,
     anchor_bytes: int = 0,
+    entry_bytes: Optional[int] = None,
+    offset_bytes: int = 0,
 ) -> Tuple[List[torch.Tensor], torch.Tensor]:
     """Per-slot envelope views over ``raw`` for Mamba state.
 
-    Layout per slot: ``[conv[0] rows × layers][conv[1] rows × layers]...
-    [temporal rows × layers]``. Each returned view has shape
-    ``(num_layers, max_slots, *inner_shape)`` matching ``MambaPool.State.conv[i]``
-    / ``.temporal``. Mamba state is always token-granular (page_size == 1).
+    Layout of one block: ``[conv[0] rows × layers][conv[1] rows × layers]...
+    [temporal rows × layers]``, starting ``offset_bytes`` into a slot's entry
+    of ``entry_bytes`` (the block's own size when omitted, i.e. a standalone
+    envelope). Each returned view has shape ``(num_layers, max_slots,
+    *inner_shape)`` matching ``MambaPool.State.conv[i]`` / ``.temporal``.
+    Mamba state is always token-granular (page_size == 1).
     """
-    entry_bytes = mamba_entry_bytes(
-        layer_num=layer_num,
-        conv_state_shapes=conv_state_shapes,
-        conv_dtype=conv_dtype,
-        temporal_state_shape=temporal_state_shape,
-        temporal_dtype=temporal_dtype,
-    )
+    if entry_bytes is None:
+        entry_bytes = mamba_entry_bytes(
+            layer_num=layer_num,
+            conv_state_shapes=conv_state_shapes,
+            conv_dtype=conv_dtype,
+            temporal_state_shape=temporal_state_shape,
+            temporal_dtype=temporal_dtype,
+        )
 
     def contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
         strides = []
@@ -257,7 +262,7 @@ def build_page_major_mamba_views(
     as_conv_dtype = raw.view(conv_dtype)
     conv_slot_stride_elems = entry_bytes // conv_itemsize
 
-    offset_bytes_within_entry = 0
+    offset_bytes_within_entry = offset_bytes
     conv_views: List[torch.Tensor] = []
     for shape in conv_state_shapes:
         inner_shape_bytes = _prod(shape) * conv_itemsize
