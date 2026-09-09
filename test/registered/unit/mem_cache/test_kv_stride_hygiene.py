@@ -32,6 +32,9 @@ import torch
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.kernels.ops.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.pool_patcher.buffer_alloc import make_row_source
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    UnquantizedKVCacheMethod,
+)
 from sglang.srt.mem_cache.layout.page_major import paged_row_view, paged_view
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -141,7 +144,9 @@ class TestPagedView(unittest.TestCase):
         pool.page_size = ps
         pool.start_layer = 0
         pool.layer_transfer_counter = None
-        pool.is_quantized_kv_cache = False
+        # `is_quantized_kv_cache` is a read-only property derived from
+        # `quant_method`; the identity method is what makes it False.
+        pool.quant_method = UnquantizedKVCacheMethod()
         pool.dtype = pool.store_dtype = torch.float16
         pool.k_buffer = [backing.as_strided((N, H, D), (E, D, 1), 0)]
         pool.v_buffer = [backing.as_strided((N, H, D), (E, D, 1), H * D)]

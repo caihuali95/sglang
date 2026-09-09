@@ -240,7 +240,7 @@ class TestHybridLinearFullLocRouting(unittest.TestCase):
         # The sub-pool decides on the marker, so the composite must pass it
         # through unchanged in both directions.
         for space in ("kernel", "virtual"):
-            pool = self._make_bare_pool()
+            pool = self._make_bare_pool(use_mla=False)
             pool.set_kv_buffer(
                 types.SimpleNamespace(layer_id=0),
                 _loc_info(

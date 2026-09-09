@@ -536,6 +536,7 @@ class TestFactoryViews(unittest.TestCase):
         build derives the SWA write loc pointwise from those values (phase 2)
         — both checked against the v2p tables over the VIRTUAL ids."""
         from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.runtime_context import get_parallel
 
         b = self._bundle()
         alloc = b.token_to_kv_pool_allocator
@@ -549,21 +550,28 @@ class TestFactoryViews(unittest.TestCase):
 
         fb = _FB()
         fb.out_cache_loc = v.clone()
-        source = KVIndexTranslator(
-            req_to_token=torch.zeros((2, 8), dtype=torch.int64),
-            token_to_kv_pool_allocator=alloc,
-            token_to_kv_pool=b.token_to_kv_pool,
-            page_size=1,
-            device="cpu",
-        )
-        self.assertTrue(source.is_translating)
-        source.rebind_write_loc(fb)
-        self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
-        self.assertTrue(
-            torch.equal(
-                source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+        # The translating paths read the DCP topology twice: construction reads
+        # `attn_dcp_size` to decide whether the read translate defers, and the
+        # write translate reads `attn_dcp_rank`, which derives from
+        # `dcp_enabled`. Neither has a pre-publish default and nothing is
+        # published in a unit test, so state both and hold the scope across
+        # every call that translates.
+        with get_parallel().override(attn_dcp_size=1, dcp_enabled=False):
+            source = KVIndexTranslator(
+                req_to_token=torch.zeros((2, 8), dtype=torch.int64),
+                token_to_kv_pool_allocator=alloc,
+                token_to_kv_pool=b.token_to_kv_pool,
+                page_size=1,
+                device="cpu",
             )
-        )
+            self.assertTrue(source.is_translating)
+            source.rebind_write_loc(fb)
+            self.assertTrue(torch.equal(fb.out_cache_loc, expected_full))
+            self.assertTrue(
+                torch.equal(
+                    source.sliding_window_write_loc_for(fb.out_cache_loc), expected_swa
+                )
+            )
 
 
 if __name__ == "__main__":
