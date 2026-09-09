@@ -104,6 +104,17 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.full.layer_num, 2)
         self.assertEqual(placement.slots_for(1, "full"), range(1, 2))
 
+    def test_a_tri_pool_host_fuses_a_full_only_draft(self):
+        decision = place_fused_draft(
+            profile=_profile(),
+            num_runners=1,
+            host_names=("full", "swa", "mamba"),
+            store_dtype=_DTYPE,
+            asymmetric_rows_ok=False,
+        )
+        self.assertIsNotNone(decision.placement, decision.declined)
+        self.assertEqual(decision.placement.hosts(), ("full",))
+
     def test_per_depth_head_needs_one_runner_per_depth(self):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 9).placement)
