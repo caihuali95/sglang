@@ -235,11 +235,13 @@ def place_fused_draft(
     num_runners: int,
     host_names: Sequence[str],
     store_dtype: torch.dtype,
+    asymmetric_rows_ok: bool,
 ) -> FusedDraftDecision:
     """Assign every draft layer of every runner to the host sub-pool whose
     lifetime covers what the layer reads: a full-attention layer rides in
     ``"full"``. A layer kind no host arm serves declines the whole draft to
-    its private pool."""
+    its private pool, as do asymmetric K/V rows unless the caller vouches
+    that every attention backend carries v_head_dim through to the kernel."""
     counts, reason = _runner_layer_counts(profile, num_runners)
     if counts is None:
         return FusedDraftDecision(declined=reason)
@@ -259,12 +261,13 @@ def place_fused_draft(
             )
         )
     geometry = profile.full
-    if geometry.head_dim != geometry.v_head_dim:
+    if geometry.head_dim != geometry.v_head_dim and not asymmetric_rows_ok:
         return FusedDraftDecision(
             declined=(
                 "the draft's K/V rows are asymmetric "
-                f"(head_dim={geometry.head_dim}, v_head_dim={geometry.v_head_dim}), "
-                "which is not admitted yet"
+                f"(head_dim={geometry.head_dim}, v_head_dim={geometry.v_head_dim}) "
+                "and a resolved attention backend does not carry v_head_dim "
+                "through to the kernel"
             )
         )
     assert "full" in host_names, host_names

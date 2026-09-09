@@ -750,6 +750,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
             fused_draft=self._resolve_fused_draft_placement(),
             page_size=self.page_size,
             start_layer=self.layer_info.start_layer,
@@ -929,7 +930,8 @@ class KVCacheConfigurator:
         (hybrid-SWA or mamba hybrid, either full-pool kind), an EAGLE-family
         or DFLASH/DSPARK algorithm whose draft config was loaded at target
         boot; `place_fused_draft` then admits or declines the draft's layer
-        kinds."""
+        kinds, asymmetric K/V rows included only on backends that carry
+        v_head_dim through to the kernel."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,
@@ -967,9 +969,21 @@ class KVCacheConfigurator:
             profile=profile,
             num_runners=self._num_draft_runners(),
             host_names=self._unified_host_names(),
+            asymmetric_rows_ok=self._draft_backends_carry_v_head_dim(),
             # Drafts store KV in the same server kv dtype as the target.
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
         )
+
+    def _draft_backends_carry_v_head_dim(self) -> bool:
+        """Whether every resolved attention backend, the draft's included,
+        carries v_head_dim through to the kernel (ASYMMETRIC_KV_BACKENDS). The
+        draft worker inherits the target's backend unless one is set."""
+        from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
+
+        backends = set(attention_backends())
+        backends.add(get_spec().speculative_draft_attention_backend)
+        backends.discard(None)
+        return backends <= ASYMMETRIC_KV_BACKENDS
 
     def fused_draft_placement(self):
         """The fused draft placement, or None when the draft keeps a private pool."""
@@ -1051,6 +1065,7 @@ class KVCacheConfigurator:
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
             head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
             store_dtype=_store_dtype_for(self.kv_cache_dtype),
             grow_direction="down",
             draft_region=region,

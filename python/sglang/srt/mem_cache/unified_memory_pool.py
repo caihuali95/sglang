@@ -320,11 +320,6 @@ class MambaSubPoolSpec(SubPoolSpec):
 # ---------------------------------------------------------------------------
 
 
-def unified_memory_supported_for_model(model_config, *, use_mla_backend: bool) -> bool:
-    """Whether this model's KV geometry can back the unified memory pool."""
-    return use_mla_backend or not model_config.has_asymmetric_kv
-
-
 def _assert_kernel_id_bound(*, sub_pool_name: str, n_rows: int) -> None:
     """Check if kernel-facing ids can flow through int32 read-index buffers."""
     assert n_rows < 2**31, (
@@ -1275,6 +1270,7 @@ def init_unified_mamba_pools(
     end_layer: int,
     is_draft_worker: bool,
     use_mla_backend: bool,
+    v_head_dim: Optional[int] = None,
     kv_lora_rank: Optional[int] = None,
     qk_rope_head_dim: Optional[int] = None,
     fused_draft: Optional[FusedDraftPlacement] = None,
@@ -1331,6 +1327,7 @@ def init_unified_mamba_pools(
             layer_num=len(full_attention_layer_ids),
             head_num=head_num,
             head_dim=head_dim,
+            v_head_dim=v_head_dim,
             store_dtype=store_dtype,
             grow_direction="down",
             draft_region=None if fused_draft is None else fused_draft.region("full"),
