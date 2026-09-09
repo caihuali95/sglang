@@ -911,11 +911,10 @@ class KVCacheConfigurator:
 
     def _fused_draft_decision(self):
         """Whether, and where, the EAGLE draft's layers fuse into the target's
-        sub-pools. Fusion applies only for: unified memory ON, a target whose
-        full sub-pool is MHA-shaped (hybrid-SWA, or a mamba hybrid off the MLA
-        backend), an EAGLE-family algorithm whose draft config was loaded at
-        target boot; `place_fused_draft` then admits or declines the draft's
-        layer kinds."""
+        sub-pools. Fusion applies only for: unified memory ON, a unified target
+        (hybrid-SWA or mamba hybrid, either full-pool kind), an EAGLE-family
+        algorithm whose draft config was loaded at target boot;
+        `place_fused_draft` then admits or declines the draft's layer kinds."""
         from sglang.srt.mem_cache.layout.fused_draft import (
             FusedDraftDecision,
             draft_kv_profile,
@@ -924,12 +923,12 @@ class KVCacheConfigurator:
         from sglang.srt.mem_cache.unified_memory_pool import _store_dtype_for
 
         aux = self.spec_aux_config
-        host_has_mha_full_pool = self.is_hybrid_swa or (
-            self.mambaish_config is not None and not self.use_mla_backend
+        host_has_fusable_full_pool = (
+            self.is_hybrid_swa or self.mambaish_config is not None
         )
         if not (
             get_memory().enable_unified_memory
-            and host_has_mha_full_pool
+            and host_has_fusable_full_pool
             and not self.is_draft_worker
             and self.spec_algorithm.is_eagle()
             and aux.eagle_draft_num_layers
@@ -999,6 +998,7 @@ class KVCacheConfigurator:
     def _fused_host_spec(self, sub_pool_name: str, region):
         from sglang.srt.mem_cache.unified_memory_pool import (
             MHASubPoolSpec,
+            MLASubPoolSpec,
             _store_dtype_for,
         )
 
@@ -1011,6 +1011,16 @@ class KVCacheConfigurator:
             if self.is_hybrid_swa
             else self.mambaish_config.full_attention_layer_ids
         )
+        if self.use_mla_backend:
+            return MLASubPoolSpec(
+                name="full",
+                layer_num=len(full_attention_layer_ids),
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                store_dtype=_store_dtype_for(self.kv_cache_dtype),
+                grow_direction="down",
+                draft_region=region,
+            )
         return MHASubPoolSpec(
             name="full",
             layer_num=len(full_attention_layer_ids),
