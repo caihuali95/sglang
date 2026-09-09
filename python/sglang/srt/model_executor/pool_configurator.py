@@ -285,7 +285,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
-            if (
+            fused_full_entry = kvc.fused_entry_bytes("full")
+            if fused_full_entry is not None:
+                # Fused draft KV: the draft rides inside every full-side
+                # page, so the cell is the EXACT fused entry - the separate
+                # draft reservation below would double-charge.
+                self._cell_size = int(fused_full_entry)
+            elif (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0

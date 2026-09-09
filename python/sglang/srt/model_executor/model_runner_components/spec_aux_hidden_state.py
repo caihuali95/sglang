@@ -222,6 +222,9 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        # The same record the EAGLE arm keeps: one draft config serves every
+        # draft-KV algorithm, and its geometry is derived after TP init.
+        config.draft_model_config = draft_model_config
         config.dflash_target_layer_ids = target_layer_ids
         config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
             draft_model_config=draft_model_config,
