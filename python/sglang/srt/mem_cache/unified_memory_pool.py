@@ -97,6 +97,10 @@ class SubPoolSpec(ABC):
     name: str
     layer_num: int
     grow_direction: str  # "up" | "down" | "float"
+    # Fused draft region riding in this sub-pool's entries; None = unfused.
+    # A kind that resolves one appends its parts to `layout()` at
+    # `draft_offset_in_entry()`.
+    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         assert self.grow_direction in self._allowed_grow_directions, (
@@ -134,7 +138,6 @@ class MHASubPoolSpec(SubPoolSpec):
     head_dim: int
     store_dtype: torch.dtype
     v_head_dim: Optional[int] = None
-    draft_region: Optional[DenseDraftRegion] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -232,6 +235,9 @@ class MLASubPoolSpec(SubPoolSpec):
         assert self.qk_rope_head_dim > 0, (
             f"qk_rope_head_dim must be positive; got {self.qk_rope_head_dim}"
         )
+        assert (
+            self.draft_region is None
+        ), "MLA sub-pools do not carry a fused draft region yet"
 
     @property
     def kv_cache_dim(self) -> int:
@@ -275,6 +281,9 @@ class MambaSubPoolSpec(SubPoolSpec):
     def __post_init__(self):
         super().__post_init__()
         assert len(self.conv_state_shapes) > 0, "conv_state_shapes must be non-empty"
+        assert (
+            self.draft_region is None
+        ), "mamba state pages carry no fused draft region yet"
 
     def conv_row_bytes(self, idx: int) -> int:
         return _prod(self.conv_state_shapes[idx]) * self.conv_dtype.itemsize
@@ -511,6 +520,17 @@ class UnifiedKVPool:
         )
         return s
 
+    def draft_host_spec(self, name: str) -> SubPoolSpec:
+        """The sub-pool spec whose entries carry a fused draft region.
+
+        Kind-agnostic: any spec that resolves a `draft_region` also lays the
+        draft parts out in its `layout()`."""
+        s = self._specs_by_name[name]
+        assert (
+            s.draft_region is not None
+        ), f"sub-pool {name!r} carries no fused draft region"
+        return s
+
     def max_slots(self, name: str) -> int:
         return self._max_slots[name]
 
@@ -559,10 +579,7 @@ class UnifiedKVPool:
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Per-layer K/V views of the DRAFT parts fused into ``sub_pool_name``'s
         entries: same pages, same slot ids, same v2p table as the host."""
-        spec = self._specs_by_name[sub_pool_name]
-        assert (
-            isinstance(spec, MHASubPoolSpec) and spec.draft_region is not None
-        ), f"sub-pool {sub_pool_name!r} carries no fused draft region"
+        spec = self.draft_host_spec(sub_pool_name)
         layout = spec.layout()
         page_size = self._page_size
         num_pages = self.max_slots(sub_pool_name) // page_size

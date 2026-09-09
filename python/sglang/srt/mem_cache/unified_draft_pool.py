@@ -37,12 +37,7 @@ class UnifiedDraftKVPool(MHATokenToKVPool):
         layer_slots: Mapping[int, int],
         page_size: int = 1,
     ):
-        spec = unified_buffer.mha_spec(host_sub_pool_name)
-        region = spec.draft_region
-        assert region is not None, (
-            f"UnifiedDraftKVPool: host sub-pool {host_sub_pool_name!r} carries "
-            "no fused draft region"
-        )
+        region = unified_buffer.draft_host_spec(host_sub_pool_name).draft_region
         layer_ids = sorted(layer_slots)
         assert layer_ids, "UnifiedDraftKVPool binds at least one layer"
         start_layer = layer_ids[0]
