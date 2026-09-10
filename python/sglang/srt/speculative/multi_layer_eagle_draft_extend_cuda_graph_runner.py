@@ -470,6 +470,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         seq_lens_sum: Optional[int],
         spec_info: EagleDraftExtendInput,
         seq_lens_cpu: Optional[torch.Tensor],
+        *,
+        out_cache_loc_virtual: Optional[torch.Tensor],
     ):
         """Init this step's attention metadata for the prepared bucket and
         replay its graph. Buffers must already be populated by the composite
@@ -492,6 +494,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             encoder_lens=None,
             # per-step write target; out_cache_loc is frozen at prepare() time.
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            # The write rail: `fill_capture_write_loc` translates the VIRTUAL
+            # loc into the backend's capture buffer, so a view that drops it
+            # sends every draft-extend write to the page-0 sink.
+            out_cache_loc_virtual=out_cache_loc_virtual,
             spec_info=spec_info,
         )
         if not self.metadata_captured_in_graph:
@@ -537,6 +543,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.captured_req_width = 1
         self.num_front_tokens = 0
         self.prune_draft_extend_logits = False
+        self._out_cache_loc_virtual = None
 
         self._init_and_capture()
 
@@ -720,6 +727,12 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         raw_bs = forward_batch.batch_size
         num_tokens = raw_bs * self.captured_req_width
 
+        # The write rail travels with the frozen out_cache_loc: `replay` takes
+        # no ForwardBatch, and `fill_capture_write_loc` translates the VIRTUAL
+        # loc into the backend's capture buffer, so losing it here sends every
+        # draft-extend write to the page-0 sink.
+        self._out_cache_loc_virtual = forward_batch.out_cache_loc_virtual
+
         # Bucketize to a captured batch size (padding the tail).
         if self.require_mlp_tp_gather:
             max_batch_size = max(forward_batch.original_global_num_tokens_cpu)
@@ -811,7 +824,11 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         runner = self.runners[step]
         runner.raw_bs = self.raw_bs
         out = runner.replay(
-            self.bs, self.seq_lens_sum, self._replay_spec_info, self.seq_lens_cpu
+            self.bs,
+            self.seq_lens_sum,
+            self._replay_spec_info,
+            self.seq_lens_cpu,
+            out_cache_loc_virtual=self._out_cache_loc_virtual,
         )
         self._publish_shared_read_done(step)
         raw_bs = self.raw_bs

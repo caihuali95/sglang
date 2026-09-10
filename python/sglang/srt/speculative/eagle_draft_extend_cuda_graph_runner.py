@@ -620,6 +620,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             ),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            # The write rail: `fill_capture_write_loc` translates the VIRTUAL
+            # loc into the backend's capture buffer, so a view that drops it
+            # sends every draft-extend write to the page-0 sink.
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
             out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             spec_info=forward_batch.spec_info,
         )

@@ -361,6 +361,10 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             ),
             encoder_lens=None,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
+            # The write rail: `fill_capture_write_loc` translates the VIRTUAL
+            # loc into the backend's capture buffer, so a view that drops it
+            # sends every draft write to the page-0 sink.
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
             spec_info=None,
         )
         with self._frozen_kv_target_view(forward_batch):
